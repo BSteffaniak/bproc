@@ -27,6 +27,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+#[cfg(test)]
+#[path = "monitor_delivery_tests.rs"]
+mod monitor_delivery_tests;
+
 /// How long to keep terminated processes visible (in seconds)
 const TERMINATED_DISPLAY_DURATION: Duration = Duration::from_secs(5);
 
@@ -45,6 +49,8 @@ pub enum MonitorCommand {
 /// Update data sent from monitoring thread to UI thread
 #[derive(Debug, Clone)]
 pub struct MonitorUpdateData {
+    /// Acquisition time is carried across bounded delivery for graph history.
+    pub acquired_at: u64,
     pub process_map: ProcessMap,
     pub interface_map: InterfaceMap,
     pub socket_mapper_name: String,
@@ -768,7 +774,7 @@ impl NetworkMonitor {
     pub fn run_monitoring_loop(
         mut self,
         mut cmd_rx: mpsc::UnboundedReceiver<MonitorCommand>,
-        update_tx: mpsc::UnboundedSender<MonitorUpdate>,
+        update_tx: mpsc::Sender<MonitorUpdate>,
     ) {
         log::info!("Starting monitoring background thread");
         let mut last_update = Instant::now();
@@ -843,13 +849,20 @@ impl NetworkMonitor {
 
                         // Send update to UI thread (non-blocking) with socket mapper info
                         let update_data = MonitorUpdateData {
+                            acquired_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
                             process_map,
                             interface_map,
                             socket_mapper_name: self.socket_mapper_name.clone(),
                             socket_mapper_capabilities: self.socket_mapper_capabilities.clone(),
                         };
 
-                        if update_tx.send(update_data).is_err() {
+                        // Lossless bounded delivery: the dedicated monitoring thread applies
+                        // backpressure instead of dropping graph/history samples. Closing
+                        // the receiver before joining this thread unblocks shutdown.
+                        if update_tx.blocking_send(update_data).is_err() {
                             log::warn!(
                                 "Update channel disconnected, shutting down monitoring thread"
                             );

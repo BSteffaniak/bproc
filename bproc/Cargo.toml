@@ -45,8 +45,24 @@ macos-full = ["monitor-pnet"]
 
 [dependencies]
 # Core dependencies (cross-platform)
-ratatui = "0.28"
-crossterm = "0.28"
+bmux_tui = { git = "https://github.com/BSteffaniak/bmux", branch = "master", features = [
+  "crossterm",
+] }
+bmux_tui_components = { git = "https://github.com/BSteffaniak/bmux", branch = "master", features = [
+  "selectable-list",
+  "text-view",
+  "text-input-box",
+  "modal-frame",
+  "tab-bar",
+  "canvas",
+  "compact",
+] }
+bmux_tui_runtime = { git = "https://github.com/BSteffaniak/bmux", branch = "master", default-features = false, features = [
+  "crossterm",
+  "images",
+] } # master currently gates shared output delivery on images; no image protocols enabled.
+bmux_keyboard = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_text_edit = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 tokio = { version = "1", features = ["full"] }
 pretty_env_logger = "0.5.0"
 sysinfo = "0.31"
@@ -57,7 +73,6 @@ chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
-unicode-width = "0.1"
 dirs = "5.0"
 
 # Network monitoring (optional, cross-platform)

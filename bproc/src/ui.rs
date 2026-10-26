@@ -2,22 +2,28 @@ use crate::backends::BackendPriority;
 use crate::backends::throttle::BackendInfo;
 use crate::history::HistoryTracker;
 use crate::process::{InterfaceInfo, InterfaceMap, ProcessInfo, ProcessMap};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+pub use bmux_tui::geometry::Rect;
+use bmux_tui::{
+    paint::PaintCx,
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{
-        Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState,
-        Paragraph,
-    },
+};
+mod events;
+mod render;
+mod scene;
+use bmux_tui::text_width::display_width;
+pub use render::ListState;
+use render::{
+    PanelChrome, TextPresentation, clear, line, paint_border, paint_list, paint_text, root_area,
+    split_vertical,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
-use unicode_width::UnicodeWidthStr;
 
 pub struct AppState {
+    component_scene: std::cell::RefCell<scene::ComponentScene>,
+    /// Runtime-owned process metadata; rendering never performs process I/O.
+    pub cached_process_details: Option<crate::process::ProcessDetails>,
     pub process_list: Vec<ProcessInfo>,
     pub unfiltered_process_list: Vec<ProcessInfo>, // Full list before interface filtering
     pub selected_index: Option<usize>,
@@ -308,6 +314,33 @@ impl ThrottleDialog {
 }
 
 impl AppState {
+    /// Supply details collected by the runtime refresh service (or clear stale details).
+    pub fn update_process_details(&mut self, details: Option<crate::process::ProcessDetails>) {
+        self.cached_process_details = details;
+    }
+
+    fn details_for(&self, process: &ProcessInfo) -> crate::process::ProcessDetails {
+        self.cached_process_details
+            .as_ref()
+            .filter(|d| d.pid == process.pid)
+            .cloned()
+            .unwrap_or_else(|| crate::process::ProcessDetails {
+                pid: process.pid,
+                name: process.name.clone(),
+                cmdline: None,
+                exe_path: None,
+                cwd: None,
+                state: None,
+                ppid: None,
+                threads: None,
+                memory_rss: None,
+                memory_vms: None,
+                uid: None,
+                gid: None,
+                connections: Vec::new(),
+            })
+    }
+
     pub fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(None); // Nothing selected initially
@@ -316,6 +349,8 @@ impl AppState {
         interface_list_state.select(None);
 
         Self {
+            component_scene: Default::default(),
+            cached_process_details: None,
             process_list: Vec::new(),
             unfiltered_process_list: Vec::new(),
             selected_index: None, // Nothing selected initially
@@ -1103,30 +1138,24 @@ impl AppState {
     }
 }
 
-pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
+pub fn draw_ui(f: &mut PaintCx<'_, '_>, app: &mut AppState) {
     draw_ui_with_backend_info(f, app, None);
 }
 
 pub fn draw_ui_with_backend_info(
-    f: &mut Frame,
+    f: &mut PaintCx<'_, '_>,
     app: &mut AppState,
     backend_info: Option<&BackendInfo>,
 ) {
+    app.component_scene.borrow_mut().begin();
     // Clear clickable regions from previous frame
     app.clickable_regions.clear();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Main content area
-            Constraint::Length(5), // Status bar (allows wrapping to 2-3 lines)
-        ])
-        .split(f.area());
+    let chunks = split_vertical(root_area(f), 3, 5);
 
     // Header (hide in ProcessDetail view to save space)
     if app.view_mode != ViewMode::ProcessDetail {
-        draw_header(f, chunks[0]);
+        draw_header(f, chunks[0], app);
     }
 
     // Main content area - render based on view mode
@@ -1138,7 +1167,7 @@ pub fn draw_ui_with_backend_info(
             // Draw process list in background so we can see live updates
             draw_process_list(f, chunks[1], app);
             // Draw interface modal overlay on top
-            draw_interface_modal(f, f.area(), app);
+            draw_interface_modal(f, root_area(f), app);
         }
         ViewMode::InterfaceDetail => {
             draw_interface_detail(f, chunks[1], app);
@@ -1160,47 +1189,50 @@ pub fn draw_ui_with_backend_info(
 
     // Help overlay
     if app.show_help {
-        draw_help_overlay(f, f.area(), app);
+        draw_help_overlay(f, root_area(f), app);
     }
 
     // Throttle dialog
     if app.show_throttle_dialog {
-        draw_throttle_dialog(f, f.area(), app);
+        draw_throttle_dialog(f, root_area(f), app);
     }
 
     // Bandwidth graph overlay
     if app.show_graph {
-        draw_bandwidth_graph(f, f.area(), app);
+        draw_bandwidth_graph(f, root_area(f), app);
     }
 
     // Backend info modal (highest priority, renders on top)
     if app.show_backend_info {
         if let Some(info) = backend_info {
-            draw_backend_info(f, f.area(), app, info);
+            draw_backend_info(f, root_area(f), app, info);
         }
     }
 
     // Backend compatibility dialog (highest priority - renders on top of everything)
     if app.show_backend_compatibility_dialog {
         if let Some(dialog) = app.backend_compatibility_dialog.clone() {
-            draw_backend_compatibility_dialog(f, f.area(), app, &dialog);
+            draw_backend_compatibility_dialog(f, root_area(f), app, &dialog);
         }
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect) {
-    let header = Paragraph::new("🔥 bproc v0.1.0 - Network Monitor & Throttler 🔥")
-        .style(
-            Style::default()
+fn draw_header(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
+    let header = (
+        render::lines("🔥 bproc v0.1.0 - Network Monitor & Throttler 🔥"),
+        TextPresentation {
+            style: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL));
+            chrome: Some(PanelChrome::default()),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(header, area);
+    paint_text(&app.component_scene, "draw_header", f, area, header);
 }
 
-fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_process_list(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     // Select which rates to display based on traffic view mode
     let get_rates = |proc: &ProcessInfo| -> (u64, u64, u64, u64) {
         match app.traffic_view_mode {
@@ -1225,7 +1257,7 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         }
     };
 
-    let items: Vec<ListItem> = app
+    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = app
         .process_list
         .iter()
         .enumerate()
@@ -1247,12 +1279,12 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             };
 
             // Use gray colors for terminated processes
-            let terminated_color = Color::Gray;
+            let terminated_color = Color::White;
 
             let name_color = if proc.is_terminated {
                 terminated_color
             } else {
-                Color::White
+                Color::BrightWhite
             };
             let dl_rate_color = if proc.is_terminated {
                 terminated_color
@@ -1283,14 +1315,17 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             // Get the appropriate rates based on traffic view mode
             let (download_rate, upload_rate, total_download, total_upload) = get_rates(proc);
 
-            let content = Line::from(vec![
+            let content = line(vec![
                 Span::styled(selection_indicator, Style::default().fg(Color::Yellow)),
                 Span::raw(format!("{:7} ", proc.pid)),
                 Span::styled(
                     format!(
                         "{:20} ",
-                        if proc.name.len() > 20 {
-                            format!("{}...", &proc.name[..17])
+                        if display_width(&proc.name) > 20 {
+                            format!(
+                                "{}...",
+                                &bmux_tui_components::compact::truncate_width(&proc.name, 17)
+                            )
                         } else {
                             proc.name.clone()
                         }
@@ -1321,11 +1356,14 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 ),
             ]);
 
-            ListItem::new(content)
+            bmux_tui_components::selectable_list::SelectableListItem::rich(
+                content.plain_text(),
+                content,
+            )
         })
         .collect();
 
-    let header = Line::from(vec![
+    let header = line(vec![
         Span::styled("PID     ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             "Process              ",
@@ -1342,7 +1380,7 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
     let header_area = Rect {
         x: area.x + 4, // +2 for border, +2 for manual selection indicator
         y: area.y + 1,
-        width: area.width - 4,
+        width: area.width.saturating_sub(5),
         height: 1,
     };
 
@@ -1360,16 +1398,26 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         "Network Activity"
     };
 
-    let border = Block::default().borders(Borders::ALL).title(title);
-    f.render_widget(border, area);
+    let border = PanelChrome {
+        title: Some(line(title)),
+        ..PanelChrome::default()
+    };
+    paint_border(f, area, border);
 
     // Render header
-    f.render_widget(Paragraph::new(header), header_area);
+    paint_text(
+        &app.component_scene,
+        "draw_process_list.header",
+        f,
+        header_area,
+        (render::lines(header), TextPresentation::default()),
+    );
 
     // Render list without its own border (since we drew it above)
-    let list = List::new(items).highlight_style(
+    let list = (
+        items,
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(Color::BrightBlack)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -1381,7 +1429,15 @@ fn draw_process_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         height: list_area.height.saturating_sub(1),
     };
 
-    f.render_stateful_widget(list, inner_list_area, &mut app.list_state);
+    paint_list(
+        &app.component_scene,
+        "draw_process_list",
+        f,
+        inner_list_area,
+        &list.0,
+        list.1,
+        &mut app.list_state,
+    );
 
     // Store clickable region for mouse selection
     let first_visible = app.list_state.offset();
@@ -1406,14 +1462,14 @@ fn wrap_spans_to_lines(spans: Vec<Span>, max_width: u16) -> Vec<Line> {
 
     while i < spans.len() {
         let span = &spans[i];
-        let span_width = span.content.width() as u16;
+        let span_width = display_width(&span.content) as u16;
 
         // LOOKAHEAD: Check if this is a styled span (yellow key like "[b]")
         // If so, calculate combined width with the next span (description)
         let lookahead_width = if span.style.fg == Some(Color::Yellow) && i + 1 < spans.len() {
             // This is a yellow key span, check next span (likely the description)
             let next_span = &spans[i + 1];
-            span_width + next_span.content.width() as u16
+            span_width + display_width(&next_span.content) as u16
         } else {
             // Not a key, just use this span's width
             span_width
@@ -1421,7 +1477,7 @@ fn wrap_spans_to_lines(spans: Vec<Span>, max_width: u16) -> Vec<Line> {
 
         // If adding this span (and its paired span if applicable) would overflow, wrap
         if current_width + lookahead_width > max_width && !current_line.is_empty() {
-            lines.push(Line::from(std::mem::take(&mut current_line)));
+            lines.push(line(std::mem::take(&mut current_line)));
             current_width = 0;
         }
 
@@ -1433,18 +1489,18 @@ fn wrap_spans_to_lines(spans: Vec<Span>, max_width: u16) -> Vec<Line> {
 
     // Add remaining spans as the last line
     if !current_line.is_empty() {
-        lines.push(Line::from(current_line));
+        lines.push(line(current_line));
     }
 
     // Return at least one empty line if no content
     if lines.is_empty() {
-        lines.push(Line::from(""));
+        lines.push(line(""));
     }
 
     lines
 }
 
-fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
+fn draw_status_bar(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
     // Auto-generate status bar from centralized keybindings
     let mut spans = vec![];
 
@@ -1489,7 +1545,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
             // No filter - show normal message
             spans.push(Span::styled(
                 &app.status_message,
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::White),
             ));
         }
         Some(filters) if filters.is_empty() => {
@@ -1500,7 +1556,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
             ));
             spans.push(Span::styled(
                 &app.status_message,
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::White),
             ));
         }
         Some(filters) => {
@@ -1522,7 +1578,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
             ));
             spans.push(Span::styled(
                 &app.status_message,
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::White),
             ));
         }
     }
@@ -1530,32 +1586,38 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &AppState) {
     // Wrap spans to multiple lines if they exceed terminal width
     let available_width = area.width.saturating_sub(2); // minus left/right borders
     let wrapped_lines = wrap_spans_to_lines(spans, available_width);
-    let status = Paragraph::new(wrapped_lines).block(Block::default().borders(Borders::ALL));
+    let status = (
+        render::lines(wrapped_lines),
+        TextPresentation {
+            chrome: Some(PanelChrome::default()),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(status, area);
+    paint_text(&app.component_scene, "draw_status_bar", f, area, status);
 }
 
-fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_help_overlay(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     // Auto-generate help text from centralized keybindings
     let mut help_text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
+        line(""),
+        line(Span::styled(
             "bproc - Keyboard Shortcuts",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
+        line(""),
     ];
 
     // Get all keybindings and generate help lines
     for binding in crate::keybindings::get_all_keybindings() {
-        help_text.push(Line::from(format!(
+        help_text.push(line(format!(
             "  {:12} - {}",
             binding.key, binding.description
         )));
     }
 
-    help_text.push(Line::from(""));
-    help_text.push(Line::from("Use ↑↓ to scroll, any other key to close"));
+    help_text.push(line(""));
+    help_text.push(line("Use ↑↓ to scroll, any other key to close"));
 
     let help_area = centered_rect(60, 50, area);
 
@@ -1565,41 +1627,39 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
         AppState::clamp_scroll(app.help_scroll_offset, content_lines, help_area.height);
     app.help_scroll_offset = clamped_scroll;
 
-    let help = Paragraph::new(help_text)
-        .style(Style::default().bg(Color::Black).fg(Color::White))
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Help")
-                .style(Style::default().fg(Color::Cyan)),
-        );
+    let help = (
+        render::lines(help_text),
+        TextPresentation {
+            style: Style::default().bg(Color::Black).fg(Color::BrightWhite),
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Help")),
+                style: Style::default().fg(Color::Cyan),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(ratatui::widgets::Clear, help_area);
-    f.render_widget(help, help_area);
+    clear(f, help_area);
+    paint_text(&app.component_scene, "help", f, help_area, help);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    // Match the original three-percentage layout by rounding the cumulative
+    // boundaries, not by flooring the modal size independently (24×30%=8).
+    fn axis(length: u16, percent: u16) -> (u16, u16) {
+        let side = (100 - percent.min(100)) / 2;
+        let start = (u32::from(length) * u32::from(side) + 50) / 100;
+        let end = (u32::from(length) * u32::from(side + percent.min(100)) + 50) / 100;
+        (start as u16, end.saturating_sub(start) as u16)
+    }
+    let (x, width) = axis(r.width, percent_x);
+    let (y, height) = axis(r.height, percent_y);
+    Rect::new(r.x.saturating_add(x), r.y.saturating_add(y), width, height)
 }
 
-fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
+fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
     let dialog = &app.throttle_dialog;
 
     let title = if let (Some(pid), Some(name)) = (dialog.target_pid, &dialog.target_name) {
@@ -1613,7 +1673,7 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::BrightWhite)
     };
 
     let upload_style = if dialog.selected_field == ThrottleField::Upload {
@@ -1621,7 +1681,7 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::BrightWhite)
     };
 
     let traffic_type = dialog.get_traffic_type();
@@ -1632,8 +1692,8 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
     };
 
     let dialog_text = vec![
-        Line::from(""),
-        Line::from(vec![
+        line(""),
+        line(vec![
             Span::styled("Download Limit (KB/s): ", download_style),
             Span::styled(
                 if dialog.download_input.is_empty() {
@@ -1644,8 +1704,8 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
                 download_style,
             ),
         ]),
-        Line::from(""),
-        Line::from(vec![
+        line(""),
+        line(vec![
             Span::styled("Upload Limit (KB/s):   ", upload_style),
             Span::styled(
                 if dialog.upload_input.is_empty() {
@@ -1656,9 +1716,12 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
                 upload_style,
             ),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Traffic Type:          ", Style::default().fg(Color::White)),
+        line(""),
+        line(vec![
+            Span::styled(
+                "Traffic Type:          ",
+                Style::default().fg(Color::BrightWhite),
+            ),
             Span::styled(
                 traffic_type_display,
                 Style::default()
@@ -1666,29 +1729,71 @@ fn draw_throttle_dialog(f: &mut Frame, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
+        line(""),
+        line(Span::styled(
             "[Tab] Switch field  [t] Cycle traffic type  [Enter] Apply  [Esc] Cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::BrightBlack),
         )),
     ];
 
-    let dialog_widget = Paragraph::new(dialog_text)
-        .style(Style::default().bg(Color::Black).fg(Color::White))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .style(Style::default().fg(Color::Cyan)),
-        );
+    let dialog_widget = (
+        render::lines(dialog_text),
+        TextPresentation {
+            style: Style::default().bg(Color::Black).fg(Color::BrightWhite),
+            chrome: Some(PanelChrome {
+                title: Some(line(title)),
+                style: Style::default().fg(Color::Cyan),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
 
     let dialog_area = centered_rect(60, 30, area);
-    f.render_widget(Clear, dialog_area);
-    f.render_widget(dialog_widget, dialog_area);
+    clear(f, dialog_area);
+    paint_text(
+        &app.component_scene,
+        "draw_throttle_dialog",
+        f,
+        dialog_area,
+        dialog_widget,
+    );
+    let field_x = dialog_area.x.saturating_add(24);
+    let field_width = dialog_area.width.saturating_sub(25);
+    for (row, value, selected, style) in [
+        (
+            2u16,
+            &dialog.download_input,
+            dialog.selected_field == ThrottleField::Download,
+            download_style,
+        ),
+        (
+            4u16,
+            &dialog.upload_input,
+            dialog.selected_field == ThrottleField::Upload,
+            upload_style,
+        ),
+    ] {
+        if row < dialog_area.height.saturating_sub(1) {
+            render::paint_input(
+                &app.component_scene,
+                if row == 2 {
+                    "throttle.download"
+                } else {
+                    "throttle.upload"
+                },
+                f,
+                Rect::new(field_x, dialog_area.y.saturating_add(row), field_width, 1),
+                value,
+                selected,
+                style,
+            );
+        }
+    }
 }
 
 fn draw_backend_compatibility_dialog(
-    f: &mut Frame,
+    f: &mut PaintCx<'_, '_>,
     area: Rect,
     app: &mut AppState,
     dialog: &BackendCompatibilityDialog,
@@ -1705,8 +1810,8 @@ fn draw_backend_compatibility_dialog(
 
     // Build styled lines with radio buttons
     let mut lines = vec![
-        Line::from(""),
-        Line::from(format!(
+        line(""),
+        line(format!(
             "{} {} backend '{}' does not support '{:?}' traffic filtering.",
             if dialog.compatible_backends.is_empty() {
                 "No available"
@@ -1721,18 +1826,18 @@ fn draw_backend_compatibility_dialog(
             dialog.current_backend,
             dialog.traffic_type
         )),
-        Line::from(""),
-        Line::from(if dialog.compatible_backends.is_empty() {
+        line(""),
+        line(if dialog.compatible_backends.is_empty() {
             "No backends on this system support IP-based traffic filtering."
         } else {
             "Only 'All Traffic' throttling is supported by this backend."
         }),
-        Line::from(""),
-        Line::from(Span::styled(
+        line(""),
+        line(Span::styled(
             "What would you like to do?",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
+        line(""),
     ];
 
     for (i, option) in options.iter().enumerate() {
@@ -1746,10 +1851,10 @@ fn draw_backend_compatibility_dialog(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::BrightWhite)
         };
 
-        lines.push(Line::from(vec![
+        lines.push(line(vec![
             Span::raw("  "),
             Span::styled(radio, style),
             Span::raw(" "),
@@ -1757,11 +1862,11 @@ fn draw_backend_compatibility_dialog(
         ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    lines.push(line(""));
+    lines.push(line(""));
+    lines.push(line(Span::styled(
         "[Enter] Confirm  [↑↓] Navigate  [Esc/q] Cancel",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     let dialog_area = centered_rect(80, 50, area);
@@ -1776,20 +1881,30 @@ fn draw_backend_compatibility_dialog(
     app.backend_compat_scroll_offset = clamped_scroll;
 
     // Render paragraph
-    let paragraph = Paragraph::new(lines)
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Backend Incompatibility (↑↓ to scroll)")
-                .style(Style::default().fg(Color::Red)),
-        );
+    let paragraph = (
+        render::lines(lines),
+        TextPresentation {
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Backend Incompatibility (↑↓ to scroll)")),
+                style: Style::default().fg(Color::Red),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(Clear, dialog_area);
-    f.render_widget(paragraph, dialog_area);
+    clear(f, dialog_area);
+    paint_text(
+        &app.component_scene,
+        "compatibility",
+        f,
+        dialog_area,
+        paragraph,
+    );
 }
 
-fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &AppState) {
+fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
     // Get selected process
     let selected_proc = app.get_selected_process();
     if selected_proc.is_none() {
@@ -1801,18 +1916,31 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &AppState) {
 
     if history.is_none() || history.unwrap().samples.is_empty() {
         // No history data available
-        let no_data = Paragraph::new("No historical data available yet...")
-            .style(Style::default().bg(Color::Black).fg(Color::Yellow))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Bandwidth Graph: {} (PID {})", proc.name, proc.pid))
-                    .style(Style::default().fg(Color::Cyan)),
-            );
+        let no_data = (
+            render::lines("No historical data available yet..."),
+            TextPresentation {
+                style: Style::default().bg(Color::Black).fg(Color::Yellow),
+                chrome: Some(PanelChrome {
+                    title: Some(line(format!(
+                        "Bandwidth Graph: {} (PID {})",
+                        proc.name, proc.pid
+                    ))),
+                    style: Style::default().fg(Color::Cyan),
+                    ..PanelChrome::default()
+                }),
+                ..TextPresentation::default()
+            },
+        );
 
         let graph_area = centered_rect(80, 60, area);
-        f.render_widget(Clear, graph_area);
-        f.render_widget(no_data, graph_area);
+        clear(f, graph_area);
+        paint_text(
+            &app.component_scene,
+            "draw_bandwidth_graph",
+            f,
+            graph_area,
+            no_data,
+        );
         return;
     }
 
@@ -1824,83 +1952,68 @@ fn draw_bandwidth_graph(f: &mut Frame, area: Rect, app: &AppState) {
     let max_upload = history.max_upload_rate() as f64;
     let max_value = max_download.max(max_upload).max(1.0); // Avoid division by zero
 
-    // Create datasets
-    let datasets = vec![
-        Dataset::default()
-            .name("Download")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Green))
-            .data(&download_data),
-        Dataset::default()
-            .name("Upload")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Yellow))
-            .data(&upload_data),
-    ];
-
-    // Create chart
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    "Bandwidth Graph: {} (PID {}) | Max: ↓{} ↑{} | Avg: ↓{} ↑{}",
-                    proc.name,
-                    proc.pid,
-                    ProcessInfo::format_rate(history.max_download_rate()),
-                    ProcessInfo::format_rate(history.max_upload_rate()),
-                    ProcessInfo::format_rate(history.avg_download_rate()),
-                    ProcessInfo::format_rate(history.avg_upload_rate()),
-                ))
-                .style(Style::default().fg(Color::Cyan)),
-        )
-        .x_axis(
-            Axis::default()
-                .title("Time (samples)")
-                .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, 60.0]),
-        )
-        .y_axis(
-            Axis::default()
-                .title("Bandwidth (bytes/s)")
-                .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, max_value * 1.1]), // Add 10% headroom
-        );
-
     let graph_area = centered_rect(90, 70, area);
-    f.render_widget(Clear, graph_area);
-    f.render_widget(chart, graph_area);
+    clear(f, graph_area);
+    render::paint_bandwidth_graph(
+        f,
+        graph_area,
+        &download_data,
+        &upload_data,
+        max_value * 1.1,
+        format!(
+            "Bandwidth Graph: {} (PID {}) | Max: ↓{} ↑{} | Avg: ↓{} ↑{}",
+            proc.name,
+            proc.pid,
+            ProcessInfo::format_rate(history.max_download_rate()),
+            ProcessInfo::format_rate(history.max_upload_rate()),
+            ProcessInfo::format_rate(history.avg_download_rate()),
+            ProcessInfo::format_rate(history.avg_upload_rate())
+        ),
+    );
 
     // Draw instructions at bottom
-    let instructions = Paragraph::new("Press 'g', 'q', or 'Esc' to close graph")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(ratatui::layout::Alignment::Center);
-
     let inst_area = Rect {
         x: graph_area.x,
-        y: graph_area.y + graph_area.height - 2,
+        y: graph_area.y + graph_area.height.saturating_sub(2),
         width: graph_area.width,
         height: 1,
     };
-    f.render_widget(instructions, inst_area);
+    let message = "Press 'g', 'q', or 'Esc' to close graph";
+    let width = u16::try_from(display_width(message))
+        .unwrap_or(u16::MAX)
+        .min(inst_area.width);
+    render::paint_label(
+        f,
+        Rect::new(
+            inst_area.x.saturating_add((inst_area.width - width) / 2),
+            inst_area.y,
+            width,
+            1,
+        ),
+        line(message),
+        Style::new().fg(Color::BrightBlack),
+    );
 }
 
-fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info: &BackendInfo) {
-    let mut text = vec![Line::from("")];
+fn draw_backend_info(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    app: &mut AppState,
+    backend_info: &BackendInfo,
+) {
+    let mut text = vec![line("")];
 
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "bproc - Backends",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Show currently active monitoring backend
     if let Some(monitoring_backend) = &backend_info.active_monitoring {
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::styled(
                 "📡 Monitoring: ",
                 Style::default()
@@ -1913,12 +2026,12 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" (packet capture)", Style::default().fg(Color::DarkGray)),
+            Span::styled(" (packet capture)", Style::default().fg(Color::BrightBlack)),
         ]));
     }
 
     if let Some(socket_mapper) = &backend_info.active_socket_mapper {
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::styled(
                 "🔌 Socket Mapper: ",
                 Style::default()
@@ -1931,11 +2044,11 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" (PID mapping)", Style::default().fg(Color::DarkGray)),
+            Span::styled(" (PID mapping)", Style::default().fg(Color::BrightBlack)),
         ]));
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Get backend stats from backend_info
     let backend_stats = &backend_info.backend_stats;
@@ -1951,7 +2064,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
             BackendSelectorItem::GroupHeader(group) => {
                 // Add spacing before groups (except first)
                 if index > 0 {
-                    text.push(Line::from(""));
+                    text.push(line(""));
                     current_line += 1;
                 }
 
@@ -1960,7 +2073,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     BackendGroup::Upload => "Upload Backends:",
                     BackendGroup::Download => "Download Backends:",
                 };
-                text.push(Line::from(Span::styled(
+                text.push(line(Span::styled(
                     header,
                     Style::default()
                         .fg(Color::Yellow)
@@ -1993,7 +2106,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(Color::BrightBlack)
                 };
 
                 // Status indicator
@@ -2010,11 +2123,11 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
-                        .bg(Color::DarkGray)
+                        .bg(Color::BrightBlack)
                 } else if !available {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(Color::BrightWhite)
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(Color::BrightWhite)
                 };
 
                 let priority_str = format!("{:?}", priority);
@@ -2044,7 +2157,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                 } else if !available {
                     line_spans.push(Span::styled(
                         " (unavailable)",
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(Color::BrightWhite),
                     ));
                 }
 
@@ -2052,21 +2165,21 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                 if !throttle_info.is_empty() {
                     line_spans.push(Span::styled(
                         throttle_info,
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(Color::BrightWhite),
                     ));
                 }
 
-                text.push(Line::from(line_spans));
+                text.push(line(line_spans));
                 current_line += 1;
             }
         }
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
+    text.push(line(""));
+    text.push(line(""));
 
     // Upload Backends Section
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "Upload Backends:",
         Style::default()
             .fg(Color::Cyan)
@@ -2074,9 +2187,9 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
     )));
 
     if backend_info.available_upload.is_empty() {
-        text.push(Line::from(Span::styled(
+        text.push(line(Span::styled(
             "  ⚪ (none compiled)",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::BrightWhite),
         )));
     } else {
         for (name, priority, available) in &backend_info.available_upload {
@@ -2105,7 +2218,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                 String::new()
             };
 
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  "),
                 Span::styled(symbol, Style::default().fg(color)),
                 Span::raw(" "),
@@ -2116,7 +2229,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(Color::BrightWhite)
                     },
                 ),
                 Span::raw(" "),
@@ -2125,7 +2238,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     Style::default().fg(if is_active {
                         Color::Yellow
                     } else {
-                        Color::Gray
+                        Color::BrightWhite
                     }),
                 ),
                 Span::raw("  Priority: "),
@@ -2133,15 +2246,15 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     format!("{:8}", priority_str),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(throttle_info, Style::default().fg(Color::Gray)),
+                Span::styled(throttle_info, Style::default().fg(Color::BrightWhite)),
             ]));
         }
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Download Backends Section
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "Download Backends:",
         Style::default()
             .fg(Color::Cyan)
@@ -2149,9 +2262,9 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
     )));
 
     if backend_info.available_download.is_empty() {
-        text.push(Line::from(Span::styled(
+        text.push(line(Span::styled(
             "  ⚪ (none compiled)",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::BrightWhite),
         )));
     } else {
         for (name, priority, available) in &backend_info.available_download {
@@ -2180,7 +2293,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                 String::new()
             };
 
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  "),
                 Span::styled(symbol, Style::default().fg(color)),
                 Span::raw(" "),
@@ -2191,7 +2304,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(Color::BrightWhite)
                     },
                 ),
                 Span::raw(" "),
@@ -2200,7 +2313,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     Style::default().fg(if is_active {
                         Color::Yellow
                     } else {
-                        Color::Gray
+                        Color::BrightWhite
                     }),
                 ),
                 Span::raw("  Priority: "),
@@ -2208,15 +2321,15 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     format!("{:8}", priority_str),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(throttle_info, Style::default().fg(Color::Gray)),
+                Span::styled(throttle_info, Style::default().fg(Color::BrightWhite)),
             ]));
         }
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Socket Mapper Backends Section
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "Socket Mapper Backends:",
         Style::default()
             .fg(Color::Cyan)
@@ -2224,9 +2337,9 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
     )));
 
     if backend_info.available_socket_mappers.is_empty() {
-        text.push(Line::from(Span::styled(
+        text.push(line(Span::styled(
             "  ⚪ (none available)",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::BrightWhite),
         )));
     } else {
         for (name, priority, available) in &backend_info.available_socket_mappers {
@@ -2249,7 +2362,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
 
             let priority_str = format!("{:?}", priority);
 
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  "),
                 Span::styled(symbol, Style::default().fg(color)),
                 Span::raw(" "),
@@ -2260,7 +2373,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(Color::BrightWhite)
                     },
                 ),
                 Span::raw(" "),
@@ -2269,7 +2382,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                     Style::default().fg(if is_active {
                         Color::Yellow
                     } else {
-                        Color::Gray
+                        Color::BrightWhite
                     }),
                 ),
                 Span::raw("  Priority: "),
@@ -2281,10 +2394,10 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
         }
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Configuration Section
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "Configuration:",
         Style::default()
             .fg(Color::Cyan)
@@ -2302,11 +2415,11 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
         .map(|s| format!(" ({} selected)", s))
         .unwrap_or_else(|| " (none available)".to_string());
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Preferred Upload:     "),
         Span::styled(
             format!("{}{}", preferred_upload_display, active_upload_display),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::BrightWhite),
         ),
     ]));
 
@@ -2321,11 +2434,11 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
         .map(|s| format!(" ({} selected)", s))
         .unwrap_or_else(|| " (none available)".to_string());
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Preferred Download:   "),
         Span::styled(
             format!("{}{}", preferred_download_display, active_download_display),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::BrightWhite),
         ),
     ]));
 
@@ -2340,30 +2453,30 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
         .map(|s| format!(" ({} selected)", s))
         .unwrap_or_else(|| " (none available)".to_string());
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Preferred Socket Map: "),
         Span::styled(
             format!(
                 "{}{}",
                 preferred_socket_mapper_display, active_socket_mapper_display
             ),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::BrightWhite),
         ),
     ]));
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Config File:          "),
         Span::styled(
             "~/.config/bproc/throttles.json",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::BrightWhite),
         ),
     ]));
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Capabilities Section (only if we have active backends)
     if backend_info.upload_capabilities.is_some() || backend_info.download_capabilities.is_some() {
-        text.push(Line::from(Span::styled(
+        text.push(line(Span::styled(
             "Capabilities (Active Backends):",
             Style::default()
                 .fg(Color::Cyan)
@@ -2377,7 +2490,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
             .or(backend_info.download_capabilities.as_ref());
 
         if let Some(capabilities) = caps {
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  IPv4:              "),
                 Span::styled(
                     if capabilities.ipv4_support {
@@ -2406,7 +2519,7 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
                 ),
             ]));
 
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  Per-Process:       "),
                 Span::styled(
                     if capabilities.per_process {
@@ -2436,13 +2549,13 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
             ]));
         }
 
-        text.push(Line::from(""));
+        text.push(line(""));
     }
 
     // Instructions
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "[↑↓] Navigate  [Space] Apply  [Enter/b/Esc] Close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     let backend_area = centered_rect(80, 80, area);
@@ -2462,18 +2575,28 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
     );
     app.backend_info_scroll_offset = clamped_scroll;
 
-    let backend_widget = Paragraph::new(text)
-        .style(Style::default().bg(Color::Black).fg(Color::White))
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Backends (↑↓ to scroll)")
-                .style(Style::default().fg(Color::Cyan)),
-        );
+    let backend_widget = (
+        render::lines(text),
+        TextPresentation {
+            style: Style::default().bg(Color::Black).fg(Color::BrightWhite),
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Backends (↑↓ to scroll)")),
+                style: Style::default().fg(Color::Cyan),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(Clear, backend_area);
-    f.render_widget(backend_widget, backend_area);
+    clear(f, backend_area);
+    paint_text(
+        &app.component_scene,
+        "backend",
+        f,
+        backend_area,
+        backend_widget,
+    );
 
     // Store clickable region for mouse selection
     app.clickable_regions.push(ClickableRegion {
@@ -2482,8 +2605,8 @@ fn draw_backend_info(f: &mut Frame, area: Rect, app: &mut AppState, backend_info
     });
 }
 
-fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
-    let items: Vec<ListItem> = app
+fn draw_interface_list(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
+    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = app
         .interface_list
         .iter()
         .enumerate()
@@ -2542,7 +2665,7 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                     .join(", ")
             };
 
-            let content = Line::from(vec![
+            let content = line(vec![
                 Span::styled(selection_indicator, Style::default().fg(Color::Yellow)),
                 Span::styled(
                     status_indicator,
@@ -2554,7 +2677,7 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 Span::styled(
                     format!("{:12} ", iface.name),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(Color::BrightWhite)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -2588,11 +2711,14 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
                 ),
             ]);
 
-            ListItem::new(content)
+            bmux_tui_components::selectable_list::SelectableListItem::rich(
+                content.plain_text(),
+                content,
+            )
         })
         .collect();
 
-    let header = Line::from(vec![
+    let header = line(vec![
         Span::styled("  ", Style::default()),
         Span::styled(
             "Interface    ",
@@ -2611,7 +2737,7 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
     let header_area = Rect {
         x: area.x + 2,
         y: area.y + 1,
-        width: area.width - 4,
+        width: area.width.saturating_sub(5),
         height: 1,
     };
 
@@ -2623,18 +2749,26 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
     };
 
     // Render border and title
-    let border = Block::default()
-        .borders(Borders::ALL)
-        .title("Network Interfaces");
-    f.render_widget(border, area);
+    let border = PanelChrome {
+        title: Some(line("Network Interfaces")),
+        ..PanelChrome::default()
+    };
+    paint_border(f, area, border);
 
     // Render header
-    f.render_widget(Paragraph::new(header), header_area);
+    paint_text(
+        &app.component_scene,
+        "draw_interface_list.header",
+        f,
+        header_area,
+        (render::lines(header), TextPresentation::default()),
+    );
 
     // Render list
-    let list = List::new(items).highlight_style(
+    let list = (
+        items,
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(Color::BrightBlack)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -2645,18 +2779,40 @@ fn draw_interface_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         height: list_area.height.saturating_sub(1),
     };
 
-    f.render_stateful_widget(list, inner_list_area, &mut app.interface_list_state);
+    paint_list(
+        &app.component_scene,
+        "draw_interface_list",
+        f,
+        inner_list_area,
+        &list.0,
+        list.1,
+        &mut app.interface_list_state,
+    );
 }
 
-fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     // Get the selected interface name
     let interface_name = match &app.selected_interface_name {
         Some(name) => name.clone(),
         None => {
             // No interface selected, show error
-            let error = Paragraph::new("No interface selected")
-                .block(Block::default().borders(Borders::ALL).title("Error"));
-            f.render_widget(error, area);
+            let error = (
+                render::lines("No interface selected"),
+                TextPresentation {
+                    chrome: Some(PanelChrome {
+                        title: Some(line("Error")),
+                        ..PanelChrome::default()
+                    }),
+                    ..TextPresentation::default()
+                },
+            );
+            paint_text(
+                &app.component_scene,
+                "draw_interface_detail",
+                f,
+                area,
+                error,
+            );
             return;
         }
     };
@@ -2669,7 +2825,7 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
         .filter(|p| p.interface_stats.contains_key(&interface_name))
         .collect();
 
-    let items: Vec<ListItem> = filtered_processes
+    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = filtered_processes
         .iter()
         .map(|proc| {
             // Get interface-specific stats
@@ -2695,11 +2851,11 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
                 " "
             };
 
-            let terminated_color = Color::Gray;
+            let terminated_color = Color::White;
             let name_color = if proc.is_terminated {
                 terminated_color
             } else {
-                Color::White
+                Color::BrightWhite
             };
             let dl_rate_color = if proc.is_terminated {
                 terminated_color
@@ -2727,14 +2883,17 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
                 Color::Red
             };
 
-            let content = Line::from(vec![
+            let content = line(vec![
                 Span::raw("  "),
                 Span::raw(format!("{:7} ", proc.pid)),
                 Span::styled(
                     format!(
                         "{:20} ",
-                        if proc.name.len() > 20 {
-                            format!("{}...", &proc.name[..17])
+                        if display_width(&proc.name) > 20 {
+                            format!(
+                                "{}...",
+                                &bmux_tui_components::compact::truncate_width(&proc.name, 17)
+                            )
                         } else {
                             proc.name.clone()
                         }
@@ -2765,11 +2924,14 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
                 ),
             ]);
 
-            ListItem::new(content)
+            bmux_tui_components::selectable_list::SelectableListItem::rich(
+                content.plain_text(),
+                content,
+            )
         })
         .collect();
 
-    let header = Line::from(vec![
+    let header = line(vec![
         Span::styled("PID     ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             "Process              ",
@@ -2786,7 +2948,7 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
     let header_area = Rect {
         x: area.x + 4,
         y: area.y + 1,
-        width: area.width - 4,
+        width: area.width.saturating_sub(5),
         height: 1,
     };
 
@@ -2799,14 +2961,23 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
 
     // Render border and title
     let title = format!("Interface: {} [Press Esc to go back]", interface_name);
-    let border = Block::default().borders(Borders::ALL).title(title);
-    f.render_widget(border, area);
+    let border = PanelChrome {
+        title: Some(line(title)),
+        ..PanelChrome::default()
+    };
+    paint_border(f, area, border);
 
     // Render header
-    f.render_widget(Paragraph::new(header), header_area);
+    paint_text(
+        &app.component_scene,
+        "draw_interface_detail.2",
+        f,
+        header_area,
+        (render::lines(header), TextPresentation::default()),
+    );
 
     // Render list
-    let list = List::new(items);
+    let list = (items, Style::default());
     let inner_list_area = Rect {
         x: list_area.x + 1,
         y: list_area.y,
@@ -2814,20 +2985,28 @@ fn draw_interface_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
         height: list_area.height.saturating_sub(1),
     };
 
-    f.render_widget(list, inner_list_area);
+    paint_list(
+        &app.component_scene,
+        "draw_interface_detail",
+        f,
+        inner_list_area,
+        &list.0,
+        list.1,
+        &mut ListState::default(),
+    );
 }
 
-fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
-    let mut text = vec![Line::from("")];
+fn draw_interface_modal(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
+    let mut text = vec![line("")];
 
     // Title
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "Network Interfaces - Filter Selection",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Show current filter state
     let filter_state = match &app.active_interface_filters {
@@ -2841,14 +3020,14 @@ fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
             }
         }
     };
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         filter_state,
         Style::default().fg(Color::Yellow),
     )));
-    text.push(Line::from(""));
+    text.push(line(""));
 
-    text.push(Line::from("Select interfaces to show (updates live):"));
-    text.push(Line::from(""));
+    text.push(line("Select interfaces to show (updates live):"));
+    text.push(line(""));
 
     // List interfaces with checkboxes
     for (index, iface) in app.interface_list.iter().enumerate() {
@@ -2861,16 +3040,16 @@ fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
         let checkbox_style = if is_filtered {
             Style::default().fg(Color::Green)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::BrightBlack)
         };
 
         let name_style = if is_cursor {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray)
+                .bg(Color::BrightBlack)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::BrightWhite)
         };
 
         // Calculate total count from unfiltered list (all processes using this interface)
@@ -2887,29 +3066,29 @@ fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
             .filter(|p| p.interface_stats.contains_key(&iface.name))
             .count();
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw(cursor),
             Span::styled(checkbox, checkbox_style),
             Span::raw(" "),
             Span::styled(format!("{:12}", iface.name), name_style),
             Span::styled(
                 format!(" ({}/{} processes)", filtered_count, total_count),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::BrightWhite),
             ),
         ]));
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
+    text.push(line(""));
+    text.push(line(""));
 
     // Instructions
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "[↑↓] Navigate  [Space] Toggle (applies live)  [A] Toggle All/None",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
-    text.push(Line::from(Span::styled(
+    text.push(line(Span::styled(
         "[Enter] View details  [Esc/i] Close and return to process view",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     let modal_area = centered_rect(70, 60, area);
@@ -2935,18 +3114,24 @@ fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
     );
     app.interface_modal_scroll_offset = clamped_scroll;
 
-    let widget = Paragraph::new(text)
-        .style(Style::default().bg(Color::Black).fg(Color::White))
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Interface Filter (↑↓ to scroll)")
-                .style(Style::default().fg(Color::Cyan)),
-        );
+    let widget = (
+        render::lines(text),
+        TextPresentation {
+            style: Style::default().bg(Color::Black).fg(Color::BrightWhite),
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Interface Filter (↑↓ to scroll)")),
+                style: Style::default().fg(Color::Cyan),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
 
-    f.render_widget(Clear, modal_area);
-    f.render_widget(widget, modal_area);
+    clear(f, modal_area);
+    paint_text(&app.component_scene, "interfaces", f, modal_area, widget);
+    // Checked indicators are part of the rich BMUX text composition above.
+    // Do not overlay another control: that changes glyphs and duplicates hit IDs.
 
     // Store clickable region for mouse selection
     app.clickable_regions.push(ClickableRegion {
@@ -2958,33 +3143,37 @@ fn draw_interface_modal(f: &mut Frame, area: Rect, app: &mut AppState) {
 }
 // Process Detail View Rendering
 
-fn draw_process_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
+fn draw_process_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     // Get the process being detailed (still alive in process list?)
     // Clone it to avoid borrow checker issues
     let process = match app.get_detail_process() {
         Some(p) => p.clone(),
         None => {
             // Process no longer exists - show message and return to process list
-            let message = Paragraph::new("Process no longer exists (press Esc to return)")
-                .style(Style::default().fg(Color::Red))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Process Not Found"),
-                );
-            f.render_widget(message, area);
+            let message = (
+                render::lines("Process no longer exists (press Esc to return)"),
+                TextPresentation {
+                    style: Style::default().fg(Color::Red),
+                    chrome: Some(PanelChrome {
+                        title: Some(line("Process Not Found")),
+                        ..PanelChrome::default()
+                    }),
+                    ..TextPresentation::default()
+                },
+            );
+            paint_text(
+                &app.component_scene,
+                "draw_process_detail",
+                f,
+                area,
+                message,
+            );
             return;
         }
     };
 
     // Split into combined header and content areas (saves 6 lines!)
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Combined title + tabs
-            Constraint::Min(10),   // Content
-        ])
-        .split(area);
+    let chunks = split_vertical(area, 3, 0);
 
     // Draw combined title with tabs
     draw_detail_header_with_tabs(f, chunks[0], &process, app.detail_tab, app);
@@ -2999,85 +3188,76 @@ fn draw_process_detail(f: &mut Frame, area: Rect, app: &mut AppState) {
 }
 
 fn draw_detail_header_with_tabs(
-    f: &mut Frame,
+    f: &mut PaintCx<'_, '_>,
     area: Rect,
     process: &ProcessInfo,
     current_tab: ProcessDetailTab,
     app: &mut AppState,
 ) {
-    let tabs = vec!["Overview", "Connections", "Traffic", "System"];
-    let mut spans = vec![];
-    let mut tab_ranges = Vec::new();
-
-    // Track column position for click regions
-    let base_col = area.x + 1; // Account for border only (no padding)
-    let mut current_col = base_col;
-
-    // Add process name and PID first
-    let name_span = Span::styled(
-        process.name.clone(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+    let prefix = line(vec![
+        Span::styled(
+            process.name.clone(),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" (PID {})  ", process.pid)),
+    ]);
+    let prefix_width = prefix.width().min(u16::MAX as usize) as u16;
+    paint_border(
+        f,
+        area,
+        PanelChrome {
+            title: Some(line("Process Details")),
+            ..Default::default()
+        },
     );
-    current_col += name_span.content.width() as u16;
-    spans.push(name_span);
-
-    let pid_text = format!(" (PID {})  ", process.pid);
-    current_col += pid_text.width() as u16;
-    spans.push(Span::raw(pid_text));
-
-    // Add tabs and track their positions for click handling
-    for (i, tab_name) in tabs.iter().enumerate() {
-        let tab_enum = match i {
-            0 => ProcessDetailTab::Overview,
-            1 => ProcessDetailTab::Connections,
-            2 => ProcessDetailTab::Traffic,
-            3 => ProcessDetailTab::System,
-            _ => ProcessDetailTab::Overview,
-        };
-
-        let is_active = tab_enum == current_tab;
-
-        // Add space before tab (except first)
-        if i > 0 {
-            spans.push(Span::raw(" "));
-            current_col += 1;
-        }
-
-        let style = if is_active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        // Add opening bracket and start tracking click range
-        let tab_click_start = current_col; // Include opening bracket
-        spans.push(Span::raw("["));
-        current_col += 1;
-
-        // Add tab name
-        spans.push(Span::styled(tab_name.to_string(), style));
-        current_col += tab_name.width() as u16;
-
-        // Add closing bracket
-        spans.push(Span::raw("]"));
-        current_col += 1;
-        let tab_click_end = current_col; // Include closing bracket
-
-        // Store click range including brackets for easier clicking
-        tab_ranges.push((tab_click_start, tab_click_end, tab_enum));
-    }
-
-    let header_widget = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Process Details"),
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
     );
-    f.render_widget(header_widget, area);
+    paint_text(
+        &app.component_scene,
+        "draw_detail_header_with_tabs",
+        f,
+        inner,
+        (vec![prefix], TextPresentation::default()),
+    );
+    let tab_area = Rect::new(
+        inner.x.saturating_add(prefix_width),
+        inner.y,
+        inner.width.saturating_sub(prefix_width),
+        1.min(inner.height),
+    );
+    render::paint_detail_tabs(
+        &app.component_scene,
+        "detail.tabs",
+        f,
+        tab_area,
+        match current_tab {
+            ProcessDetailTab::Overview => 0,
+            ProcessDetailTab::Connections => 1,
+            ProcessDetailTab::Traffic => 2,
+            ProcessDetailTab::System => 3,
+        },
+    );
+    let mut col = tab_area.x;
+    let tab_ranges = [
+        ("Overview", ProcessDetailTab::Overview),
+        ("Connections", ProcessDetailTab::Connections),
+        ("Traffic", ProcessDetailTab::Traffic),
+        ("System", ProcessDetailTab::System),
+    ]
+    .into_iter()
+    .map(|(name, tab)| {
+        let start = col;
+        let end = start
+            .saturating_add(display_width(name) as u16)
+            .saturating_add(2);
+        col = end.saturating_add(1);
+        (start, end, tab)
+    })
+    .collect();
 
     // Store clickable region for mouse selection
     app.clickable_regions.push(ClickableRegion {
@@ -3086,62 +3266,70 @@ fn draw_detail_header_with_tabs(
     });
 }
 
-fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &mut AppState) {
+fn draw_detail_overview(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    process: &ProcessInfo,
+    app: &mut AppState,
+) {
     let history = &app.history;
     let mut text = vec![];
 
     // Basic Information
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Basic Information:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
-    text.push(Line::from(format!("  PID:              {}", process.pid)));
-    text.push(Line::from(format!("  Name:             {}", process.name)));
+    text.push(line(""));
+    text.push(line(format!("  PID:              {}", process.pid)));
+    text.push(line(format!("  Name:             {}", process.name)));
 
     // Get process details
-    let details = crate::process::ProcessDetails::from_pid(process.pid);
+    let details = app.details_for(process);
 
     if let Some(ref cmdline) = details.cmdline {
         let cmd_str = cmdline.join(" ");
-        let cmd_display = if cmd_str.len() > 80 {
-            format!("{}...", &cmd_str[..77])
+        let cmd_display = if display_width(&cmd_str) > 80 {
+            format!(
+                "{}...",
+                &bmux_tui_components::compact::truncate_width(&cmd_str, 77)
+            )
         } else {
             cmd_str
         };
-        text.push(Line::from(format!("  Command:          {}", cmd_display)));
+        text.push(line(format!("  Command:          {}", cmd_display)));
     }
 
     if let Some(ref exe) = details.exe_path {
-        text.push(Line::from(format!("  Executable:       {}", exe)));
+        text.push(line(format!("  Executable:       {}", exe)));
     }
 
     if let Some(ref cwd) = details.cwd {
-        text.push(Line::from(format!("  Working Dir:      {}", cwd)));
+        text.push(line(format!("  Working Dir:      {}", cwd)));
     }
 
-    text.push(Line::from(format!(
+    text.push(line(format!(
         "  State:            {}",
         details.state_description()
     )));
 
     if let Some(ppid) = details.ppid {
-        text.push(Line::from(format!("  Parent PID:       {}", ppid)));
+        text.push(line(format!("  Parent PID:       {}", ppid)));
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Network Statistics
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Network Statistics:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
-    text.push(Line::from(vec![
+    text.push(line(""));
+    text.push(line(vec![
         Span::raw("  Current Download: "),
         Span::styled(
             format!("↓ {:>10}", ProcessInfo::format_rate(process.download_rate)),
@@ -3154,7 +3342,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         ),
     ]));
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Total Download:   "),
         Span::styled(
             format!("{:>10}", ProcessInfo::format_bytes(process.total_download)),
@@ -3169,7 +3357,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
 
     // Get history stats
     if let Some(hist) = history.get_history(process.pid) {
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  Peak Download:    "),
             Span::styled(
                 format!("{:>10}", ProcessInfo::format_rate(hist.max_download_rate())),
@@ -3182,7 +3370,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
             ),
         ]));
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  Avg Download:     "),
             Span::styled(
                 format!("{:>10}", ProcessInfo::format_rate(hist.avg_download_rate())),
@@ -3196,16 +3384,16 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         ]));
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Internet/Local breakdown
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Internet Traffic:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     let internet_pct = if process.download_rate > 0 {
         (process.internet_download_rate as f64 / process.download_rate as f64 * 100.0) as u32
@@ -3213,7 +3401,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         0
     };
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Download:         "),
         Span::styled(
             format!(
@@ -3235,7 +3423,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         0
     };
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Upload:           "),
         Span::styled(
             format!(
@@ -3251,16 +3439,16 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         ),
     ]));
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Local traffic
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Local Traffic:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     let local_dl_pct = if process.download_rate > 0 {
         (process.local_download_rate as f64 / process.download_rate as f64 * 100.0) as u32
@@ -3268,7 +3456,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         0
     };
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Download:         "),
         Span::styled(
             format!(
@@ -3290,7 +3478,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         0
     };
 
-    text.push(Line::from(vec![
+    text.push(line(vec![
         Span::raw("  Upload:           "),
         Span::styled(
             format!(
@@ -3306,16 +3494,16 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         ),
     ]));
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Throttle status
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Throttle Status:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     if let Some(ref throttle) = process.throttle_limit {
         let dl_text = if let Some(limit) = throttle.download_limit {
@@ -3336,7 +3524,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
             crate::process::TrafficType::Local => "Local Only",
         };
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  Download Limit:   "),
             Span::styled(
                 dl_text,
@@ -3346,7 +3534,7 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
             Span::styled(" ⚡", Style::default().fg(Color::Yellow)),
         ]));
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  Upload Limit:     "),
             Span::styled(
                 ul_text,
@@ -3354,44 +3542,44 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
             ),
         ]));
     } else {
-        text.push(Line::from("  Not throttled"));
+        text.push(line("  Not throttled"));
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // System resources
     if details.memory_rss.is_some() || details.threads.is_some() {
-        text.push(Line::from(vec![Span::styled(
+        text.push(line(vec![Span::styled(
             "System Resources:",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
-        text.push(Line::from(""));
+        text.push(line(""));
 
         if let Some(rss) = details.memory_rss {
-            text.push(Line::from(format!(
+            text.push(line(format!(
                 "  Memory (RSS):     {}",
                 crate::process::ProcessDetails::format_memory(rss)
             )));
         }
 
         if let Some(vms) = details.memory_vms {
-            text.push(Line::from(format!(
+            text.push(line(format!(
                 "  Memory (VMS):     {}",
                 crate::process::ProcessDetails::format_memory(vms)
             )));
         }
 
         if let Some(threads) = details.threads {
-            text.push(Line::from(format!("  Threads:          {}", threads)));
+            text.push(line(format!("  Threads:          {}", threads)));
         }
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(Span::styled(
+    text.push(line(""));
+    text.push(line(Span::styled(
         "[↑↓] Scroll  [Tab] Switch tab  [t] Throttle  [g] Graph  [Esc] Back",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     // Clamp scroll offset to content bounds
@@ -3400,29 +3588,42 @@ fn draw_detail_overview(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &
         AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
     app.detail_scroll_offset = clamped_scroll;
 
-    let paragraph = Paragraph::new(text)
-        .scroll((clamped_scroll as u16, 0))
-        .block(Block::default().borders(Borders::ALL).title("Overview"));
-    f.render_widget(paragraph, area);
+    let paragraph = (
+        render::lines(text),
+        TextPresentation {
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Overview")),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
+    paint_text(&app.component_scene, "detail.overview", f, area, paragraph);
 }
 
-fn draw_detail_connections(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &mut AppState) {
+fn draw_detail_connections(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    process: &ProcessInfo,
+    app: &mut AppState,
+) {
     let mut text = vec![];
 
-    text.push(Line::from(""));
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(""));
+    text.push(line(vec![Span::styled(
         format!("Active Network Connections ({})", process.connections.len()),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     if process.connections.is_empty() {
-        text.push(Line::from("  No active connections"));
+        text.push(line("  No active connections"));
     } else {
         // Header
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::styled(
                 "  Protocol  ",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -3437,7 +3638,7 @@ fn draw_detail_connections(f: &mut Frame, area: Rect, process: &ProcessInfo, app
             ),
             Span::styled("State     ", Style::default().add_modifier(Modifier::BOLD)),
         ]));
-        text.push(Line::from(
+        text.push(line(
             "  ──────────────────────────────────────────────────────────────────────",
         ));
 
@@ -3488,10 +3689,10 @@ fn draw_detail_connections(f: &mut Frame, area: Rect, process: &ProcessInfo, app
             let state_style = match conn.state.as_str() {
                 "Established" => Style::default().fg(Color::Green),
                 "Listen" => Style::default().fg(Color::Cyan),
-                _ => Style::default().fg(Color::Gray),
+                _ => Style::default().fg(Color::BrightWhite),
             };
 
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw("  "),
                 Span::styled(format!("{:8}  ", conn.protocol), proto_style),
                 Span::raw(format!("{:24} ", local)),
@@ -3501,11 +3702,11 @@ fn draw_detail_connections(f: &mut Frame, area: Rect, process: &ProcessInfo, app
         }
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
-    text.push(Line::from(Span::styled(
+    text.push(line(""));
+    text.push(line(""));
+    text.push(line(Span::styled(
         "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     // Clamp scroll offset to content bounds
@@ -3514,10 +3715,24 @@ fn draw_detail_connections(f: &mut Frame, area: Rect, process: &ProcessInfo, app
         AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
     app.detail_scroll_offset = clamped_scroll;
 
-    let paragraph = Paragraph::new(text)
-        .scroll((clamped_scroll as u16, 0))
-        .block(Block::default().borders(Borders::ALL).title("Connections"));
-    f.render_widget(paragraph, area);
+    let paragraph = (
+        render::lines(text),
+        TextPresentation {
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Connections")),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
+    paint_text(
+        &app.component_scene,
+        "detail.connections",
+        f,
+        area,
+        paragraph,
+    );
 }
 
 fn format_ip_addr(addr: &IpAddr) -> String {
@@ -3528,23 +3743,28 @@ fn format_ip_addr(addr: &IpAddr) -> String {
     }
 }
 
-fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &mut AppState) {
+fn draw_detail_traffic(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    process: &ProcessInfo,
+    app: &mut AppState,
+) {
     let mut text = vec![];
 
-    text.push(Line::from(""));
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(""));
+    text.push(line(vec![Span::styled(
         "Traffic Breakdown by Interface:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     if process.interface_stats.is_empty() {
-        text.push(Line::from("  No interface data available"));
+        text.push(line("  No interface data available"));
     } else {
         // Header
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::styled(
                 "  Interface    ",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -3564,7 +3784,7 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
             Span::styled("Total UL", Style::default().add_modifier(Modifier::BOLD)),
         ]));
 
-        text.push(Line::from(
+        text.push(line(
             "  ─────────────────────────────────────────────────────────────────────",
         ));
 
@@ -3574,7 +3794,7 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
 
         for (iface_name, stats) in ifaces.iter().take(10) {
             // Show top 10
-            text.push(Line::from(vec![
+            text.push(line(vec![
                 Span::raw(format!("  {:12} ", iface_name)),
                 Span::styled(
                     format!(
@@ -3599,17 +3819,17 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
         }
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
+    text.push(line(""));
+    text.push(line(""));
 
     // Traffic by type
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Traffic by Type:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     let total_dl = process.download_rate;
     let total_ul = process.upload_rate;
@@ -3621,7 +3841,7 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
             0
         };
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  🌐 Internet:  "),
             Span::styled(
                 format!("{}%", internet_pct),
@@ -3653,7 +3873,7 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
             0
         };
 
-        text.push(Line::from(vec![
+        text.push(line(vec![
             Span::raw("  🏠 Local:     "),
             Span::styled(
                 format!("{}%", local_pct),
@@ -3676,14 +3896,14 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
             ),
         ]));
     } else {
-        text.push(Line::from("  No traffic"));
+        text.push(line("  No traffic"));
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
-    text.push(Line::from(Span::styled(
+    text.push(line(""));
+    text.push(line(""));
+    text.push(line(Span::styled(
         "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     // Clamp scroll offset to content bounds
@@ -3692,163 +3912,154 @@ fn draw_detail_traffic(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &m
         AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
     app.detail_scroll_offset = clamped_scroll;
 
-    let paragraph = Paragraph::new(text)
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Traffic Details"),
-        );
-    f.render_widget(paragraph, area);
+    let paragraph = (
+        render::lines(text),
+        TextPresentation {
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("Traffic Details")),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
+    paint_text(&app.component_scene, "detail.traffic", f, area, paragraph);
 }
 
-fn draw_detail_system(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &mut AppState) {
-    let details = crate::process::ProcessDetails::from_pid(process.pid);
+fn draw_detail_system(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    process: &ProcessInfo,
+    app: &mut AppState,
+) {
+    let details = app.details_for(process);
 
     let mut text = vec![];
 
-    text.push(Line::from(""));
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(""));
+    text.push(line(vec![Span::styled(
         "Process Information:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
-    text.push(Line::from(format!("  PID:                {}", details.pid)));
+    text.push(line(format!("  PID:                {}", details.pid)));
     if let Some(ppid) = details.ppid {
-        text.push(Line::from(format!("  Parent PID:         {}", ppid)));
+        text.push(line(format!("  Parent PID:         {}", ppid)));
     }
-    text.push(Line::from(format!(
+    text.push(line(format!(
         "  State:              {}",
         details.state_description()
     )));
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // User/Group
     if details.uid.is_some() || details.gid.is_some() {
-        text.push(Line::from(vec![Span::styled(
+        text.push(line(vec![Span::styled(
             "User/Group:",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
-        text.push(Line::from(""));
+        text.push(line(""));
 
         if let Some(uid) = details.uid {
-            text.push(Line::from(format!("  UID:                {}", uid)));
+            text.push(line(format!("  UID:                {}", uid)));
         }
         if let Some(gid) = details.gid {
-            text.push(Line::from(format!("  GID:                {}", gid)));
+            text.push(line(format!("  GID:                {}", gid)));
         }
 
-        text.push(Line::from(""));
+        text.push(line(""));
     }
 
     // Memory
     if details.memory_rss.is_some() || details.memory_vms.is_some() {
-        text.push(Line::from(vec![Span::styled(
+        text.push(line(vec![Span::styled(
             "Memory:",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
-        text.push(Line::from(""));
+        text.push(line(""));
 
         if let Some(vms) = details.memory_vms {
-            text.push(Line::from(format!(
+            text.push(line(format!(
                 "  Virtual Memory:     {}",
                 crate::process::ProcessDetails::format_memory(vms)
             )));
         }
         if let Some(rss) = details.memory_rss {
-            text.push(Line::from(format!(
+            text.push(line(format!(
                 "  Resident Memory:    {}",
                 crate::process::ProcessDetails::format_memory(rss)
             )));
         }
 
-        text.push(Line::from(""));
+        text.push(line(""));
     }
 
     // Threads
     if let Some(threads) = details.threads {
-        text.push(Line::from(vec![Span::styled(
+        text.push(line(vec![Span::styled(
             "Threads:",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
-        text.push(Line::from(""));
-        text.push(Line::from(format!("  Thread Count:       {}", threads)));
-        text.push(Line::from(""));
+        text.push(line(""));
+        text.push(line(format!("  Thread Count:       {}", threads)));
+        text.push(line(""));
     }
 
     // Executable
-    text.push(Line::from(vec![Span::styled(
+    text.push(line(vec![Span::styled(
         "Executable:",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )]));
-    text.push(Line::from(""));
+    text.push(line(""));
 
     if let Some(ref exe) = details.exe_path {
-        text.push(Line::from(format!("  Path:               {}", exe)));
+        text.push(line(format!("  Path:               {}", exe)));
     } else {
-        text.push(Line::from("  Path:               (not available)"));
+        text.push(line("  Path:               (not available)"));
     }
 
     if let Some(ref cwd) = details.cwd {
-        text.push(Line::from(format!("  Working Directory:  {}", cwd)));
+        text.push(line(format!("  Working Directory:  {}", cwd)));
     }
 
-    text.push(Line::from(""));
+    text.push(line(""));
 
     // Command line
     if let Some(ref cmdline) = details.cmdline {
-        text.push(Line::from(vec![Span::styled(
+        text.push(line(vec![Span::styled(
             "Command Line:",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )]));
-        text.push(Line::from(""));
+        text.push(line(""));
 
         let cmd_str = cmdline.join(" ");
         // Wrap long command lines at word/path boundaries
         // Calculate available width: area width - borders (2) - indentation (2)
-        let max_width = area.width.saturating_sub(4) as usize;
-        let mut remaining = cmd_str.as_str();
-        while !remaining.is_empty() {
-            if remaining.len() <= max_width {
-                // Fits on one line
-                text.push(Line::from(format!("  {}", remaining)));
-                break;
-            }
-
-            // Try to find a good break point (space, slash, backslash)
-            let mut break_point = max_width;
-            if let Some(pos) = remaining[..max_width].rfind(|c| c == ' ' || c == '/' || c == '\\') {
-                // Break after the separator
-                break_point = pos + 1;
-            }
-
-            text.push(Line::from(format!(
-                "  {}",
-                &remaining[..break_point].trim_end()
-            )));
-            remaining = &remaining[break_point..].trim_start();
+        let max_width = usize::from(area.width.saturating_sub(4)).max(1);
+        for row in Line::raw(cmd_str).wrap_word(max_width) {
+            text.push(line(format!("  {}", row.plain_text())));
         }
     }
 
-    text.push(Line::from(""));
-    text.push(Line::from(""));
-    text.push(Line::from(Span::styled(
+    text.push(line(""));
+    text.push(line(""));
+    text.push(line(Span::styled(
         "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::BrightBlack),
     )));
 
     // Clamp scroll offset to content bounds
@@ -3857,12 +4068,25 @@ fn draw_detail_system(f: &mut Frame, area: Rect, process: &ProcessInfo, app: &mu
         AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
     app.detail_scroll_offset = clamped_scroll;
 
-    let paragraph = Paragraph::new(text)
-        .scroll((clamped_scroll as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("System Information"),
-        );
-    f.render_widget(paragraph, area);
+    let paragraph = (
+        render::lines(text),
+        TextPresentation {
+            scroll: (clamped_scroll as u16, 0),
+            chrome: Some(PanelChrome {
+                title: Some(line("System Information")),
+                ..PanelChrome::default()
+            }),
+            ..TextPresentation::default()
+        },
+    );
+    paint_text(&app.component_scene, "detail.system", f, area, paragraph);
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod parity;
+
+#[cfg(test)]
+mod regressions;

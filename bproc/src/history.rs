@@ -33,11 +33,11 @@ impl ProcessHistory {
 
     /// Add a new sample, removing old ones if we exceed the limit
     pub fn add_sample(&mut self, download_rate: u64, upload_rate: u64) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        self.add_sample_at(unix_timestamp(), download_rate, upload_rate);
+    }
 
+    /// Append a sample at its acquisition time, independently of presentation cadence.
+    pub fn add_sample_at(&mut self, timestamp: u64, download_rate: u64, upload_rate: u64) {
         let sample = BandwidthSample {
             timestamp,
             download_rate,
@@ -123,6 +123,24 @@ impl HistoryTracker {
 
     /// Update history for a process
     pub fn update(&mut self, pid: i32, process_name: String, download_rate: u64, upload_rate: u64) {
+        self.update_at(
+            unix_timestamp(),
+            pid,
+            process_name,
+            download_rate,
+            upload_rate,
+        );
+    }
+
+    /// Record a reliably delivered measurement without replacing intermediate samples.
+    pub fn update_at(
+        &mut self,
+        timestamp: u64,
+        pid: i32,
+        process_name: String,
+        download_rate: u64,
+        upload_rate: u64,
+    ) {
         let history = self
             .histories
             .entry(pid)
@@ -130,7 +148,7 @@ impl HistoryTracker {
 
         // Update process name in case it changed
         history.process_name = process_name;
-        history.add_sample(download_rate, upload_rate);
+        history.add_sample_at(timestamp, download_rate, upload_rate);
     }
 
     /// Get history for a specific process
@@ -170,6 +188,13 @@ impl Default for HistoryTracker {
     }
 }
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +212,42 @@ mod tests {
         assert_eq!(history.max_upload_rate(), 1000);
         assert_eq!(history.avg_download_rate(), 1500);
         assert_eq!(history.avg_upload_rate(), 750);
+    }
+
+    #[test]
+    fn reliable_samples_preserve_peaks_and_acquisition_times() {
+        let mut tracker = HistoryTracker::new();
+        for (timestamp, download, upload) in [(10, 1, 3), (11, 900, 700), (12, 2, 4)] {
+            tracker.update_at(timestamp, 7, "worker".into(), download, upload);
+        }
+        let history = tracker.get_history(7).unwrap();
+        assert_eq!(
+            history
+                .samples
+                .iter()
+                .map(|s| s.timestamp)
+                .collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        assert_eq!(history.max_download_rate(), 900);
+        assert_eq!(history.max_upload_rate(), 700);
+        assert_eq!(
+            history.get_graph_data().0,
+            [(0.0, 1.0), (1.0, 900.0), (2.0, 2.0)]
+        );
+    }
+
+    #[test]
+    fn timestamped_history_retains_latest_window_and_updated_name() {
+        let mut tracker = HistoryTracker::new();
+        for timestamp in 0..70 {
+            tracker.update_at(timestamp, 7, format!("worker-{timestamp}"), timestamp, 0);
+        }
+        let history = tracker.get_history(7).unwrap();
+        assert_eq!(history.samples.len(), 60);
+        assert_eq!(history.samples.front().unwrap().timestamp, 10);
+        assert_eq!(history.samples.back().unwrap().timestamp, 69);
+        assert_eq!(history.process_name, "worker-69");
     }
 
     #[test]

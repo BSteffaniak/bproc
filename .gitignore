@@ -2,3 +2,5 @@ target/
 
 # direnv
 .direnv/
+
+__pycache__/

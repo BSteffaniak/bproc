@@ -77,6 +77,13 @@ impl ThrottleManager {
         self.backend_names()
     }
 
+    /// Restore a previously captured default selection after a temporary operation.
+    /// This is not a new backend selection: `None` must remain `None`, and a
+    /// previously selected backend need not be redetected to restore bookkeeping.
+    pub(crate) fn restore_default_backends(&mut self, defaults: (Option<String>, Option<String>)) {
+        (self.default_upload, self.default_download) = defaults;
+    }
+
     /// Set default upload backend for new throttles
     pub fn set_default_upload_backend(&mut self, name: &str) -> Result<()> {
         // Validate backend is available
@@ -488,6 +495,27 @@ impl ThrottleManager {
             .filter(|(_, backend)| backend.supports_traffic_type(traffic_type))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod default_selection_tests {
+    use super::ThrottleManager;
+
+    #[test]
+    fn temporary_selection_restores_absent_and_existing_defaults_exactly() {
+        let mut manager = ThrottleManager::new(None, None);
+        let previous = manager.get_default_backends();
+        manager.default_upload = Some("temporary".into());
+        manager.restore_default_backends(previous);
+        assert_eq!(manager.get_default_backends(), (None, None));
+
+        let captured = (
+            Some("original-upload".into()),
+            Some("original-download".into()),
+        );
+        manager.restore_default_backends(captured.clone());
+        assert_eq!(manager.get_default_backends(), captured);
     }
 }
 

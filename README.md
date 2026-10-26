@@ -86,6 +86,31 @@ cargo clippy --workspace --all-targets
 
 Host unit tests do not validate Linux kernel enforcement. See [Linux validation](docs/linux-validation.md) for the required runtime matrix. Report bugs with the OS/kernel, build features, selected backend, and a non-sensitive reproduction through [GitHub Issues](https://github.com/BSteffaniak/bproc/issues).
 
+### Terminal UI checks
+
+The interactive frontend uses BMUX components and its scheduling/presentation runtime.
+BMUX dependencies track GitHub `master`; the workspace `Cargo.lock` records the exact
+resolved revision. Refresh that resolution deliberately and validate it as a unit.
+Application-specific presentation components live under `bproc/src/ui`.
+
+Run the unprivileged PTY lifecycle smoke test with an isolated monitoring-free build:
+
+```sh
+cargo build --locked -p bproc --no-default-features
+python3 scripts/smoke-tui.py "$PWD/target/debug/bproc"
+```
+
+The harness isolates configuration, disables policy restoration/persistence, checks
+normal and Ctrl+C exit, resizing, tiny terminals, and terminal-mode restoration.
+It does not exercise packet capture, real throttling, or prove visual parity.
+Restore the default-feature build before evaluating monitoring.
+
+The parity suite compares 33 non-graph screens with captured pre-migration
+terminal-cell glyphs. Wide-cell continuation representation and the repaired
+80-column header border are explicit exceptions. Graph tests cover plot geometry,
+Braille output, and series colors; BMUX's rasterization is not bit-for-bit identical.
+
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE). BMUX dependencies are MPL-2.0 licensed; retain their license and
+source notices when distributing the application.
