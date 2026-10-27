@@ -194,6 +194,8 @@ mod monitor {
     pub enum MonitorCommand {
         /// Switch to a different socket mapper backend
         SwitchSocketMapper {
+            // The disabled backend rejects every switch, irrespective of the name.
+            #[allow(dead_code)]
             backend_name: String,
             /// Channel to send back success or error (hot-swap, no thread restart)
             response_tx: tokio::sync::oneshot::Sender<Result<()>>,
@@ -217,58 +219,12 @@ mod monitor {
 
     pub struct NetworkMonitor;
 
-    pub struct ProcessBandwidth {
-        name: String,
-        rx_bytes: u64,
-        tx_bytes: u64,
-        last_rx_bytes: u64,
-        last_tx_bytes: u64,
-    }
-
     impl NetworkMonitor {
         pub fn with_socket_mapper(_: Option<&str>) -> Result<Self> {
             log::warn!("No monitoring backend available - monitoring disabled");
             Ok(NetworkMonitor)
         }
 
-        pub fn get_socket_mapper_info(&self) -> (&str, &crate::backends::BackendCapabilities) {
-            static CAPS: crate::backends::BackendCapabilities =
-                crate::backends::BackendCapabilities {
-                    ipv4_support: false,
-                    ipv6_support: false,
-                    per_process: false,
-                    per_connection: false,
-                };
-            ("none", &CAPS)
-        }
-
-        pub fn update(&mut self) -> Result<(ProcessMap, InterfaceMap)> {
-            Ok((HashMap::new(), HashMap::new()))
-        }
-
-        pub fn extract_bandwidth_data(
-            &self,
-        ) -> (HashMap<i32, ProcessBandwidth>, HashMap<i32, Instant>) {
-            (HashMap::new(), HashMap::new())
-        }
-
-        pub fn restore_bandwidth_data(
-            &mut self,
-            _: HashMap<i32, ProcessBandwidth>,
-            _: HashMap<i32, Instant>,
-        ) {
-            // No-op
-        }
-
-        pub fn get_bandwidth_data(&self) -> HashMap<i32, Vec<crate::history::BandwidthSample>> {
-            HashMap::new()
-        }
-
-        pub fn get_monitoring_backend_name(&self) -> &'static str {
-            "none"
-        }
-
-        /// Run the monitoring loop in a background thread (stub implementation)
         pub fn run_monitoring_loop(
             self,
             mut cmd_rx: mpsc::UnboundedReceiver<MonitorCommand>,
@@ -325,6 +281,7 @@ mod monitor {
 }
 
 mod process;
+#[cfg(any(feature = "monitor-pnet", test))]
 mod traffic_classifier;
 mod tui_runtime;
 mod ui;
@@ -842,15 +799,15 @@ async fn main() -> Result<()> {
     log::info!("Spawned background monitoring thread");
 
     // Run the app with channel receivers
-    tui_runtime::run(
+    tui_runtime::run(tui_runtime::Startup {
         app,
-        throttle_manager,
+        manager: throttle_manager,
         config,
-        monitor_update_rx,
-        monitor_cmd_tx,
+        monitor: monitor_update_rx,
+        monitor_commands: monitor_cmd_tx,
         monitor_thread,
-        !args.no_save,
-        socket_mapper_preference_str,
-    )
+        save: !args.no_save,
+        socket_mapper: socket_mapper_preference_str,
+    })
     .await
 }

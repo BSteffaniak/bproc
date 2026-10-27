@@ -21,6 +21,12 @@ pub struct TokenBucket {
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for TokenBucket {}
 
+impl Default for TokenBucket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenBucket {
     pub const fn new() -> Self {
         Self {
@@ -58,6 +64,12 @@ pub struct CgroupThrottleConfig {
 // SAFETY: CgroupThrottleConfig is a plain old data type with all primitive fields
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for CgroupThrottleConfig {}
+
+impl Default for CgroupThrottleConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CgroupThrottleConfig {
     pub const fn new() -> Self {
@@ -97,6 +109,12 @@ pub struct ThrottleStats {
 // SAFETY: ThrottleStats is a plain old data type with all u64 fields
 #[cfg(feature = "userspace")]
 unsafe impl aya::Pod for ThrottleStats {}
+
+impl Default for ThrottleStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ThrottleStats {
     pub const fn new() -> Self {

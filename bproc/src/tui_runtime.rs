@@ -93,15 +93,15 @@ fn input(
                     KeyCode::Enter => {
                         if let Some(dialog) = &app.backend_compatibility_dialog {
                             let action = dialog.get_action();
-                            if !matches!(action, ui::BackendCompatibilityAction::Cancel) {
-                                if let Some(request) = throttle_request(app) {
-                                    effects.push(Effect::Resolve {
-                                        request,
-                                        is_upload: dialog.is_upload,
-                                        action,
-                                    });
-                                    app.status_message = "Applying throttle...".into();
-                                }
+                            if !matches!(action, ui::BackendCompatibilityAction::Cancel)
+                                && let Some(request) = throttle_request(app)
+                            {
+                                effects.push(Effect::Resolve {
+                                    request,
+                                    is_upload: dialog.is_upload,
+                                    action,
+                                });
+                                app.status_message = "Applying throttle...".into();
                             }
                             app.show_backend_compatibility_dialog = false;
                             app.backend_compatibility_dialog = None;
@@ -411,16 +411,16 @@ fn input(
                 }
                 KeyCode::Space | KeyCode::Char(' ') => {
                     // Space bar toggles filter in interface list view
-                    if app.view_mode == ui::ViewMode::InterfaceList {
-                        if let Some(iface) = app.get_selected_interface() {
-                            let iface_name = iface.name.clone();
-                            app.toggle_interface_filter(iface_name);
+                    if app.view_mode == ui::ViewMode::InterfaceList
+                        && let Some(iface) = app.get_selected_interface()
+                    {
+                        let iface_name = iface.name.clone();
+                        app.toggle_interface_filter(iface_name);
 
-                            // Save to config immediately
-                            config.filtered_interfaces = app.active_interface_filters.clone();
-                            if let Err(e) = queue_preferences(config, effects) {
-                                log::error!("Failed to save filter config: {}", e);
-                            }
+                        // Save to config immediately
+                        config.filtered_interfaces = app.active_interface_filters.clone();
+                        if let Err(e) = queue_preferences(config, effects) {
+                            log::error!("Failed to save filter config: {}", e);
                         }
                     }
                 }
@@ -556,7 +556,6 @@ fn input(
                             match &region.region_type {
                                 ui::ClickableRegionType::ProcessList {
                                     first_visible_index,
-                                    visible_count: _,
                                 } => {
                                     // Only handle process list clicks when it's actually visible
                                     // (not covered by any overlays/modals)
@@ -667,7 +666,7 @@ enum Message {
     InputFailed(String),
     Monitor(MonitorUpdate),
     MonitorClosed,
-    Effect(ServiceResult, u64, Option<i32>),
+    Effect(Box<ServiceResult>, u64, Option<i32>),
     EffectFailed(String),
     Details {
         generation: u64,
@@ -755,7 +754,7 @@ impl Application {
         let dialog_pid = self.app.throttle_dialog.target_pid;
         update.commands.push(Command::concurrent(async move {
             Some(match reply.await {
-                Ok(result) => Message::Effect(result, dialog_generation, dialog_pid),
+                Ok(result) => Message::Effect(Box::new(result), dialog_generation, dialog_pid),
                 Err(error) => Message::EffectFailed(error.to_string()),
             })
         }));
@@ -891,7 +890,7 @@ impl Program for Application {
             RuntimeEvent::Message(Message::Effect(result, generation, dialog_pid)) => {
                 self.in_flight_effects = self.in_flight_effects.saturating_sub(1);
                 self.receipts
-                    .insert(result.sequence, (result, generation, dialog_pid));
+                    .insert(result.sequence, (*result, generation, dialog_pid));
                 while let Some((result, generation, dialog_pid)) = self.receipts.pop() {
                     self.throttles = result.throttles;
                     self.backend = Some(result.backend);
@@ -901,11 +900,11 @@ impl Program for Application {
                     if generation == self.dialog_generation
                         && dialog_pid == self.app.throttle_dialog.target_pid
                     {
-                        if let Some(dialog) = result.dialog {
-                            if self.app.show_throttle_dialog {
-                                self.app.backend_compatibility_dialog = Some(dialog);
-                                self.app.show_backend_compatibility_dialog = true;
-                            }
+                        if let Some(dialog) = result.dialog
+                            && self.app.show_throttle_dialog
+                        {
+                            self.app.backend_compatibility_dialog = Some(dialog);
+                            self.app.show_backend_compatibility_dialog = true;
                         }
                         if result.close_throttle {
                             self.app.show_throttle_dialog = false;
@@ -941,16 +940,29 @@ impl Program for Application {
     }
 }
 
-pub(super) async fn run(
-    app: AppState,
-    manager: ThrottleManager,
-    config: config::Config,
-    monitor: tokio::sync::mpsc::Receiver<MonitorUpdate>,
-    monitor_commands: tokio::sync::mpsc::UnboundedSender<MonitorCommand>,
-    monitor_thread: std::thread::JoinHandle<()>,
-    save: bool,
-    socket_mapper: Option<String>,
-) -> Result<()> {
+/// Resources transferred into the interactive runtime as one lifecycle unit.
+pub(super) struct Startup {
+    pub app: AppState,
+    pub manager: ThrottleManager,
+    pub config: config::Config,
+    pub monitor: tokio::sync::mpsc::Receiver<MonitorUpdate>,
+    pub monitor_commands: tokio::sync::mpsc::UnboundedSender<MonitorCommand>,
+    pub monitor_thread: std::thread::JoinHandle<()>,
+    pub save: bool,
+    pub socket_mapper: Option<String>,
+}
+
+pub(super) async fn run(startup: Startup) -> Result<()> {
+    let Startup {
+        app,
+        manager,
+        config,
+        monitor,
+        monitor_commands,
+        monitor_thread,
+        save,
+        socket_mapper,
+    } = startup;
     let setup = (|| -> Result<_> {
         let size = bmux_tui::crossterm::terminal_size()?;
         let guard = bmux_tui::crossterm::CrosstermTerminalGuard::enter(std::io::stdout())?;
@@ -1262,14 +1274,14 @@ mod tests {
         assert_eq!(program.dialog_generation, 0);
         program
             .update(RuntimeEvent::Message(Message::Effect(
-                ServiceResult {
+                Box::new(ServiceResult {
                     sequence: 1,
                     status: None,
                     dialog: None,
                     close_throttle: true,
                     backend: backend(),
                     throttles: Default::default(),
-                },
+                }),
                 0,
                 Some(10),
             )))
@@ -1310,14 +1322,14 @@ mod tests {
         assert_eq!(program.dialog_generation, 1);
         program
             .update(RuntimeEvent::Message(Message::Effect(
-                ServiceResult {
+                Box::new(ServiceResult {
                     sequence: 1,
                     status: None,
                     dialog: None,
                     close_throttle: true,
                     backend: backend(),
                     throttles: Default::default(),
-                },
+                }),
                 0,
                 Some(10),
             )))
@@ -1406,14 +1418,14 @@ mod tests {
         );
         program
             .update(RuntimeEvent::Message(Message::Effect(
-                ServiceResult {
+                Box::new(ServiceResult {
                     sequence: 1,
                     status: Some("Failed old action".into()),
                     dialog: Some(dialog),
                     close_throttle: true,
                     backend: backend(),
                     throttles: Default::default(),
-                },
+                }),
                 0,
                 Some(10),
             )))

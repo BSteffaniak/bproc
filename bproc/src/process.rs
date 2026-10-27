@@ -3,17 +3,12 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 /// Traffic type for throttling - determines which traffic to throttle
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrafficType {
-    All,      // Throttle all traffic (default/current behavior)
+    #[default]
+    All, // Throttle all traffic (default/current behavior)
     Internet, // Throttle only internet traffic
     Local,    // Throttle only local traffic
-}
-
-impl Default for TrafficType {
-    fn default() -> Self {
-        TrafficType::All
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +41,8 @@ pub struct ProcessInfo {
 }
 
 #[derive(Debug, Clone)]
+// Retained domain metadata for platform collectors and diagnostics.
+#[allow(dead_code)]
 pub struct InterfaceStats {
     // Aggregate rates (existing)
     pub download_rate: u64,
@@ -61,6 +58,8 @@ pub struct InterfaceStats {
 }
 
 #[derive(Debug, Clone)]
+// Retained domain metadata for platform collectors and diagnostics.
+#[allow(dead_code)]
 pub struct InterfaceInfo {
     pub name: String,
     pub mac_address: Option<String>,
@@ -80,6 +79,7 @@ pub struct ThrottleLimit {
 }
 
 impl ProcessInfo {
+    #[cfg(any(feature = "monitor-pnet", target_os = "windows", test))]
     pub fn new(pid: i32, name: String) -> Self {
         Self {
             pid,
@@ -135,6 +135,7 @@ impl ProcessInfo {
     }
 
     /// Populate connections for this process from the connection map
+    #[cfg(feature = "monitor-pnet")]
     pub fn populate_connections(
         &mut self,
         connection_map: &crate::backends::process::ConnectionMap,
@@ -146,17 +147,17 @@ impl ProcessInfo {
         let mut add_connections = |entries: &[crate::backends::process::ConnectionEntry],
                                    protocol: &str| {
             for entry in entries {
-                if let Some((pid, _name)) = socket_to_pid.get(&entry.inode) {
-                    if *pid == self.pid {
-                        self.connections.push(ConnectionDetail {
-                            protocol: protocol.to_string(),
-                            local_addr: entry.local_addr,
-                            local_port: entry.local_port,
-                            remote_addr: entry.remote_addr,
-                            remote_port: entry.remote_port,
-                            state: entry.state.clone(),
-                        });
-                    }
+                if let Some((pid, _name)) = socket_to_pid.get(&entry.inode)
+                    && *pid == self.pid
+                {
+                    self.connections.push(ConnectionDetail {
+                        protocol: protocol.to_string(),
+                        local_addr: entry.local_addr,
+                        local_port: entry.local_port,
+                        remote_addr: entry.remote_addr,
+                        remote_port: entry.remote_port,
+                        state: entry.state.clone(),
+                    });
                 }
             }
         };
@@ -186,6 +187,8 @@ pub struct ConnectionDetail {
 #[derive(Debug, Clone)]
 pub struct ProcessDetails {
     pub pid: i32,
+    // Retained domain metadata for platform collectors and diagnostics.
+    #[allow(dead_code)]
     pub name: String,
     pub cmdline: Option<Vec<String>>,
     pub exe_path: Option<String>,
@@ -197,6 +200,8 @@ pub struct ProcessDetails {
     pub memory_vms: Option<u64>, // Virtual Memory Size in KB
     pub uid: Option<u32>,
     pub gid: Option<u32>,
+    // Retained domain metadata for platform collectors and diagnostics.
+    #[allow(dead_code)]
     pub connections: Vec<ConnectionDetail>,
 }
 

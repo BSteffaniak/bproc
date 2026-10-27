@@ -1,15 +1,20 @@
 // Bandwidth history tracking for graphing
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum number of history samples to keep (e.g., 60 samples = 1 minute at 1Hz)
 const MAX_HISTORY_SAMPLES: usize = 60;
 
 /// A single bandwidth measurement sample
+pub type GraphPoints = Vec<(f64, f64)>;
+
 #[derive(Debug, Clone)]
 pub struct BandwidthSample {
-    pub timestamp: u64,     // Unix timestamp in seconds
+    // Retained domain metadata for platform collectors and diagnostics.
+    #[allow(dead_code)]
+    pub timestamp: u64, // Unix timestamp in seconds
     pub download_rate: u64, // bytes per second
     pub upload_rate: u64,   // bytes per second
 }
@@ -17,6 +22,8 @@ pub struct BandwidthSample {
 /// Bandwidth history for a single process
 #[derive(Debug, Clone)]
 pub struct ProcessHistory {
+    // Retained domain metadata for platform collectors and diagnostics.
+    #[allow(dead_code)]
     pub pid: i32,
     pub process_name: String,
     pub samples: VecDeque<BandwidthSample>,
@@ -32,6 +39,7 @@ impl ProcessHistory {
     }
 
     /// Add a new sample, removing old ones if we exceed the limit
+    #[cfg(test)]
     pub fn add_sample(&mut self, download_rate: u64, upload_rate: u64) {
         self.add_sample_at(unix_timestamp(), download_rate, upload_rate);
     }
@@ -89,7 +97,7 @@ impl ProcessHistory {
     }
 
     /// Get samples as vectors for graphing
-    pub fn get_graph_data(&self) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    pub fn get_graph_data(&self) -> (GraphPoints, GraphPoints) {
         let download_data: Vec<(f64, f64)> = self
             .samples
             .iter()
@@ -122,6 +130,7 @@ impl HistoryTracker {
     }
 
     /// Update history for a process
+    #[cfg(test)]
     pub fn update(&mut self, pid: i32, process_name: String, download_rate: u64, upload_rate: u64) {
         self.update_at(
             unix_timestamp(),
@@ -155,31 +164,6 @@ impl HistoryTracker {
     pub fn get_history(&self, pid: i32) -> Option<&ProcessHistory> {
         self.histories.get(&pid)
     }
-
-    /// Get mutable history for a specific process
-    pub fn get_history_mut(&mut self, pid: i32) -> Option<&mut ProcessHistory> {
-        self.histories.get_mut(&pid)
-    }
-
-    /// Remove history for a process (when it exits)
-    pub fn remove(&mut self, pid: i32) {
-        self.histories.remove(&pid);
-    }
-
-    /// Clear all histories
-    pub fn clear(&mut self) {
-        self.histories.clear();
-    }
-
-    /// Get the number of processes being tracked
-    pub fn len(&self) -> usize {
-        self.histories.len()
-    }
-
-    /// Check if tracking any processes
-    pub fn is_empty(&self) -> bool {
-        self.histories.is_empty()
-    }
 }
 
 impl Default for HistoryTracker {
@@ -188,6 +172,7 @@ impl Default for HistoryTracker {
     }
 }
 
+#[cfg(test)]
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

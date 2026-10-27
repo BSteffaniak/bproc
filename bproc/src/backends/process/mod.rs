@@ -13,9 +13,12 @@ pub trait ProcessUtils: Send + Sync {
     fn get_process_name(&self, pid: i32) -> Result<String>;
 
     /// Check if process exists
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     fn process_exists(&self, pid: i32) -> bool;
 
     /// Get all running processes with their names
+    // Bulk enumeration is part of the cross-platform collector contract.
+    #[allow(dead_code)]
     fn get_all_processes(&self) -> Result<Vec<ProcessEntry>>;
 
     /// Get socket-to-PID mapping for network connections
@@ -24,6 +27,7 @@ pub trait ProcessUtils: Send + Sync {
     /// Refresh internal caches (e.g., process list)
     /// This should be called periodically to keep cached data fresh
     /// Default implementation is a no-op for platforms that don't cache
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     fn refresh_caches(&self) {
         // Default no-op implementation
     }
@@ -31,13 +35,15 @@ pub trait ProcessUtils: Send + Sync {
 
 /// Process entry with PID and name
 #[derive(Debug, Clone)]
+// Optional backend contract; not every operation is used on each host.
+#[allow(dead_code)]
 pub struct ProcessEntry {
     pub pid: i32,
     pub name: String,
 }
 
 /// Complete connection map including socket inodes and connections
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionMap {
     /// Socket inode -> (PID, process name) mapping
     pub socket_to_pid: HashMap<u64, (i32, String)>,
@@ -46,21 +52,11 @@ pub struct ConnectionMap {
     /// TCP IPv6 connections
     pub tcp6_connections: Vec<ConnectionEntry>,
     /// UDP IPv4 connections
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     pub udp_connections: Vec<ConnectionEntry>,
     /// UDP IPv6 connections
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     pub udp6_connections: Vec<ConnectionEntry>,
-}
-
-impl Default for ConnectionMap {
-    fn default() -> Self {
-        Self {
-            socket_to_pid: HashMap::new(),
-            tcp_connections: Vec::new(),
-            tcp6_connections: Vec::new(),
-            udp_connections: Vec::new(),
-            udp6_connections: Vec::new(),
-        }
-    }
 }
 
 /// Network connection entry
@@ -71,6 +67,7 @@ pub struct ConnectionEntry {
     pub remote_addr: IpAddr,
     pub remote_port: u16,
     pub inode: u64,
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     pub state: String, // "Established", "Listen", etc.
 }
 

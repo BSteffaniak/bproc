@@ -1,6 +1,6 @@
 // Throttling backend traits and implementations
 
-use super::{ActiveThrottle, BackendCapabilities, BackendPriority};
+use super::{BackendCapabilities, BackendPriority};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -25,6 +25,8 @@ pub use manager::ThrottleManager;
 
 /// Throttle statistics for a process/cgroup
 #[derive(Debug, Clone, Default)]
+// Optional backend contract; not every operation is used on each host.
+#[allow(dead_code)]
 pub struct BackendStats {
     pub packets_total: u64,
     pub bytes_total: u64,
@@ -38,6 +40,8 @@ pub trait UploadThrottleBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Backend priority for auto-selection
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn priority(&self) -> BackendPriority;
 
     /// Check if this backend is available on the current system
@@ -64,6 +68,8 @@ pub trait UploadThrottleBackend: Send + Sync {
     fn remove_upload_throttle(&mut self, pid: i32) -> Result<()>;
 
     /// Get active upload throttle for a process
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn get_upload_throttle(&self, pid: i32) -> Option<u64>;
 
     /// Get all active upload throttles
@@ -73,6 +79,8 @@ pub trait UploadThrottleBackend: Send + Sync {
     fn cleanup(&mut self) -> Result<()>;
 
     /// Get statistics for a throttled process (if supported by backend)
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn get_stats(&self, _pid: i32) -> Option<BackendStats> {
         None // Default implementation returns None for backends that don't support stats
     }
@@ -91,6 +99,8 @@ pub trait DownloadThrottleBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Backend priority for auto-selection
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn priority(&self) -> BackendPriority;
 
     /// Check if this backend is available on the current system
@@ -117,6 +127,8 @@ pub trait DownloadThrottleBackend: Send + Sync {
     fn remove_download_throttle(&mut self, pid: i32) -> Result<()>;
 
     /// Get active download throttle for a process
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn get_download_throttle(&self, pid: i32) -> Option<u64>;
 
     /// Get all active download throttles
@@ -126,12 +138,16 @@ pub trait DownloadThrottleBackend: Send + Sync {
     fn cleanup(&mut self) -> Result<()>;
 
     /// Get statistics for a throttled process (if supported by backend)
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn get_stats(&self, _pid: i32) -> Option<BackendStats> {
         None // Default implementation returns None for backends that don't support stats
     }
 
     /// Log diagnostic information for a throttled process (for debugging)
     /// Default implementation does nothing - only eBPF backend implements this
+    // Optional backend diagnostics/query contract retained across feature sets.
+    #[allow(dead_code)]
     fn log_diagnostics(&mut self, _pid: i32) -> Result<()> {
         Ok(())
     }

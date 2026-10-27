@@ -135,19 +135,21 @@ impl ComponentScene {
             ControlKind::Input { state, .. } => {
                 let selected = true;
                 use bmux_keyboard::KeyCode;
-                if let Event::Paste(value) = &route.event {
-                    if !value.chars().all(|c| c.is_ascii_digit()) {
-                        return Some(Change::Consumed);
-                    }
+                if let Event::Paste(value) = &route.event
+                    && !value.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Some(Change::Consumed);
                 }
                 if let Event::Key(key) = &route.event {
                     if matches!(key.key, KeyCode::Space) {
                         return Some(Change::Consumed);
                     }
-                    if let KeyCode::Char(ch) = key.key {
-                        if !ch.is_ascii_digit() && !matches!(ch, 'q' | 't') && !key.modifiers.ctrl {
-                            return Some(Change::Consumed);
-                        }
+                    if let KeyCode::Char(ch) = key.key
+                        && !ch.is_ascii_digit()
+                        && !matches!(ch, 'q' | 't')
+                        && !key.modifiers.ctrl
+                    {
+                        return Some(Change::Consumed);
                     }
                 }
                 if let Event::Key(key) = &route.event {
@@ -210,13 +212,13 @@ impl ComponentScene {
             }
             ControlKind::List { items, state } => {
                 use bmux_keyboard::{KeyCode, KeyStroke};
-                if let Event::Key(key) = &route.event {
-                    if matches!(
+                if let Event::Key(key) = &route.event
+                    && matches!(
                         key.key,
                         KeyCode::Enter | KeyCode::Space | KeyCode::Char(' ')
-                    ) {
-                        return None;
-                    }
+                    )
+                {
+                    return None;
                 }
                 let policy = list_policy();
                 let mut initial = state.get();
@@ -275,8 +277,10 @@ impl ComponentScene {
     }
 }
 pub fn list_policy() -> SelectableListPolicy {
-    let mut policy = SelectableListPolicy::default();
-    policy.highlight = SelectableListHighlightPolicy::new("", false);
+    let mut policy = SelectableListPolicy {
+        highlight: SelectableListHighlightPolicy::new("", false),
+        ..Default::default()
+    };
     policy.keyboard.wrap = true;
     policy.keyboard.enter_selects = false;
     policy.keyboard.space_selects = false;

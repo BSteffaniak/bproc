@@ -28,7 +28,7 @@ fn main() -> Result<()> {
 
     // BPF objects must be optimized and use the release path consumed by build.rs,
     // even when the userspace application is built in debug mode.
-    match args.get(0).map(|s| s.as_str()) {
+    match args.first().map(|s| s.as_str()) {
         Some("build-ebpf") => build_ebpf(true)?,
         Some("build") => {
             build_ebpf(true)?;
@@ -121,101 +121,98 @@ enum NightlyStrategy {
 /// Detect how to invoke nightly Rust on this system
 fn ensure_nightly_available() -> Result<NightlyStrategy> {
     // Strategy 1: Check if plain rustc is already nightly
-    if let Ok(output) = Command::new("rustc").arg("--version").output() {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout);
-            if version.contains("nightly") {
-                println!("✓ Default rustc is nightly ({})", version.trim());
-                return Ok(NightlyStrategy::PlainCargoIsNightly);
-            }
+    if let Ok(output) = Command::new("rustc").arg("--version").output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout);
+        if version.contains("nightly") {
+            println!("✓ Default rustc is nightly ({})", version.trim());
+            return Ok(NightlyStrategy::PlainCargoIsNightly);
         }
     }
 
     // Strategy 2: Check if `rustc +nightly` works and get its path
     if let Ok(output) = Command::new("rustc")
-        .args(&["+nightly", "--version"])
+        .args(["+nightly", "--version"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout);
-            if version.contains("nightly") {
-                println!("✓ rustc +nightly is available ({})", version.trim());
+        let version = String::from_utf8_lossy(&output.stdout);
+        if version.contains("nightly") {
+            println!("✓ rustc +nightly is available ({})", version.trim());
 
-                // Get the actual path to nightly toolchain
-                // Use `rustc +nightly --print sysroot` to find it
-                if let Ok(sysroot_output) = Command::new("rustc")
-                    .args(&["+nightly", "--print", "sysroot"])
-                    .output()
-                {
-                    let sysroot = String::from_utf8_lossy(&sysroot_output.stdout);
-                    let sysroot = sysroot.trim();
-                    let rustc_path = PathBuf::from(sysroot).join("bin/rustc");
-                    let cargo_path = PathBuf::from(sysroot).join("bin/cargo");
+            // Get the actual path to nightly toolchain
+            // Use `rustc +nightly --print sysroot` to find it
+            if let Ok(sysroot_output) = Command::new("rustc")
+                .args(["+nightly", "--print", "sysroot"])
+                .output()
+            {
+                let sysroot = String::from_utf8_lossy(&sysroot_output.stdout);
+                let sysroot = sysroot.trim();
+                let rustc_path = PathBuf::from(sysroot).join("bin/rustc");
+                let cargo_path = PathBuf::from(sysroot).join("bin/cargo");
 
-                    if rustc_path.exists() && cargo_path.exists() {
-                        println!("  Using nightly toolchain at: {}", sysroot);
-                        return Ok(NightlyStrategy::UseNightlyToolchain {
-                            cargo_path,
-                            rustc_path,
-                        });
-                    } else if rustc_path.exists() {
-                        // Only rustc found, cargo might be a wrapper - use default cargo with RUSTC
-                        println!("  Using rustc at: {}", rustc_path.display());
-                        // Fall through to try finding cargo
-                    }
+                if rustc_path.exists() && cargo_path.exists() {
+                    println!("  Using nightly toolchain at: {}", sysroot);
+                    return Ok(NightlyStrategy::UseNightlyToolchain {
+                        cargo_path,
+                        rustc_path,
+                    });
+                } else if rustc_path.exists() {
+                    // Only rustc found, cargo might be a wrapper - use default cargo with RUSTC
+                    println!("  Using rustc at: {}", rustc_path.display());
+                    // Fall through to try finding cargo
                 }
             }
         }
     }
 
     // Strategy 3: Try rustup if available
-    if let Ok(output) = Command::new("rustup").arg("--version").output() {
-        if output.status.success() {
-            println!("ℹ️  Checking rustup for nightly toolchain...");
+    if let Ok(output) = Command::new("rustup").arg("--version").output()
+        && output.status.success()
+    {
+        println!("ℹ️  Checking rustup for nightly toolchain...");
 
-            // Check if nightly is installed
-            if let Ok(list_output) = Command::new("rustup").args(&["toolchain", "list"]).output() {
-                let toolchains = String::from_utf8_lossy(&list_output.stdout);
+        // Check if nightly is installed
+        if let Ok(list_output) = Command::new("rustup").args(["toolchain", "list"]).output() {
+            let toolchains = String::from_utf8_lossy(&list_output.stdout);
 
-                if !toolchains.contains("nightly") {
-                    println!("⚠️  Nightly not found, installing via rustup...");
+            if !toolchains.contains("nightly") {
+                println!("⚠️  Nightly not found, installing via rustup...");
 
-                    let status = Command::new("rustup")
-                        .args(&["toolchain", "install", "nightly", "--component", "rust-src"])
-                        .status()
-                        .context("Failed to run rustup")?;
+                let status = Command::new("rustup")
+                    .args(["toolchain", "install", "nightly", "--component", "rust-src"])
+                    .status()
+                    .context("Failed to run rustup")?;
 
-                    if !status.success() {
-                        anyhow::bail!("Failed to install nightly via rustup");
-                    }
-
-                    println!("✓ Nightly installed successfully");
+                if !status.success() {
+                    anyhow::bail!("Failed to install nightly via rustup");
                 }
 
-                // Get toolchain paths from rustup
-                if let Ok(rustc_which) = Command::new("rustup")
-                    .args(&["which", "--toolchain", "nightly", "rustc"])
-                    .output()
-                {
-                    if rustc_which.status.success() {
-                        let rustc_path = String::from_utf8_lossy(&rustc_which.stdout);
-                        let rustc_path = PathBuf::from(rustc_path.trim());
+                println!("✓ Nightly installed successfully");
+            }
 
-                        if let Ok(cargo_which) = Command::new("rustup")
-                            .args(&["which", "--toolchain", "nightly", "cargo"])
-                            .output()
-                        {
-                            if cargo_which.status.success() {
-                                let cargo_path = String::from_utf8_lossy(&cargo_which.stdout);
-                                let cargo_path = PathBuf::from(cargo_path.trim());
-                                println!("  Using nightly toolchain from rustup");
-                                return Ok(NightlyStrategy::UseNightlyToolchain {
-                                    cargo_path,
-                                    rustc_path,
-                                });
-                            }
-                        }
-                    }
+            // Get toolchain paths from rustup
+            if let Ok(rustc_which) = Command::new("rustup")
+                .args(["which", "--toolchain", "nightly", "rustc"])
+                .output()
+                && rustc_which.status.success()
+            {
+                let rustc_path = String::from_utf8_lossy(&rustc_which.stdout);
+                let rustc_path = PathBuf::from(rustc_path.trim());
+
+                if let Ok(cargo_which) = Command::new("rustup")
+                    .args(["which", "--toolchain", "nightly", "cargo"])
+                    .output()
+                    && cargo_which.status.success()
+                {
+                    let cargo_path = String::from_utf8_lossy(&cargo_which.stdout);
+                    let cargo_path = PathBuf::from(cargo_path.trim());
+                    println!("  Using nightly toolchain from rustup");
+                    return Ok(NightlyStrategy::UseNightlyToolchain {
+                        cargo_path,
+                        rustc_path,
+                    });
                 }
             }
         }
@@ -309,9 +306,9 @@ fn build_ebpf(release: bool) -> Result<()> {
             }
         }
 
-        cmd.args(&["--target=bpfel-unknown-none"])
-            .args(&["-Z", "build-std=core"])
-            .args(&["--bin", bin])
+        cmd.args(["--target=bpfel-unknown-none"])
+            .args(["-Z", "build-std=core"])
+            .args(["--bin", bin])
             .env("RUSTFLAGS", "-C link-arg=--disable-memory-builtins");
 
         if release {
@@ -340,7 +337,7 @@ fn build_main(release: bool, opts: &BuildOptions) -> Result<()> {
     let features = build_feature_list(opts);
 
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&root).args(&["build"]);
+    cmd.current_dir(&root).args(["build"]);
 
     // Apply no-default-features if requested
     if opts.no_default_features {
@@ -350,7 +347,7 @@ fn build_main(release: bool, opts: &BuildOptions) -> Result<()> {
 
     // Apply features (throttle-ebpf always included)
     if !features.is_empty() {
-        cmd.args(&["--features", &features]);
+        cmd.args(["--features", &features]);
         println!("  → Using features: {}", features);
     }
 
@@ -381,7 +378,7 @@ fn clean() -> Result<()> {
 
     let status = Command::new("cargo")
         .current_dir(&root)
-        .args(&["clean"])
+        .args(["clean"])
         .status()
         .context("Failed to run cargo clean")?;
 

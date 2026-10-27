@@ -64,8 +64,6 @@ pub struct AppState {
     pub interface_modal_scroll_offset: usize, // For interface filter modal scrolling
     pub backend_compat_scroll_offset: usize, // For backend compatibility dialog scrolling
     // Auto-scroll optimization - track last selection to avoid redundant scrolling
-    pub last_interface_selection: Option<usize>,
-    pub last_backend_selection: usize,
     // Mouse click selection - track clickable regions for each frame
     pub clickable_regions: Vec<ClickableRegion>,
 }
@@ -103,7 +101,6 @@ pub struct ClickableRegion {
 pub enum ClickableRegionType {
     ProcessList {
         first_visible_index: usize, // Index of first visible item in list
-        visible_count: usize,       // Number of visible items
     },
     ProcessDetailTabs {
         // Column ranges for each tab: (start_col, end_col, tab)
@@ -383,8 +380,6 @@ impl AppState {
             backend_info_scroll_offset: 0,
             interface_modal_scroll_offset: 0,
             backend_compat_scroll_offset: 0,
-            last_interface_selection: None,
-            last_backend_selection: 0,
             clickable_regions: Vec::new(),
         }
     }
@@ -398,12 +393,13 @@ impl AppState {
         self.interface_list = interfaces;
 
         // Adjust selection if out of bounds
-        if let Some(index) = self.selected_interface_index {
-            if index >= self.interface_list.len() && !self.interface_list.is_empty() {
-                self.selected_interface_index = Some(self.interface_list.len() - 1);
-                self.interface_list_state
-                    .select(Some(self.interface_list.len() - 1));
-            }
+        if let Some(index) = self.selected_interface_index
+            && index >= self.interface_list.len()
+            && !self.interface_list.is_empty()
+        {
+            self.selected_interface_index = Some(self.interface_list.len() - 1);
+            self.interface_list_state
+                .select(Some(self.interface_list.len() - 1));
         }
     }
 
@@ -541,18 +537,6 @@ impl AppState {
                 }
             }
         }
-    }
-
-    /// Clear filter (show all)
-    pub fn clear_interface_filters(&mut self) {
-        self.active_interface_filters = None;
-        self.status_message = "Filter cleared - showing all interfaces".to_string();
-    }
-
-    /// Set empty filter (show nothing)
-    pub fn set_empty_filter(&mut self) {
-        self.active_interface_filters = Some(vec![]);
-        self.status_message = "Filter: showing no interfaces".to_string();
     }
 
     /// Toggle between all interfaces selected and none selected
@@ -741,11 +725,12 @@ impl AppState {
         self.process_list = processes;
 
         // Adjust selection if out of bounds
-        if let Some(index) = self.selected_index {
-            if index >= self.process_list.len() && !self.process_list.is_empty() {
-                self.selected_index = Some(self.process_list.len() - 1);
-                self.list_state.select(Some(self.process_list.len() - 1));
-            }
+        if let Some(index) = self.selected_index
+            && index >= self.process_list.len()
+            && !self.process_list.is_empty()
+        {
+            self.selected_index = Some(self.process_list.len() - 1);
+            self.list_state.select(Some(self.process_list.len() - 1));
         }
     }
 
@@ -889,13 +874,13 @@ impl AppState {
         }
 
         // Try to restore previous selection (preserves cursor position)
-        if let Some(name) = current_backend_name {
-            if let Some(index) = self.backend_items.iter().position(
+        if let Some(name) = current_backend_name
+            && let Some(index) = self.backend_items.iter().position(
                 |item| matches!(item, BackendSelectorItem::Backend { name: n, .. } if n == &name),
-            ) {
-                self.backend_selected_index = index;
-                return; // Found it, keep cursor there!
-            }
+            )
+        {
+            self.backend_selected_index = index;
+            return; // Found it, keep cursor there!
         }
 
         // Fallback: find first available backend item and select it
@@ -927,10 +912,9 @@ impl AppState {
 
             if let Some(BackendSelectorItem::Backend { available, .. }) =
                 self.backend_items.get(self.backend_selected_index)
+                && *available
             {
-                if *available {
-                    break;
-                }
+                break;
             }
 
             // Prevent infinite loop if no available backends
@@ -956,10 +940,9 @@ impl AppState {
 
             if let Some(BackendSelectorItem::Backend { available, .. }) =
                 self.backend_items.get(self.backend_selected_index)
+                && *available
             {
-                if *available {
-                    break;
-                }
+                break;
             }
 
             // Prevent infinite loop if no available backends
@@ -977,10 +960,9 @@ impl AppState {
             available,
             ..
         }) = self.backend_items.get(self.backend_selected_index)
+            && *available
         {
-            if *available {
-                return Some((name.as_str(), *group));
-            }
+            return Some((name.as_str(), *group));
         }
         None
     }
@@ -1092,11 +1074,6 @@ impl AppState {
         self.interface_modal_scroll_offset = self.interface_modal_scroll_offset.saturating_add(1);
     }
 
-    /// Reset backend compatibility dialog scroll when opened
-    pub fn reset_backend_compat_scroll(&mut self) {
-        self.backend_compat_scroll_offset = 0;
-    }
-
     /// Scroll backend compatibility dialog up
     pub fn scroll_backend_compat_up(&mut self) {
         self.backend_compat_scroll_offset = self.backend_compat_scroll_offset.saturating_sub(1);
@@ -1138,6 +1115,7 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 pub fn draw_ui(f: &mut PaintCx<'_, '_>, app: &mut AppState) {
     draw_ui_with_backend_info(f, app, None);
 }
@@ -1203,17 +1181,17 @@ pub fn draw_ui_with_backend_info(
     }
 
     // Backend info modal (highest priority, renders on top)
-    if app.show_backend_info {
-        if let Some(info) = backend_info {
-            draw_backend_info(f, root_area(f), app, info);
-        }
+    if app.show_backend_info
+        && let Some(info) = backend_info
+    {
+        draw_backend_info(f, root_area(f), app, info);
     }
 
     // Backend compatibility dialog (highest priority - renders on top of everything)
-    if app.show_backend_compatibility_dialog {
-        if let Some(dialog) = app.backend_compatibility_dialog.clone() {
-            draw_backend_compatibility_dialog(f, root_area(f), app, &dialog);
-        }
+    if app.show_backend_compatibility_dialog
+        && let Some(dialog) = app.backend_compatibility_dialog.clone()
+    {
+        draw_backend_compatibility_dialog(f, root_area(f), app, &dialog);
     }
 }
 
@@ -1441,12 +1419,10 @@ fn draw_process_list(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
 
     // Store clickable region for mouse selection
     let first_visible = app.list_state.offset();
-    let visible_count = inner_list_area.height.saturating_sub(1) as usize; // -1 for potential scrollbar
     app.clickable_regions.push(ClickableRegion {
         area: inner_list_area,
         region_type: ClickableRegionType::ProcessList {
             first_visible_index: first_visible,
-            visible_count,
         },
     });
 }
@@ -1635,7 +1611,6 @@ fn draw_help_overlay(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
             chrome: Some(PanelChrome {
                 title: Some(line("Help")),
                 style: Style::default().fg(Color::Cyan),
-                ..PanelChrome::default()
             }),
             ..TextPresentation::default()
         },
@@ -1743,7 +1718,6 @@ fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
             chrome: Some(PanelChrome {
                 title: Some(line(title)),
                 style: Style::default().fg(Color::Cyan),
-                ..PanelChrome::default()
             }),
             ..TextPresentation::default()
         },
@@ -1888,7 +1862,6 @@ fn draw_backend_compatibility_dialog(
             chrome: Some(PanelChrome {
                 title: Some(line("Backend Incompatibility (↑↓ to scroll)")),
                 style: Style::default().fg(Color::Red),
-                ..PanelChrome::default()
             }),
             ..TextPresentation::default()
         },
@@ -1926,7 +1899,6 @@ fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
                         proc.name, proc.pid
                     ))),
                     style: Style::default().fg(Color::Cyan),
-                    ..PanelChrome::default()
                 }),
                 ..TextPresentation::default()
             },
@@ -2124,8 +2096,6 @@ fn draw_backend_info(
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
                         .bg(Color::BrightBlack)
-                } else if !available {
-                    Style::default().fg(Color::BrightWhite)
                 } else {
                     Style::default().fg(Color::BrightWhite)
                 };
@@ -2404,11 +2374,7 @@ fn draw_backend_info(
             .add_modifier(Modifier::BOLD),
     )));
 
-    let preferred_upload_display = backend_info
-        .preferred_upload
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("Auto");
+    let preferred_upload_display = backend_info.preferred_upload.as_deref().unwrap_or("Auto");
     let active_upload_display = backend_info
         .active_upload
         .as_ref()
@@ -2423,11 +2389,7 @@ fn draw_backend_info(
         ),
     ]));
 
-    let preferred_download_display = backend_info
-        .preferred_download
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("Auto");
+    let preferred_download_display = backend_info.preferred_download.as_deref().unwrap_or("Auto");
     let active_download_display = backend_info
         .active_download
         .as_ref()
@@ -2444,8 +2406,7 @@ fn draw_backend_info(
 
     let preferred_socket_mapper_display = backend_info
         .preferred_socket_mapper
-        .as_ref()
-        .map(|s| s.as_str())
+        .as_deref()
         .unwrap_or("Auto");
     let active_socket_mapper_display = backend_info
         .active_socket_mapper
@@ -2583,7 +2544,6 @@ fn draw_backend_info(
             chrome: Some(PanelChrome {
                 title: Some(line("Backends (↑↓ to scroll)")),
                 style: Style::default().fg(Color::Cyan),
-                ..PanelChrome::default()
             }),
             ..TextPresentation::default()
         },
@@ -2605,191 +2565,6 @@ fn draw_backend_info(
     });
 }
 
-fn draw_interface_list(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = app
-        .interface_list
-        .iter()
-        .enumerate()
-        .map(|(index, iface)| {
-            // Selection indicator
-            let selection_indicator = if Some(index) == app.interface_list_state.selected() {
-                "▶ "
-            } else {
-                "  "
-            };
-
-            // Status indicator: up (✓), down (✗), loopback (⟲)
-            let status_indicator = if iface.is_loopback {
-                "⟲"
-            } else if iface.is_up {
-                "✓"
-            } else {
-                "✗"
-            };
-
-            let status_color = if iface.is_loopback {
-                Color::Cyan
-            } else if iface.is_up {
-                Color::Green
-            } else {
-                Color::Red
-            };
-
-            // Calculate visible process count (filtered or total)
-            let visible_count = if let Some(filters) = &app.active_interface_filters {
-                if filters.is_empty() {
-                    0 // Empty filter = show nothing
-                } else if filters.contains(&iface.name) {
-                    // Count processes that use this interface
-                    app.process_list
-                        .iter()
-                        .filter(|p| p.interface_stats.contains_key(&iface.name))
-                        .count()
-                } else {
-                    0 // Not in filter
-                }
-            } else {
-                iface.process_count // No filter = show total
-            };
-
-            // Format IP addresses
-            let ip_str = if iface.ip_addresses.is_empty() {
-                "No IP".to_string()
-            } else {
-                iface
-                    .ip_addresses
-                    .iter()
-                    .take(2) // Show up to 2 IPs
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-
-            let content = line(vec![
-                Span::styled(selection_indicator, Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    status_indicator,
-                    Style::default()
-                        .fg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:12} ", iface.name),
-                    Style::default()
-                        .fg(Color::BrightWhite)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        "{:30} ",
-                        if ip_str.len() > 30 {
-                            format!("{}...", &ip_str[..27])
-                        } else {
-                            ip_str
-                        }
-                    ),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!(
-                        "↓{:>10} ",
-                        ProcessInfo::format_rate(iface.total_download_rate)
-                    ),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::styled(
-                    format!(
-                        "↑{:>10} ",
-                        ProcessInfo::format_rate(iface.total_upload_rate)
-                    ),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{} proc", visible_count),
-                    Style::default().fg(Color::Magenta),
-                ),
-            ]);
-
-            bmux_tui_components::selectable_list::SelectableListItem::rich(
-                content.plain_text(),
-                content,
-            )
-        })
-        .collect();
-
-    let header = line(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            "Interface    ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "IP Address                     ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("DL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("UL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Processes", Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    // Split the area for header and list
-    let header_area = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(5),
-        height: 1,
-    };
-
-    let list_area = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: area.height.saturating_sub(2),
-    };
-
-    // Render border and title
-    let border = PanelChrome {
-        title: Some(line("Network Interfaces")),
-        ..PanelChrome::default()
-    };
-    paint_border(f, area, border);
-
-    // Render header
-    paint_text(
-        &app.component_scene,
-        "draw_interface_list.header",
-        f,
-        header_area,
-        (render::lines(header), TextPresentation::default()),
-    );
-
-    // Render list
-    let list = (
-        items,
-        Style::default()
-            .bg(Color::BrightBlack)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    let inner_list_area = Rect {
-        x: list_area.x + 1,
-        y: list_area.y,
-        width: list_area.width.saturating_sub(2),
-        height: list_area.height.saturating_sub(1),
-    };
-
-    paint_list(
-        &app.component_scene,
-        "draw_interface_list",
-        f,
-        inner_list_area,
-        &list.0,
-        list.1,
-        &mut app.interface_list_state,
-    );
-}
-
 fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     // Get the selected interface name
     let interface_name = match &app.selected_interface_name {
@@ -2801,7 +2576,7 @@ fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState
                 TextPresentation {
                     chrome: Some(PanelChrome {
                         title: Some(line("Error")),
-                        ..PanelChrome::default()
+                        style: Style::default(),
                     }),
                     ..TextPresentation::default()
                 },
@@ -3122,7 +2897,6 @@ fn draw_interface_modal(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState)
             chrome: Some(PanelChrome {
                 title: Some(line("Interface Filter (↑↓ to scroll)")),
                 style: Style::default().fg(Color::Cyan),
-                ..PanelChrome::default()
             }),
             ..TextPresentation::default()
         },
@@ -3156,7 +2930,7 @@ fn draw_process_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) 
                     style: Style::default().fg(Color::Red),
                     chrome: Some(PanelChrome {
                         title: Some(line("Process Not Found")),
-                        ..PanelChrome::default()
+                        style: Style::default(),
                     }),
                     ..TextPresentation::default()
                 },
@@ -3594,7 +3368,7 @@ fn draw_detail_overview(
             scroll: (clamped_scroll as u16, 0),
             chrome: Some(PanelChrome {
                 title: Some(line("Overview")),
-                ..PanelChrome::default()
+                style: Style::default(),
             }),
             ..TextPresentation::default()
         },
@@ -3721,7 +3495,7 @@ fn draw_detail_connections(
             scroll: (clamped_scroll as u16, 0),
             chrome: Some(PanelChrome {
                 title: Some(line("Connections")),
-                ..PanelChrome::default()
+                style: Style::default(),
             }),
             ..TextPresentation::default()
         },
@@ -3918,7 +3692,7 @@ fn draw_detail_traffic(
             scroll: (clamped_scroll as u16, 0),
             chrome: Some(PanelChrome {
                 title: Some(line("Traffic Details")),
-                ..PanelChrome::default()
+                style: Style::default(),
             }),
             ..TextPresentation::default()
         },
@@ -4074,7 +3848,7 @@ fn draw_detail_system(
             scroll: (clamped_scroll as u16, 0),
             chrome: Some(PanelChrome {
                 title: Some(line("System Information")),
-                ..PanelChrome::default()
+                style: Style::default(),
             }),
             ..TextPresentation::default()
         },

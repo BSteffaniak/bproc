@@ -384,6 +384,18 @@ impl Owner {
 }
 
 #[cfg(test)]
+impl Service {
+    pub(super) fn disconnected_for_test() -> Self {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        Self {
+            tx,
+            thread: None,
+            sequence: 0,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -534,17 +546,5 @@ mod tests {
         ));
         assert!(matches!(rx.recv().unwrap().effect, Effect::Refresh));
         drop(receipts);
-    }
-}
-
-#[cfg(test)]
-impl Service {
-    pub(super) fn disconnected_for_test() -> Self {
-        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        Self {
-            tx,
-            thread: None,
-            sequence: 0,
-        }
     }
 }

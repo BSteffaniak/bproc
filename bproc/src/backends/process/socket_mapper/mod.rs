@@ -18,7 +18,8 @@ pub trait SocketMapperBackend: Send + Sync {
     /// Backend name (e.g., "procfs", "lsof", "libproc")
     fn name(&self) -> &'static str;
 
-    /// Backend priority for auto-selection
+    /// Backend priority for auto-selection; detection metadata also carries this value.
+    #[allow(dead_code)]
     fn priority(&self) -> BackendPriority;
 
     /// Check if this backend is available on the current system
@@ -27,6 +28,7 @@ pub trait SocketMapperBackend: Send + Sync {
         Self: Sized;
 
     /// Get backend capabilities
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     fn capabilities(&self) -> BackendCapabilities;
 
     /// Get complete socket-to-PID connection map

@@ -13,7 +13,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 // Constants from sys/proc_info.h (not exposed by libproc crate)
 const INI_IPV4: u8 = 0x1;
-const INI_IPV6: u8 = 0x2;
 
 // TCP state constants from netinet/tcp_fsm.h
 const TCPS_CLOSED: i32 = 0;

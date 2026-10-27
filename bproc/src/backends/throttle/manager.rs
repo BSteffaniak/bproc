@@ -150,33 +150,6 @@ impl ThrottleManager {
         stats
     }
 
-    /// Get list of PIDs using a specific backend
-    pub fn get_pids_for_backend(&self, backend_name: &str) -> Vec<i32> {
-        let mut pids = Vec::new();
-        for (pid, name) in &self.upload_backend_map {
-            if name == backend_name {
-                pids.push(*pid);
-            }
-        }
-        for (pid, name) in &self.download_backend_map {
-            if name == backend_name && !pids.contains(pid) {
-                pids.push(*pid);
-            }
-        }
-        pids
-    }
-
-    /// Log eBPF throttle stats for a PID (if using eBPF backend)
-    pub fn log_ebpf_stats(&mut self, pid: i32) -> Result<()> {
-        // Check if this PID is using an eBPF backend for download
-        if let Some(backend_name) = self.download_backend_map.get(&pid) {
-            if let Some(backend) = self.download_backends.get_mut(backend_name) {
-                backend.log_diagnostics(pid)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Get comprehensive backend information for UI display
     pub fn get_backend_info(
         &self,
@@ -293,44 +266,44 @@ impl ThrottleManager {
         let mut errors = Vec::new();
 
         // Remove upload throttle if it exists
-        if let Some(backend_name) = self.upload_backend_map.remove(&pid) {
-            if let Some(backend) = self.upload_backends.get_mut(&backend_name) {
-                if let Err(e) = backend.remove_upload_throttle(pid) {
-                    log::warn!(
-                        "Failed to remove upload throttle for PID {} from {} backend: {}",
-                        pid,
-                        backend_name,
-                        e
-                    );
-                    errors.push(e);
-                } else {
-                    log::info!(
-                        "Removed upload throttle for PID {} from {} backend",
-                        pid,
-                        backend_name
-                    );
-                }
+        if let Some(backend_name) = self.upload_backend_map.remove(&pid)
+            && let Some(backend) = self.upload_backends.get_mut(&backend_name)
+        {
+            if let Err(e) = backend.remove_upload_throttle(pid) {
+                log::warn!(
+                    "Failed to remove upload throttle for PID {} from {} backend: {}",
+                    pid,
+                    backend_name,
+                    e
+                );
+                errors.push(e);
+            } else {
+                log::info!(
+                    "Removed upload throttle for PID {} from {} backend",
+                    pid,
+                    backend_name
+                );
             }
         }
 
         // Remove download throttle if it exists
-        if let Some(backend_name) = self.download_backend_map.remove(&pid) {
-            if let Some(backend) = self.download_backends.get_mut(&backend_name) {
-                if let Err(e) = backend.remove_download_throttle(pid) {
-                    log::warn!(
-                        "Failed to remove download throttle for PID {} from {} backend: {}",
-                        pid,
-                        backend_name,
-                        e
-                    );
-                    errors.push(e);
-                } else {
-                    log::info!(
-                        "Removed download throttle for PID {} from {} backend",
-                        pid,
-                        backend_name
-                    );
-                }
+        if let Some(backend_name) = self.download_backend_map.remove(&pid)
+            && let Some(backend) = self.download_backends.get_mut(&backend_name)
+        {
+            if let Err(e) = backend.remove_download_throttle(pid) {
+                log::warn!(
+                    "Failed to remove download throttle for PID {} from {} backend: {}",
+                    pid,
+                    backend_name,
+                    e
+                );
+                errors.push(e);
+            } else {
+                log::info!(
+                    "Removed download throttle for PID {} from {} backend",
+                    pid,
+                    backend_name
+                );
             }
         }
 
@@ -347,43 +320,12 @@ impl ThrottleManager {
         Ok(())
     }
 
-    /// Get throttle information for a process
-    pub fn get_throttle(&self, pid: i32) -> Option<ActiveThrottle> {
-        let upload_limit = self
-            .upload_backend_map
-            .get(&pid)
-            .and_then(|backend_name| self.upload_backends.get(backend_name))
-            .and_then(|b| b.get_upload_throttle(pid));
-
-        let download_limit = self
-            .download_backend_map
-            .get(&pid)
-            .and_then(|backend_name| self.download_backends.get(backend_name))
-            .and_then(|b| b.get_download_throttle(pid));
-
-        if upload_limit.is_some() || download_limit.is_some() {
-            Some(ActiveThrottle {
-                pid,
-                process_name: self.process_names.get(&pid).cloned().unwrap_or_default(),
-                upload_limit,
-                download_limit,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Check if download throttling is available
-    pub fn is_download_throttling_available(&self) -> bool {
-        self.default_download.is_some()
-    }
-
     /// Get all active throttles (merged from all backends)
     pub fn get_all_throttles(&self) -> HashMap<i32, ActiveThrottle> {
         let mut throttles: HashMap<i32, ActiveThrottle> = HashMap::new();
 
         // Collect upload throttles from all backends
-        for (backend_name, backend) in &self.upload_backends {
+        for backend in self.upload_backends.values() {
             for (pid, upload_limit) in backend.get_all_throttles() {
                 let process_name = self.process_names.get(&pid).cloned().unwrap_or_default();
                 throttles.entry(pid).or_insert_with(|| ActiveThrottle {
@@ -399,7 +341,7 @@ impl ThrottleManager {
         }
 
         // Collect download throttles from all backends
-        for (backend_name, backend) in &self.download_backends {
+        for backend in self.download_backends.values() {
             for (pid, download_limit) in backend.get_all_throttles() {
                 let process_name = self.process_names.get(&pid).cloned().unwrap_or_default();
                 throttles.entry(pid).or_insert_with(|| ActiveThrottle {
@@ -452,10 +394,10 @@ impl ThrottleManager {
         &self,
         traffic_type: crate::process::TrafficType,
     ) -> bool {
-        if let Some(backend_name) = &self.default_upload {
-            if let Some(backend) = self.upload_backends.get(backend_name) {
-                return backend.supports_traffic_type(traffic_type);
-            }
+        if let Some(backend_name) = &self.default_upload
+            && let Some(backend) = self.upload_backends.get(backend_name)
+        {
+            return backend.supports_traffic_type(traffic_type);
         }
         false
     }
@@ -465,10 +407,10 @@ impl ThrottleManager {
         &self,
         traffic_type: crate::process::TrafficType,
     ) -> bool {
-        if let Some(backend_name) = &self.default_download {
-            if let Some(backend) = self.download_backends.get(backend_name) {
-                return backend.supports_traffic_type(traffic_type);
-            }
+        if let Some(backend_name) = &self.default_download
+            && let Some(backend) = self.download_backends.get(backend_name)
+        {
+            return backend.supports_traffic_type(traffic_type);
         }
         false
     }
@@ -498,6 +440,12 @@ impl ThrottleManager {
     }
 }
 
+impl Drop for ThrottleManager {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
 #[cfg(test)]
 mod default_selection_tests {
     use super::ThrottleManager;
@@ -516,11 +464,5 @@ mod default_selection_tests {
         );
         manager.restore_default_backends(captured.clone());
         assert_eq!(manager.get_default_backends(), captured);
-    }
-}
-
-impl Drop for ThrottleManager {
-    fn drop(&mut self) {
-        let _ = self.cleanup();
     }
 }

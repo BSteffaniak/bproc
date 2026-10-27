@@ -131,11 +131,6 @@ impl Config {
         self.throttles.insert(pid, throttle);
     }
 
-    /// Remove a throttle
-    pub fn remove_throttle(&mut self, pid: i32) {
-        self.throttles.remove(&pid);
-    }
-
     /// Get all saved throttles
     pub fn get_throttles(&self) -> &HashMap<i32, SavedThrottle> {
         &self.throttles
@@ -154,7 +149,6 @@ mod tests {
     #[test]
     fn test_config_serialization() {
         let mut config = Config::default();
-        config.auto_restore = true;
         config.set_throttle(
             1234,
             SavedThrottle {
@@ -169,6 +163,6 @@ mod tests {
 
         let deserialized: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.throttles.len(), 1);
-        assert_eq!(deserialized.auto_restore, true);
+        assert!(deserialized.auto_restore);
     }
 }

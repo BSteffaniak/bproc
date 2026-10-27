@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::{self};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -83,7 +83,6 @@ pub struct NetworkMonitor {
     // Platform-specific process utilities
     process_utils: Box<dyn ProcessUtils>,
     // Monitoring backend name (e.g., "pnet", "windows-poll")
-    monitoring_backend_name: &'static str,
     // Socket mapper backend information
     socket_mapper_name: String,
     socket_mapper_capabilities: crate::backends::BackendCapabilities,
@@ -150,7 +149,6 @@ pub struct ProcessBandwidth {
 
 #[derive(Clone)]
 struct InterfaceBandwidth {
-    name: String,
     rx_bytes: u64,
     tx_bytes: u64,
     last_rx_bytes: u64,
@@ -175,10 +173,6 @@ struct ProcessInterfaceBandwidth {
 }
 
 impl NetworkMonitor {
-    pub fn new() -> Result<Self> {
-        Self::with_socket_mapper(None)
-    }
-
     pub fn with_socket_mapper(socket_mapper_preference: Option<&str>) -> Result<Self> {
         let bandwidth_tracker = Arc::new(Mutex::new(BandwidthTracker {
             connection_map: HashMap::new(),
@@ -214,7 +208,6 @@ impl NetworkMonitor {
             }
             #[cfg(target_os = "macos")]
             {
-                use crate::backends::process::MacOSProcessUtils;
                 let temp_utils = crate::backends::process::MacOSProcessUtils::with_socket_mapper(
                     socket_mapper_preference,
                 );
@@ -246,7 +239,6 @@ impl NetworkMonitor {
         let mut monitor = Self {
             bandwidth_tracker,
             process_utils,
-            monitoring_backend_name: "pnet",
             socket_mapper_name,
             socket_mapper_capabilities,
             shutdown_flag: Arc::clone(&shutdown_flag),
@@ -332,16 +324,6 @@ impl NetworkMonitor {
         }
 
         Ok(monitor)
-    }
-
-    /// Get monitoring backend name (e.g., "pnet")
-    pub fn get_monitoring_backend_name(&self) -> &'static str {
-        self.monitoring_backend_name
-    }
-
-    /// Get socket mapper backend information
-    pub fn get_socket_mapper_info(&self) -> (&str, &crate::backends::BackendCapabilities) {
-        (&self.socket_mapper_name, &self.socket_mapper_capabilities)
     }
 
     pub fn update(&mut self) -> Result<(ProcessMap, InterfaceMap)> {
@@ -713,7 +695,7 @@ impl NetworkMonitor {
             let mut tracker = self.bandwidth_tracker.lock().unwrap();
 
             // Update last values for process bandwidth
-            for (&pid, bandwidth) in &mut tracker.process_bandwidth {
+            for (&_pid, bandwidth) in &mut tracker.process_bandwidth {
                 bandwidth.last_rx_bytes = bandwidth.rx_bytes;
                 bandwidth.last_tx_bytes = bandwidth.tx_bytes;
                 bandwidth.last_internet_rx_bytes = bandwidth.internet_rx_bytes;
@@ -723,13 +705,13 @@ impl NetworkMonitor {
             }
 
             // Update last values for interface bandwidth
-            for (_, bw) in &mut tracker.interface_bandwidth {
+            for bw in tracker.interface_bandwidth.values_mut() {
                 bw.last_rx_bytes = bw.rx_bytes;
                 bw.last_tx_bytes = bw.tx_bytes;
             }
 
             // Update last values for process-interface bandwidth
-            for (_, bw) in &mut tracker.process_interface_bandwidth {
+            for bw in tracker.process_interface_bandwidth.values_mut() {
                 bw.last_rx_bytes = bw.rx_bytes;
                 bw.last_tx_bytes = bw.tx_bytes;
                 bw.last_internet_rx_bytes = bw.internet_rx_bytes;
@@ -856,7 +838,7 @@ impl NetworkMonitor {
                             process_map,
                             interface_map,
                             socket_mapper_name: self.socket_mapper_name.clone(),
-                            socket_mapper_capabilities: self.socket_mapper_capabilities.clone(),
+                            socket_mapper_capabilities: self.socket_mapper_capabilities,
                         };
 
                         // Lossless bounded delivery: the dedicated monitoring thread applies
@@ -896,7 +878,7 @@ impl NetworkMonitor {
         // Clone the raw map first since we'll be moving parts of it
         let raw_map = conn_map.clone();
 
-        let mut new_socket_map = conn_map.socket_to_pid;
+        let new_socket_map = conn_map.socket_to_pid;
         let mut new_connection_map = HashMap::new();
 
         // Map TCP connections to PIDs via socket inodes
@@ -1209,10 +1191,8 @@ impl NetworkMonitor {
             IpNextHeaderProtocols::Tcp => {
                 if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
                     Self::track_connection(
-                        src_addr,
-                        tcp.get_source(),
-                        dst_addr,
-                        tcp.get_destination(),
+                        (src_addr, tcp.get_source()),
+                        (dst_addr, tcp.get_destination()),
                         Protocol::Tcp,
                         packet_len,
                         interface_name,
@@ -1223,10 +1203,8 @@ impl NetworkMonitor {
             IpNextHeaderProtocols::Udp => {
                 if let Some(udp) = UdpPacket::new(ipv4.payload()) {
                     Self::track_connection(
-                        src_addr,
-                        udp.get_source(),
-                        dst_addr,
-                        udp.get_destination(),
+                        (src_addr, udp.get_source()),
+                        (dst_addr, udp.get_destination()),
                         Protocol::Udp,
                         packet_len,
                         interface_name,
@@ -1253,10 +1231,8 @@ impl NetworkMonitor {
             IpNextHeaderProtocols::Tcp => {
                 if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
                     Self::track_connection(
-                        src_addr,
-                        tcp.get_source(),
-                        dst_addr,
-                        tcp.get_destination(),
+                        (src_addr, tcp.get_source()),
+                        (dst_addr, tcp.get_destination()),
                         Protocol::Tcp,
                         packet_len,
                         interface_name,
@@ -1267,10 +1243,8 @@ impl NetworkMonitor {
             IpNextHeaderProtocols::Udp => {
                 if let Some(udp) = UdpPacket::new(ipv6.payload()) {
                     Self::track_connection(
-                        src_addr,
-                        udp.get_source(),
-                        dst_addr,
-                        udp.get_destination(),
+                        (src_addr, udp.get_source()),
+                        (dst_addr, udp.get_destination()),
                         Protocol::Udp,
                         packet_len,
                         interface_name,
@@ -1285,15 +1259,15 @@ impl NetworkMonitor {
     }
 
     fn track_connection(
-        src_addr: IpAddr,
-        src_port: u16,
-        dst_addr: IpAddr,
-        dst_port: u16,
+        source: (IpAddr, u16),
+        destination: (IpAddr, u16),
         protocol: Protocol,
         packet_len: usize,
         interface_name: &str,
         tracker: &Arc<Mutex<BandwidthTracker>>,
     ) {
+        let (src_addr, src_port) = source;
+        let (dst_addr, dst_port) = destination;
         let mut tracker = tracker.lock().unwrap();
         tracker.packets_captured += 1;
 
@@ -1557,7 +1531,6 @@ impl NetworkMonitor {
                 .interface_bandwidth
                 .entry(interface_name.to_string())
                 .or_insert(InterfaceBandwidth {
-                    name: interface_name.to_string(),
                     rx_bytes: 0,
                     tx_bytes: 0,
                     last_rx_bytes: 0,
@@ -1579,7 +1552,6 @@ impl NetworkMonitor {
                 .interface_bandwidth
                 .entry(interface_name.to_string())
                 .or_insert(InterfaceBandwidth {
-                    name: interface_name.to_string(),
                     rx_bytes: 0,
                     tx_bytes: 0,
                     last_rx_bytes: 0,
@@ -1626,7 +1598,7 @@ impl NetworkMonitor {
         }
 
         // Periodic statistics logging
-        if tracker.packets_captured % 1000 == 0 {
+        if tracker.packets_captured.is_multiple_of(1000) {
             log::debug!(
                 "Packet stats: captured={}, matched={}, unmatched={} (match rate: {:.1}%)",
                 tracker.packets_captured,

@@ -15,7 +15,7 @@
 // - New connections require rule updates
 // - Rule management via pfctl (no native API)
 
-use crate::backends::process::{ConnectionEntry, ProcessUtils};
+use crate::backends::process::ProcessUtils;
 use crate::backends::throttle::UploadThrottleBackend;
 use crate::backends::{BackendCapabilities, BackendPriority};
 use anyhow::{Context, Result, anyhow};

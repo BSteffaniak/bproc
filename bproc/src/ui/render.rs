@@ -314,10 +314,12 @@ pub fn paint_list(
 
     bmux_state.scroll.set_vertical_offset(state.offset as u64);
     native.set(bmux_state);
-    let mut styles = SelectableListStyles::default();
-    styles.selected = highlight;
-    styles.focused = highlight;
-    styles.hovered = highlight;
+    let styles = SelectableListStyles {
+        selected: highlight,
+        focused: highlight,
+        hovered: highlight,
+        ..Default::default()
+    };
     let policy = super::scene::list_policy();
 
     // BMUX styles rich spans, while Ratatui highlighted the entire selected

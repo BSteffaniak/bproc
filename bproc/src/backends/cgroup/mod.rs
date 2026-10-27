@@ -206,6 +206,11 @@ pub fn is_cgroup_v1_available() -> bool {
 ///
 /// Useful for debugging and the `--list-backends` CLI flag
 pub fn list_all_backends() -> Vec<(CgroupBackendType, bool, String)> {
+    // Feature-gated backends append below; the monitoring-only build has none.
+    #[cfg_attr(
+        not(any(feature = "cgroup-v1", feature = "cgroup-v2-nftables")),
+        allow(unused_mut)
+    )]
     let mut backends = Vec::new();
 
     #[cfg(feature = "cgroup-v1")]

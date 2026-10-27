@@ -8,14 +8,11 @@ use sysinfo::{Pid, System};
 /// macOS process utilities with pluggable socket mapping
 pub struct MacOSProcessUtils {
     socket_mapper: Box<dyn SocketMapperBackend>,
+    #[cfg_attr(not(feature = "monitor-pnet"), allow(dead_code))]
     socket_mapper_name: String,
 }
 
 impl MacOSProcessUtils {
-    pub fn new() -> Self {
-        Self::with_socket_mapper(None)
-    }
-
     /// Create with a specific socket mapper backend
     pub fn with_socket_mapper(backend_name: Option<&str>) -> Self {
         let socket_mapper = select_socket_mapper(backend_name)
@@ -31,11 +28,13 @@ impl MacOSProcessUtils {
     }
 
     /// Get the name of the socket mapper backend
+    #[cfg(feature = "monitor-pnet")]
     pub fn socket_mapper_name(&self) -> &str {
         &self.socket_mapper_name
     }
 
     /// Get capabilities of the socket mapper backend
+    #[cfg(feature = "monitor-pnet")]
     pub fn socket_mapper_capabilities(&self) -> crate::backends::BackendCapabilities {
         self.socket_mapper.capabilities()
     }

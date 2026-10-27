@@ -103,7 +103,7 @@ impl LsofSocketMapper {
     /// - "[::1]:8080->[::1]:54321" (IPv6)
     fn parse_connection(
         conn_str: &str,
-        pid: i32,
+        _pid: i32,
         _name: &str,
         is_tcp: bool,
     ) -> Option<ConnectionEntry> {
@@ -263,7 +263,7 @@ impl SocketMapperBackend for LsofSocketMapper {
         // -P: Don't resolve port names (faster)
         // -F pcn: Field output (pid, command, network address)
         let output = Command::new("lsof")
-            .args(&["-i", "-n", "-P", "-F", "pcn"])
+            .args(["-i", "-n", "-P", "-F", "pcn"])
             .output()
             .context("Failed to execute lsof command")?;
 
