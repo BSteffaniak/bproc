@@ -443,6 +443,8 @@ impl ExplorerState {
     // ---- input -----------------------------------------------------------------
 
     pub fn handle_event(&mut self, event: &Event) -> Outcome {
+        let normalized = normalize_key(event);
+        let event = normalized.as_ref().unwrap_or(event);
         if let Event::Mouse(mouse) = event {
             self.pointer.position = Some(mouse.position);
             if matches!(mouse.kind, MouseEventKind::Move | MouseEventKind::Drag(_)) {
@@ -864,6 +866,28 @@ impl Click<'_> {
     }
 }
 
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+
+    #[test]
+    fn shifted_letters_run_uppercase_bindings() {
+        let mut state = ExplorerState::default();
+        let mut shift = Modifiers::NONE;
+        shift.shift = true;
+        let tree = state.settings.tree;
+        state.handle_event(&Event::Key(KeyStroke::with_modifiers(KeyCode::Char('t'), shift)));
+        assert_ne!(state.settings.tree, tree, "Shift+t must toggle tree, not throttle");
+        assert!(
+            !state
+                .take_requests()
+                .iter()
+                .any(|r| matches!(r, UiRequest::Legacy(LegacyRequest::OpenThrottle { .. })))
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Layout {
     pub header: Rect,
@@ -874,6 +898,20 @@ pub struct Layout {
     pub dock: Rect,
     pub fkeys: Rect,
     pub status: Rect,
+}
+
+/// Terminals report Shift+letter as the lowercase key plus a Shift modifier;
+/// every handler expects the typed (uppercase) character instead.
+fn normalize_key(event: &Event) -> Option<Event> {
+    let Event::Key(key) = event else { return None };
+    match key.key {
+        bmux_keyboard::KeyCode::Char(c) if key.modifiers.shift && c.is_ascii_lowercase() => {
+            let mut key = key.clone();
+            key.key = bmux_keyboard::KeyCode::Char(c.to_ascii_uppercase());
+            Some(Event::Key(key))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
