@@ -38,6 +38,19 @@ impl Body {
             Self::Message(_) => 0,
         }
     }
+    /// The rows that scroll (indexes match `scroll_rows`).
+    pub fn scroll_lines(&self) -> Option<&[BLine]> {
+        match self {
+            Self::Lines(lines) | Self::Columns { left: lines, .. } => Some(lines),
+            Self::Message(_) => None,
+        }
+    }
+    pub fn scroll_lines_mut(&mut self) -> Option<&mut Vec<BLine>> {
+        match self {
+            Self::Lines(lines) | Self::Columns { left: lines, .. } => Some(lines),
+            Self::Message(_) => None,
+        }
+    }
 }
 
 pub struct Ctx<'a> {
@@ -58,7 +71,7 @@ pub fn build(cx: &Ctx<'_>, tab: Tab) -> Body {
         Tab::Env => section(cx, "Environment", |d| &d.environment, |v, w| env(v, w)),
         Tab::Memory => section(cx, "Memory maps", |d| &d.memory_maps, |v, w| memory(v, w)),
         Tab::Tree => tree(cx),
-        Tab::Limits => section(cx, "Limits", |d| &d.limits, |v, w| limits(v, w)),
+        Tab::Limits => limits_tab(cx),
         Tab::Events => events(cx),
     }
 }
@@ -134,14 +147,89 @@ fn label(text: &str) -> Seg {
     Seg::new(fit(text, LABEL_W, false), theme::dim())
 }
 
-/// `label  value` rows, wrapping the value under itself.
-fn fact(out: &mut Vec<BLine>, name: &str, value: &str, style: Style, width: usize) {
-    let avail = width.saturating_sub(LABEL_W).max(1);
-    for (i, part) in wrap(value, avail).into_iter().enumerate() {
-        let head = if i == 0 { name } else { "" };
-        out.push(BLine::new(vec![label(head), Seg::new(part, style)]));
+/// One overview fact before layout: wrapped text or a single styled row.
+enum FactValue {
+    Text(String, Style),
+    Segs(Vec<Seg>),
+}
+
+struct Fact {
+    name: String,
+    value: FactValue,
+}
+
+impl Fact {
+    fn text(name: &str, value: impl Into<String>, style: Style) -> Self {
+        Self {
+            name: name.into(),
+            value: FactValue::Text(value.into(), style),
+        }
+    }
+    fn segs(name: &str, segs: Vec<Seg>) -> Self {
+        Self {
+            name: name.into(),
+            value: FactValue::Segs(segs),
+        }
     }
 }
+
+/// Label column width for `facts`: the longest label plus a one-cell gap,
+/// at least `LABEL_W`, and at most a third of `width` (never below
+/// `LABEL_W`).
+fn label_width(facts: &[Fact], width: usize) -> usize {
+    let longest = facts
+        .iter()
+        .map(|f| bmux_tui::text_width::display_width(&f.name))
+        .max()
+        .unwrap_or(0);
+    (longest + 1).clamp(LABEL_W, (width / 3).max(LABEL_W))
+}
+
+/// `label value` rows, wrapping text values under themselves.
+fn layout_facts(facts: &[Fact], width: usize) -> Vec<BLine> {
+    let label_w = label_width(facts, width);
+    let head = |name: &str| {
+        Seg::new(
+            format!("{} ", fit(name, label_w.saturating_sub(1), false)),
+            theme::dim(),
+        )
+    };
+    let avail = width.saturating_sub(label_w).max(1);
+    let mut out = Vec::new();
+    for f in facts {
+        match &f.value {
+            FactValue::Text(value, style) => {
+                for (i, part) in wrap(value, avail).into_iter().enumerate() {
+                    let name = if i == 0 { f.name.as_str() } else { "" };
+                    out.push(BLine::new(vec![head(name), Seg::new(part, *style)]));
+                }
+            }
+            FactValue::Segs(segs) => {
+                let mut line = vec![head(&f.name)];
+                line.extend(segs.iter().cloned());
+                out.push(BLine::new(line));
+            }
+        }
+    }
+    out
+}
+
+/// Detail facts the summary already shows (or the warning line under the
+/// tab bar does); merging them would repeat the same fact twice.
+const SUMMARY_FACTS: [&str; 12] = [
+    "Executable",
+    "Working dir",
+    "Command",
+    "User",
+    "Parent",
+    "State",
+    "Started",
+    "Threads",
+    "Priority",
+    "Nice",
+    "Access",
+    "Truncated",
+];
 
 pub fn state_style(state: ProcState) -> Style {
     match state {
@@ -196,20 +284,18 @@ fn now_secs(state: &ExplorerState) -> u64 {
 }
 
 fn facts(cx: &Ctx<'_>, row: &Row, width: usize) -> Vec<BLine> {
+    layout_facts(&fact_list(cx, row), width)
+}
+
+fn fact_list(cx: &Ctx<'_>, row: &Row) -> Vec<Fact> {
     let record = &row.entry.record;
     let s = &row.entry.sample;
     let base = theme::base();
-    let mut out = Vec::new();
-    fact(
-        &mut out,
-        "PID",
-        &record.key.pid.to_string(),
-        theme::bold(),
-        width,
-    );
+    let detail_fact = |name: &str| cx.detail.and_then(|d| d.fact(name));
+    let mut out = vec![Fact::text("PID", record.key.pid.to_string(), theme::bold())];
     match record.ppid {
         Some(ppid) => {
-            let mut segs = vec![label("PPID")];
+            let mut segs = Vec::new();
             match cx.state.store.by_pid(ppid) {
                 Some(parent) => {
                     segs.push(Seg::link(
@@ -221,25 +307,35 @@ fn facts(cx: &Ctx<'_>, row: &Row, width: usize) -> Vec<BLine> {
                 }
                 None => segs.push(Seg::new(ppid.to_string(), base)),
             }
-            out.push(BLine::new(segs));
+            out.push(Fact::segs("PPID", segs));
         }
-        None => fact(&mut out, "PPID", "–", base, width),
+        None => out.push(Fact::text(
+            "PPID",
+            detail_fact("Parent").unwrap_or("–"),
+            base,
+        )),
     }
-    fact(&mut out, "User", &user_label(row), base, width);
+    let mut user = user_label(row);
+    if user == "–"
+        && let Some(v) = detail_fact("User")
+    {
+        user = v.to_string();
+    }
+    out.push(Fact::text("User", user, base));
     let state_text = if row.is_ghost() {
         "Exited".to_string()
     } else {
         s.state.label().to_string()
     };
-    fact(&mut out, "State", &state_text, state_style(s.state), width);
+    out.push(Fact::text("State", state_text, state_style(s.state)));
     let started = if record.key.start_time == 0 {
-        "–".to_string()
+        detail_fact("Started").unwrap_or("–").to_string()
     } else {
         let when = local_time(record.key.start_time, "%Y-%m-%d %H:%M:%S").unwrap_or_default();
         let ago = now_secs(cx.state).saturating_sub(record.key.start_time);
         format!("{when} · {} ago", age(ago))
     };
-    fact(&mut out, "Started", &started, base, width);
+    out.push(Fact::text("Started", started, base));
     let elapsed_ms = now_secs(cx.state)
         .saturating_sub(record.key.start_time)
         .saturating_mul(1000);
@@ -251,47 +347,48 @@ fn facts(cx: &Ctx<'_>, row: &Row, width: usize) -> Vec<BLine> {
     } else {
         String::new()
     };
-    out.push(BLine::new(vec![
-        label("CPU"),
-        Seg::new(
-            format!("{}%", fmt::percent(s.cpu_percent)),
-            Style::new()
-                .fg(theme::heat(f64::from(s.cpu_percent)))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Seg::new(format!(" now{avg}"), theme::dim()),
-    ]));
-    fact(
-        &mut out,
-        "CPU time",
-        &fmt::cpu_time(s.cpu_time_ms),
-        base,
-        width,
-    );
-    fact(&mut out, "Threads", &opt(s.threads), base, width);
-    fact(
-        &mut out,
+    out.push(Fact::segs(
+        "CPU",
+        vec![
+            Seg::new(
+                format!("{}%", fmt::percent(s.cpu_percent)),
+                Style::new()
+                    .fg(theme::heat(f64::from(s.cpu_percent)))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Seg::new(format!(" now{avg}"), theme::dim()),
+        ],
+    ));
+    out.push(Fact::text("CPU time", fmt::cpu_time(s.cpu_time_ms), base));
+    let threads = s
+        .threads
+        .map(|t| t.to_string())
+        .or_else(|| detail_fact("Threads").map(str::to_string))
+        .unwrap_or_else(|| "–".into());
+    out.push(Fact::text("Threads", threads, base));
+    let nice = s
+        .nice
+        .map(|n| n.to_string())
+        .or_else(|| detail_fact("Nice").map(str::to_string))
+        .unwrap_or_else(|| "–".into());
+    out.push(Fact::text(
         "Priority",
-        &format!("nice {} · pri {}", opt(s.nice), opt(s.priority)),
+        format!("nice {nice} · pri {}", opt(s.priority)),
         base,
-        width,
-    );
-    fact(
-        &mut out,
+    ));
+    out.push(Fact::text(
         "Memory",
-        &format!(
+        format!(
             "RSS {} · VIRT {} · {}%",
             fmt::bytes(s.mem_rss),
             fmt::bytes(s.mem_virtual),
             fmt::percent(s.mem_percent)
         ),
         base,
-        width,
-    );
-    fact(
-        &mut out,
+    ));
+    out.push(Fact::text(
         "Disk",
-        &format!(
+        format!(
             "R {} · W {} · total R {} W {}",
             fmt::rate(s.disk_read_rate),
             fmt::rate(s.disk_write_rate),
@@ -299,52 +396,63 @@ fn facts(cx: &Ctx<'_>, row: &Row, width: usize) -> Vec<BLine> {
             fmt::bytes(s.disk_write_total)
         ),
         base,
-        width,
-    );
+    ));
     if let Some(net) = &row.net {
-        out.push(BLine::new(vec![
-            label("Network"),
-            Seg::new(
-                format!("↓ {}", fmt::rate(net.download_rate)),
-                theme::download(),
-            ),
-            Seg::new(" ", base),
-            Seg::new(format!("↑ {}", fmt::rate(net.upload_rate)), theme::upload()),
-            Seg::new(
-                format!(
-                    " · total ↓ {} ↑ {}",
-                    fmt::bytes(net.total_download),
-                    fmt::bytes(net.total_upload)
+        out.push(Fact::segs(
+            "Network",
+            vec![
+                Seg::new(
+                    format!("↓ {}", fmt::rate(net.download_rate)),
+                    theme::download(),
                 ),
-                theme::dim(),
-            ),
-        ]));
+                Seg::new(" ", base),
+                Seg::new(format!("↑ {}", fmt::rate(net.upload_rate)), theme::upload()),
+                Seg::new(
+                    format!(
+                        " · total ↓ {} ↑ {}",
+                        fmt::bytes(net.total_download),
+                        fmt::bytes(net.total_upload)
+                    ),
+                    theme::dim(),
+                ),
+            ],
+        ));
     }
-    fact(&mut out, "Open files", &opt(s.open_fds), base, width);
+    out.push(Fact::text("Open files", opt(s.open_fds), base));
     if let Some(tty) = &record.tty {
-        fact(&mut out, "TTY", tty, base, width);
+        out.push(Fact::text("TTY", tty.clone(), base));
     }
     if let Some(group) = &record.group {
-        fact(&mut out, "Group", group, base, width);
+        out.push(Fact::text("Group", group.clone(), base));
     }
-    fact(
-        &mut out,
-        "Exe",
-        record.exe.as_deref().unwrap_or("–"),
-        base,
-        width,
-    );
-    fact(
-        &mut out,
-        "CWD",
-        record.cwd.as_deref().unwrap_or("–"),
-        base,
-        width,
-    );
-    fact(&mut out, "Command", &record.command(), base, width);
+    let exe = record
+        .exe
+        .as_deref()
+        .or_else(|| detail_fact("Executable"))
+        .unwrap_or("–");
+    out.push(Fact::text("Executable", exe, base));
+    let cwd = record
+        .cwd
+        .as_deref()
+        .or_else(|| detail_fact("Working dir"))
+        .unwrap_or("–");
+    out.push(Fact::text("Working dir", cwd, base));
+    let command = if record.cmdline.is_empty() {
+        detail_fact("Command")
+            .map(str::to_string)
+            .unwrap_or_else(|| record.command())
+    } else {
+        record.command()
+    };
+    out.push(Fact::text("Command", command, base));
     if let Some(detail) = cx.detail {
         for (name, value) in &detail.facts {
-            fact(&mut out, name, value, base, width);
+            let shown = SUMMARY_FACTS.contains(&name.as_str())
+                || (name == "Group" && record.group.is_some())
+                || (name == "Terminal" && record.tty.is_some());
+            if !shown {
+                out.push(Fact::text(name, value.clone(), base));
+            }
         }
     }
     out
@@ -612,7 +720,10 @@ fn env(vars: &[(String, String)], width: usize) -> Body {
     sorted.sort();
     let mut out = vec![
         BLine::plain(
-            format!("{} variables · click a row to copy KEY=value", sorted.len()),
+            format!(
+                "{} variables · click a row or press y to copy KEY=value",
+                sorted.len()
+            ),
             theme::dim(),
         ),
         BLine::blank(),
@@ -685,10 +796,35 @@ fn limit_value(v: Option<u64>, unit: &str) -> String {
     }
 }
 
-fn limits(list: &[crate::procs::detail::ResourceLimit], width: usize) -> Body {
-    if list.is_empty() {
-        return Body::Message("No limits reported".into());
+/// Resource limits, followed by the process's cgroups when known.
+fn limits_tab(cx: &Ctx<'_>) -> Body {
+    let Some(d) = cx.detail else {
+        return Body::Message("Loading…".into());
+    };
+    let cgroups = d.cgroups.as_ref().ok().filter(|c| !c.is_empty());
+    let mut out = match &d.limits {
+        Ok(list) if !list.is_empty() => limits(list, cx.width),
+        Ok(_) if cgroups.is_none() => return Body::Message("No limits reported".into()),
+        Err(reason) if cgroups.is_none() => {
+            return Body::Message(format!("Limits unavailable\n{reason}"));
+        }
+        Ok(_) => vec![BLine::plain("No limits reported", theme::dim())],
+        Err(reason) => vec![BLine::plain(
+            truncate(&format!("Limits unavailable · {reason}"), cx.width),
+            theme::dim(),
+        )],
+    };
+    if let Some(cgroups) = cgroups {
+        out.push(BLine::blank());
+        out.push(header(&[("CGROUP", cx.width.max(1), false)]));
+        for cgroup in cgroups {
+            out.push(BLine::plain(truncate(cgroup, cx.width), theme::base()));
+        }
     }
+    Body::Lines(out)
+}
+
+fn limits(list: &[crate::procs::detail::ResourceLimit], width: usize) -> Vec<BLine> {
     let name_w = width.saturating_sub(12 + 12 + 10 + 3).clamp(8, 28);
     let mut out = vec![header(&[
         ("LIMIT", name_w, false),
@@ -714,7 +850,7 @@ fn limits(list: &[crate::procs::detail::ResourceLimit], width: usize) -> Body {
             Seg::new(fit(&l.unit, 10, false), theme::dim()),
         ]));
     }
-    Body::Lines(out)
+    out
 }
 
 // ---- network / tree / events -------------------------------------------------

@@ -119,7 +119,8 @@ pub fn paint_lines(frame: &mut Frame<'_, '_, '_>, r: Rect, lines: &[BLine], scro
     }
 }
 
-/// Word-wrap to `width` cells, splitting words longer than a line.
+/// Word-wrap to `width` cells. Words longer than a line (paths, long flags)
+/// break after a separator such as `/` when one fits, else mid-word.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
@@ -140,22 +141,43 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         if !current.is_empty() {
             out.push(std::mem::take(&mut current));
-            used = 0;
         }
-        for ch in word.chars() {
-            let cw = display_width(ch.encode_utf8(&mut [0; 4]));
-            if used + cw > width && !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-                used = 0;
-            }
-            current.push(ch);
-            used += cw;
+        let mut rest = word;
+        while display_width(rest) > width {
+            let cut = break_point(rest, width);
+            out.push(rest[..cut].to_string());
+            rest = &rest[cut..];
         }
+        current = rest.to_string();
+        used = display_width(rest);
     }
     if !current.is_empty() || out.is_empty() {
         out.push(current);
     }
     out
+}
+
+/// Byte index to split an over-long `word` at so the head fits `width`
+/// cells: just after the last separator in the head, else at the width.
+/// Always at least one character.
+fn break_point(word: &str, width: usize) -> usize {
+    let mut limit = 0usize;
+    let mut used = 0usize;
+    for (i, ch) in word.char_indices() {
+        let cw = display_width(ch.encode_utf8(&mut [0; 4]));
+        if used + cw > width && i > 0 {
+            break;
+        }
+        used += cw;
+        limit = i + ch.len_utf8();
+    }
+    const SEPARATORS: [char; 6] = ['/', '\\', ':', ',', '=', '-'];
+    word[..limit]
+        .char_indices()
+        .rev()
+        .find(|(i, c)| SEPARATORS.contains(c) && *i > 0)
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(limit)
 }
 
 #[cfg(test)]
@@ -169,7 +191,16 @@ mod tests {
             wrap("cargo run --release", 10),
             vec!["cargo run", "--release"]
         );
-        assert_eq!(wrap("/very/long/path", 6), vec!["/very/", "long/p", "ath"]);
+        assert_eq!(wrap("/very/long/path", 6), vec!["/very/", "long/", "path"]);
+        // Paths break after a slash, never mid-name, when a slash fits.
+        assert_eq!(
+            wrap("/Volumes/ehdd/target/release/bclean", 16),
+            vec!["/Volumes/ehdd/", "target/release/", "bclean"]
+        );
+        // No separator: split at the width.
+        assert_eq!(wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        // A short word after a long one continues on its line.
+        assert_eq!(wrap("/aa/bb/cc x", 6), vec!["/aa/", "bb/cc", "x"]);
         assert_eq!(wrap("", 5), vec![""]);
         assert!(wrap("abc", 0).is_empty());
         assert_eq!(wrap("界面界面", 4), vec!["界面", "界面"]);

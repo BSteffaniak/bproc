@@ -18,7 +18,7 @@ use crate::procs::model::ProcState;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
-use bmux_tui::style::Modifier;
+use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 use tabs::Body;
 use text::{BLine, Seg, paint_line, paint_lines};
@@ -86,6 +86,11 @@ pub struct DetailPanel {
     /// Panel extent (rows or cells) and saved `dock_size` when a splitter
     /// drag began.
     drag_from: Option<(u16, u16)>,
+    /// Keyboard row cursor per tab (full screen): an index into `targets`.
+    cursor: [Option<usize>; Tab::ALL.len()],
+    /// Actionable rows of the current tab at the last paint: scroll-line
+    /// index and the click action that row performs.
+    targets: Vec<(usize, Hit)>,
 }
 
 impl DetailPanel {
@@ -93,6 +98,8 @@ impl DetailPanel {
         if self.key != Some(key) {
             self.detail = None;
             self.scroll = Default::default();
+            self.cursor = Default::default();
+            self.targets.clear();
         }
         self.key = Some(key);
         self.full = full;
@@ -134,6 +141,7 @@ impl DetailPanel {
         if self.tab != tab {
             self.tab = tab;
             self.content_rows = usize::MAX;
+            self.targets.clear();
         }
     }
     /// Cycle tabs by `delta`, wrapping.
@@ -161,6 +169,103 @@ impl DetailPanel {
     fn page(&self) -> isize {
         self.body_rows.saturating_sub(1).max(1) as isize
     }
+    /// Scroll-line index of the keyboard cursor in the current tab, if any.
+    pub fn cursor_line(&self) -> Option<usize> {
+        let c = self.cursor[self.tab.index()]?;
+        self.targets.get(c).map(|(line, _)| *line)
+    }
+    /// Click action of the row under the keyboard cursor.
+    fn cursor_hit(&self) -> Option<Hit> {
+        let c = self.cursor[self.tab.index()]?;
+        self.targets.get(c).map(|(_, hit)| hit.clone())
+    }
+    /// Scroll so scroll-line `line` is visible.
+    fn reveal(&mut self, line: usize) {
+        let top = self.scroll();
+        if line < top {
+            self.scroll_to(line);
+        } else if self.body_rows > 0 && line >= top + self.body_rows {
+            self.scroll_to(line + 1 - self.body_rows);
+        }
+    }
+    /// Move the row cursor by `delta` actionable rows. Tabs without
+    /// actionable rows scroll instead.
+    fn move_cursor(&mut self, delta: isize) {
+        let n = self.targets.len();
+        if n == 0 {
+            self.scroll_by(delta);
+            return;
+        }
+        let i = self.tab.index();
+        let next = match self.cursor[i].filter(|c| *c < n) {
+            Some(c) => c.saturating_add_signed(delta).min(n - 1),
+            // First press: start on the first visible actionable row.
+            None => {
+                let top = self.scroll();
+                self.targets
+                    .iter()
+                    .position(|(line, _)| *line >= top)
+                    .unwrap_or(0)
+            }
+        };
+        self.cursor[i] = Some(next);
+        if next == 0 && delta < 0 {
+            // Reveal any heading above the first row.
+            self.scroll_to(0);
+        }
+        self.reveal(self.targets[next].0);
+    }
+    /// After a scroll, keep the cursor on a visible row when one exists.
+    fn snap_cursor(&mut self) {
+        let i = self.tab.index();
+        let Some(c) = self.cursor[i] else {
+            return;
+        };
+        if self.targets.is_empty() {
+            self.cursor[i] = None;
+            return;
+        }
+        let c = c.min(self.targets.len() - 1);
+        self.cursor[i] = Some(c);
+        let top = self.scroll();
+        let bottom = top + self.body_rows;
+        let line = self.targets[c].0;
+        if (top..bottom).contains(&line) {
+            return;
+        }
+        let visible = |(_, (l, _)): &(usize, &(usize, Hit))| (top..bottom).contains(l);
+        let snapped = if line < top {
+            self.targets.iter().enumerate().find(visible)
+        } else {
+            self.targets.iter().enumerate().rev().find(visible)
+        };
+        if let Some((j, _)) = snapped {
+            self.cursor[i] = Some(j);
+        }
+    }
+}
+
+/// Collection caveats worth surfacing above the tab body: limited access
+/// (not root) and truncated sections.
+pub fn notice(detail: &DeepDetail) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(access) = detail.fact("Access") {
+        parts.push(format!("Access {access}"));
+    }
+    if detail.fact("Truncated").is_some() {
+        parts.extend(
+            detail
+                .facts
+                .iter()
+                .filter(|(name, _)| name == "Truncated")
+                .map(|(_, v)| v.clone()),
+        );
+    }
+    (!parts.is_empty()).then(|| format!(" ⚠ {}", parts.join(" · ")))
+}
+
+fn notice_style() -> Style {
+    Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM)
 }
 
 /// Rows of the panel, top to bottom.
@@ -170,11 +275,12 @@ struct Plan {
     crumbs: Rect,
     tabs: Rect,
     banner: Rect,
+    notice: Rect,
     body: Rect,
     actions: Rect,
 }
 
-fn plan(inner: Rect, ghost: bool) -> Plan {
+fn plan(inner: Rect, ghost: bool, notice: bool) -> Plan {
     let h = inner.height;
     let row = |y: u16, on: bool| Rect::new(inner.x, y, inner.width, u16::from(on));
     let mut y = inner.y;
@@ -186,6 +292,8 @@ fn plan(inner: Rect, ghost: bool) -> Plan {
     y = y.saturating_add(tabs.height);
     let banner = row(y, ghost && h >= 5);
     y = y.saturating_add(banner.height);
+    let notice = row(y, notice && h >= 7);
+    y = y.saturating_add(notice.height);
     let actions_on = h >= 6;
     let bottom = inner.y.saturating_add(h);
     let actions = Rect::new(
@@ -201,6 +309,7 @@ fn plan(inner: Rect, ghost: bool) -> Plan {
         crumbs,
         tabs,
         banner,
+        notice,
         body,
         actions,
     }
@@ -249,7 +358,8 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
         }
     }
     let ghost = is_ghost(state, &key);
-    let p = plan(inner, ghost);
+    let caveat = state.detail.detail().and_then(notice);
+    let p = plan(inner, ghost, caveat.is_some());
     draw_title(frame, p.title, state, key, ghost);
     draw_crumbs(frame, p.crumbs, state, key);
     draw_tabs(frame, p.tabs, state, key);
@@ -262,6 +372,13 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
                 usize::from(p.banner.width),
             ),
             theme::error().add_modifier(Modifier::BOLD),
+        );
+    }
+    if let Some(caveat) = caveat.filter(|_| p.notice.height > 0) {
+        frame.text(
+            p.notice,
+            &truncate(&caveat, usize::from(p.notice.width)),
+            notice_style(),
         );
     }
     draw_body(frame, p.body, state, key);
@@ -469,11 +586,27 @@ fn draw_body(frame: &mut Frame<'_, '_, '_>, r: Rect, state: &mut ExplorerState, 
         };
         tabs::build(&cx, shared.detail.tab())
     };
+    let mut body = body;
     let panel = &mut state.detail;
     panel.content_rows = body.scroll_rows();
     panel.body_rows = usize::from(content.height);
     let scroll = panel.scroll().min(panel.max_scroll());
     panel.scroll[panel.tab.index()] = scroll;
+    // The row cursor is for list tabs; the overview's arrows keep scrolling
+    // its (possibly long) fact list.
+    panel.targets = if panel.tab == Tab::Overview {
+        Vec::new()
+    } else {
+        targets(&body)
+    };
+    panel.snap_cursor();
+    if panel.is_full()
+        && let Some(line) = panel.cursor_line()
+        && let Some(lines) = body.scroll_lines_mut()
+        && let Some(target) = lines.get_mut(line)
+    {
+        highlight(target, usize::from(content.width));
+    }
     match &body {
         Body::Lines(lines) => paint_lines(frame, content, lines, scroll),
         Body::Columns {
@@ -524,6 +657,37 @@ fn draw_body(frame: &mut Frame<'_, '_, '_>, r: Rect, state: &mut ExplorerState, 
     }
     if panel.content_rows > panel.body_rows && content.height > 0 {
         draw_scrollbar(frame, r, panel.content_rows, panel.body_rows, scroll);
+    }
+}
+
+/// Actionable rows of `body`: a row hit, else its first link segment.
+fn targets(body: &Body) -> Vec<(usize, Hit)> {
+    let Some(lines) = body.scroll_lines() else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let hit = line
+                .hit
+                .clone()
+                .or_else(|| line.segs.iter().find_map(|s| s.hit.clone()))?;
+            matches!(hit, Hit::DetailRow { .. } | Hit::ProcessLink { .. }).then_some((i, hit))
+        })
+        .collect()
+}
+
+/// Paint `line` as the keyboard cursor row, padded across `width`.
+fn highlight(line: &mut BLine, width: usize) {
+    let sel = theme::selected();
+    let mut used = 0;
+    for seg in &mut line.segs {
+        seg.style = seg.style.patch(sel);
+        used += seg.width();
+    }
+    if used < width {
+        line.segs.push(Seg::new(" ".repeat(width - used), sel));
     }
 }
 
@@ -607,10 +771,14 @@ fn draw_actions(
         }
         x = x.saturating_add(w + 1);
     }
-    let hint = if state.detail.is_full() {
-        "Tab/⇧Tab tabs · ↑↓ scroll · Esc dock"
+    let hint = if !state.detail.is_full() {
+        "{ } tabs · ⇧↑↓ scroll · Enter full screen"
+    } else if state.detail.tab() == Tab::Env {
+        "Tab tabs · ↑↓ row · y copy · Esc dock"
+    } else if !state.detail.targets.is_empty() {
+        "Tab tabs · ↑↓ row · Enter open · Esc dock"
     } else {
-        "{ } tabs · Enter full screen"
+        "Tab/⇧Tab tabs · ↑↓ scroll · Esc dock"
     };
     let hw = display_width(hint) as u16;
     if x.saturating_add(hw).saturating_add(2) <= end {
@@ -620,24 +788,49 @@ fn draw_actions(
 
 // ---- input -----------------------------------------------------------------
 
+/// Keys: `{`/`}` cycle tabs and Shift+↑↓/PgUp/PgDn scroll in either mode.
+/// Full screen also takes Tab/←→ (tabs), ↑↓ (row cursor on tabs with
+/// actionable rows, else scroll), PgUp/PgDn/Home/End (scroll), Enter
+/// (activate the cursor row), `y` (copy the cursor's env var) and Esc.
 pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
     if !state.detail.is_open() || key.modifiers.ctrl || key.modifiers.alt {
         return Outcome::Ignored;
     }
+    let shift = key.modifiers.shift;
     let panel = &mut state.detail;
     match key.key {
         KeyCode::Char('{') => panel.cycle_tab(-1),
         KeyCode::Char('}') => panel.cycle_tab(1),
+        KeyCode::Up if shift => panel.scroll_by(-1),
+        KeyCode::Down if shift => panel.scroll_by(1),
+        KeyCode::PageUp if shift => panel.scroll_by(-panel.page()),
+        KeyCode::PageDown if shift => panel.scroll_by(panel.page()),
         _ if !panel.is_full() => return Outcome::Ignored,
-        KeyCode::Tab if key.modifiers.shift => panel.cycle_tab(-1),
+        KeyCode::Tab if shift => panel.cycle_tab(-1),
         KeyCode::Tab | KeyCode::Right => panel.cycle_tab(1),
         KeyCode::Left => panel.cycle_tab(-1),
-        KeyCode::Up => panel.scroll_by(-1),
-        KeyCode::Down => panel.scroll_by(1),
+        KeyCode::Up => panel.move_cursor(-1),
+        KeyCode::Down => panel.move_cursor(1),
         KeyCode::PageUp => panel.scroll_by(-panel.page()),
         KeyCode::PageDown => panel.scroll_by(panel.page()),
         KeyCode::Home => panel.scroll_to(0),
         KeyCode::End => panel.scroll_to(usize::MAX),
+        KeyCode::Enter => {
+            let Some(hit) = panel.cursor_hit() else {
+                return Outcome::Ignored;
+            };
+            return activate(state, &hit);
+        }
+        KeyCode::Char('y') => {
+            return match panel.cursor_hit() {
+                Some(hit @ Hit::DetailRow { .. }) => activate(state, &hit),
+                _ if panel.tab() == Tab::Env => {
+                    state.flash("Select a variable with ↑↓, then press y to copy it");
+                    Outcome::Consumed
+                }
+                _ => Outcome::Ignored,
+            };
+        }
         KeyCode::Escape => {
             panel.set_full(false);
             if let Some(k) = panel.key() {
@@ -647,6 +840,31 @@ pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
         _ => return Outcome::Ignored,
     }
     Outcome::Consumed
+}
+
+/// Perform a body row's click action: copy an env var or follow a link.
+fn activate(state: &mut ExplorerState, hit: &Hit) -> Outcome {
+    match hit {
+        Hit::DetailRow { row } => {
+            if state.detail.tab() != Tab::Env {
+                return Outcome::Ignored;
+            }
+            let Some(detail) = state.detail.detail() else {
+                return Outcome::Ignored;
+            };
+            let Some((k, v)) = tabs::sorted_env(detail).into_iter().nth(*row) else {
+                return Outcome::Ignored;
+            };
+            state.request(UiRequest::Copy(format!("{k}={v}")));
+            state.flash(format!("Copied {k} to clipboard"));
+            Outcome::Consumed
+        }
+        Hit::ProcessLink { key } => {
+            navigate(state, *key);
+            Outcome::Consumed
+        }
+        _ => Outcome::Ignored,
+    }
 }
 
 /// Inspect another process (breadcrumb / tree / PPID link).
@@ -708,20 +926,9 @@ pub fn handle_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
                 state.detail.drag_from = Some((extent, state.settings.dock_size));
             }
         }
-        Hit::DetailRow { row } if left => {
-            if state.detail.tab() != Tab::Env {
-                return Outcome::Ignored;
-            }
-            let Some(detail) = state.detail.detail() else {
-                return Outcome::Ignored;
-            };
-            let Some((k, v)) = tabs::sorted_env(detail).into_iter().nth(*row) else {
-                return Outcome::Ignored;
-            };
-            state.request(UiRequest::Copy(format!("{k}={v}")));
-            state.flash(format!("Copied {k} to clipboard"));
+        Hit::DetailRow { .. } | Hit::ProcessLink { .. } if left => {
+            return activate(state, click.hit);
         }
-        Hit::ProcessLink { key: target } if left => navigate(state, *target),
         Hit::DetailAction(action) if left => {
             if is_ghost(state, &key) {
                 state.flash("Process has exited");

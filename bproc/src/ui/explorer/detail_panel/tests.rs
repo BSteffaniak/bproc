@@ -710,13 +710,13 @@ fn keyboard_full_screen_tabs_scroll_and_escape() {
 
     state.detail.set_tab(Tab::Env);
     render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
-    key(&mut state, KeyCode::Down);
-    key(&mut state, KeyCode::Down);
-    assert_eq!(state.detail.scroll(), 2);
+    key(&mut state, KeyCode::PageDown);
+    let page = state.detail.scroll();
+    assert!(page > 2, "{page}");
     key(&mut state, KeyCode::End);
     let max = state.detail.scroll();
-    assert!(max > 2);
-    key(&mut state, KeyCode::Down);
+    assert!(max > page);
+    key(&mut state, KeyCode::PageDown);
     assert_eq!(state.detail.scroll(), max, "clamped to content");
     key(&mut state, KeyCode::PageUp);
     assert!(state.detail.scroll() < max);
@@ -781,4 +781,321 @@ fn full_explorer_draw_routes_clicks_to_the_panel() {
     assert!(tab.y >= layout.dock.y && tab.y < layout.dock.y + layout.dock.height);
     click(&mut state, tab);
     assert_eq!(state.detail.tab(), Tab::Limits);
+}
+
+fn shifted(state: &mut ExplorerState, code: KeyCode) -> Outcome {
+    let stroke = KeyStroke {
+        key: code,
+        modifiers: bmux_keyboard::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    };
+    handle_key(state, &stroke)
+}
+
+fn long_env(state: &mut ExplorerState) {
+    let vars: Vec<(String, String)> = (0..60)
+        .map(|i| (format!("VAR_{i:02}"), format!("value {i}")))
+        .collect();
+    let mut detail = deep(k(300));
+    detail.environment = Ok(vars);
+    state.detail.apply(detail);
+}
+
+#[test]
+fn docked_panel_scrolls_with_shifted_keys() {
+    let mut state = fixture();
+    long_env(&mut state);
+    state.detail.set_tab(Tab::Env);
+    render(&mut state, Rect::new(0, 20, 100, 16), 100, 40);
+    assert!(state.detail.is_docked());
+    // Plain arrows still belong to the table.
+    assert_eq!(key(&mut state, KeyCode::Down), Outcome::Ignored);
+    assert_eq!(shifted(&mut state, KeyCode::Down), Outcome::Consumed);
+    assert_eq!(shifted(&mut state, KeyCode::Down), Outcome::Consumed);
+    assert_eq!(state.detail.scroll(), 2);
+    assert_eq!(shifted(&mut state, KeyCode::Up), Outcome::Consumed);
+    assert_eq!(state.detail.scroll(), 1);
+    assert_eq!(shifted(&mut state, KeyCode::PageDown), Outcome::Consumed);
+    assert!(state.detail.scroll() > 2);
+    assert_eq!(shifted(&mut state, KeyCode::PageUp), Outcome::Consumed);
+    assert_eq!(state.detail.scroll(), 1);
+    // Table selection untouched.
+    assert_eq!(state.table.selected(), Some(k(300)));
+    // The docked hint advertises it.
+    let text = all_text(&render(&mut state, Rect::new(0, 20, 120, 16), 120, 40));
+    assert!(text.contains("⇧↑↓ scroll"), "{text}");
+}
+
+#[test]
+fn full_screen_env_cursor_copies_with_y_and_enter() {
+    let mut state = fixture();
+    state.detail.set_full(true);
+    state.detail.set_tab(Tab::Env);
+    render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    state.take_requests();
+    // No cursor yet: y explains rather than copying.
+    assert_eq!(key(&mut state, KeyCode::Char('y')), Outcome::Consumed);
+    assert!(state.take_requests().is_empty());
+    assert_eq!(key(&mut state, KeyCode::Enter), Outcome::Ignored);
+
+    assert_eq!(key(&mut state, KeyCode::Down), Outcome::Consumed);
+    assert_eq!(key(&mut state, KeyCode::Char('y')), Outcome::Consumed);
+    assert_eq!(
+        state.take_requests(),
+        vec![UiRequest::Copy("HOME=/Users/me".into())]
+    );
+    key(&mut state, KeyCode::Down);
+    key(&mut state, KeyCode::Down); // clamped at the last row
+    assert_eq!(key(&mut state, KeyCode::Enter), Outcome::Consumed);
+    assert_eq!(
+        state.take_requests(),
+        vec![UiRequest::Copy("PATH=/usr/bin:/bin".into())]
+    );
+
+    // The cursor row is highlighted across the content width.
+    let buffer = render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    let line = state.detail.cursor_line().unwrap();
+    let y = (0..20)
+        .find(|y| row_text(&buffer, *y).contains("PATH = "))
+        .unwrap();
+    let body = rect(&state, Hit::DetailBody);
+    assert_eq!(usize::from(y - body.y), line - state.detail.scroll());
+    let sel = theme::selected();
+    for x in [body.x + 1, body.x + 60] {
+        assert_eq!(buffer.get(Point::new(x, y)).unwrap().style.bg, sel.bg);
+    }
+    let wide = render(&mut state, Rect::new(0, 0, 120, 20), 120, 20);
+    assert!(all_text(&wide).contains("↑↓ row · y copy"));
+}
+
+#[test]
+fn full_screen_cursor_follows_and_snaps_to_scroll() {
+    let mut state = fixture();
+    long_env(&mut state);
+    state.detail.set_full(true);
+    state.detail.set_tab(Tab::Env);
+    render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    for _ in 0..30 {
+        key(&mut state, KeyCode::Down);
+    }
+    // Moving past the bottom scrolls to keep the cursor visible.
+    let line = state.detail.cursor_line().unwrap();
+    assert!(state.detail.scroll() > 0);
+    let buffer = render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    assert!(all_text(&buffer).contains("VAR_29"));
+    assert_eq!(state.detail.cursor_line(), Some(line));
+
+    // Home scrolls; the cursor snaps onto a visible row on the next paint.
+    key(&mut state, KeyCode::Home);
+    render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    let line = state.detail.cursor_line().unwrap();
+    assert!(line < 20, "{line}");
+    state.take_requests();
+    key(&mut state, KeyCode::Char('y'));
+    let copied = state.take_requests();
+    assert!(
+        matches!(&copied[..], [UiRequest::Copy(v)] if v.starts_with("VAR_")),
+        "{copied:?}"
+    );
+
+    // Up from the first row reveals the heading.
+    for _ in 0..80 {
+        key(&mut state, KeyCode::Up);
+    }
+    assert_eq!(state.detail.scroll(), 0);
+    assert_eq!(state.detail.cursor_line(), Some(2));
+}
+
+#[test]
+fn full_screen_tree_cursor_follows_links_with_enter() {
+    let mut state = fixture();
+    state.detail.set_full(true);
+    state.detail.set_tab(Tab::Tree);
+    render(&mut state, Rect::new(0, 0, 120, 30), 120, 30);
+    state.take_requests();
+    // launchd, zsh, cargo, then (skipping bproc itself) worker-b, worker-a.
+    for _ in 0..4 {
+        key(&mut state, KeyCode::Down);
+    }
+    assert_eq!(key(&mut state, KeyCode::Enter), Outcome::Consumed);
+    assert_eq!(state.detail.key(), Some(k(401)));
+    assert!(state.detail.is_full());
+    assert_eq!(state.take_requests(), vec![UiRequest::LoadDetail(k(401))]);
+    // New process: cursor resets.
+    assert_eq!(state.detail.cursor_line(), None);
+    let text = all_text(&render(&mut state, Rect::new(0, 0, 120, 30), 120, 30));
+    assert!(text.contains("Enter open"), "{text}");
+    // `y` does nothing outside env rows.
+    key(&mut state, KeyCode::Down);
+    assert_eq!(key(&mut state, KeyCode::Char('y')), Outcome::Ignored);
+}
+
+#[test]
+fn tabs_without_rows_scroll_with_arrows() {
+    let mut state = fixture();
+    let mut detail = deep(k(300));
+    detail.limits = Ok((0..40)
+        .map(|i| ResourceLimit {
+            name: format!("Limit {i}"),
+            soft: Some(i),
+            hard: None,
+            unit: "files".into(),
+        })
+        .collect());
+    state.detail.apply(detail);
+    state.detail.set_full(true);
+    state.detail.set_tab(Tab::Limits);
+    render(&mut state, Rect::new(0, 0, 100, 20), 100, 20);
+    key(&mut state, KeyCode::Down);
+    key(&mut state, KeyCode::Down);
+    assert_eq!(state.detail.scroll(), 2);
+    assert_eq!(state.detail.cursor_line(), None);
+
+    // The overview's PPID link does not capture the arrows: a narrow,
+    // stacked overview keeps scrolling.
+    state.detail.set_tab(Tab::Overview);
+    render(&mut state, Rect::new(0, 0, 50, 16), 50, 16);
+    key(&mut state, KeyCode::Down);
+    key(&mut state, KeyCode::Down);
+    assert_eq!(state.detail.scroll(), 2);
+    assert_eq!(state.detail.cursor_line(), None);
+}
+
+fn deep_with_platform_facts(key: ProcessKey) -> DeepDetail {
+    let mut d = deep(key);
+    d.facts = [
+        ("Executable", "/usr/bin/bproc"),
+        ("Command", "/usr/bin/bproc --flag"),
+        ("Working dir", "/Users/me/src"),
+        ("Root", "/"),
+        ("User", "me (501)"),
+        ("Parent", "200 (cargo)"),
+        ("Process group", "300"),
+        ("Session", "42"),
+        ("Started", "2023-11-14 22:13:20"),
+        ("Nice", "0"),
+        ("Threads", "12"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    d
+}
+
+#[test]
+fn overview_does_not_repeat_facts_and_labels_keep_a_gap() {
+    let mut state = fixture();
+    state.detail.apply(deep_with_platform_facts(k(300)));
+    state.detail.set_full(true);
+    let buffer = render(&mut state, Rect::new(0, 0, 120, 40), 120, 40);
+    let text = all_text(&buffer);
+    for label in [
+        "Executable",
+        "Working dir",
+        "Command",
+        "User ",
+        "PPID",
+        "Started",
+    ] {
+        assert_eq!(text.matches(label).count(), 1, "{label} repeated\n{text}");
+    }
+    assert!(!text.contains("Parent"), "{text}");
+    assert!(!text.contains("me (501)"), "{text}");
+    // Extra platform facts are still merged.
+    for needle in ["Root", "Session", "42"] {
+        assert!(text.contains(needle), "{needle} missing\n{text}");
+    }
+    // The longest label is shown whole, with a gap before its value.
+    assert!(text.contains("Process group 300"), "{text}");
+    assert!(text.contains("Working dir   /Users/me/src"), "{text}");
+    assert!(!text.contains("Process gr…"));
+}
+
+#[test]
+fn overview_falls_back_to_detail_facts_when_the_sample_lacks_them() {
+    let mut state = fixture();
+    let mut bare = entries();
+    {
+        let record = Arc::make_mut(&mut bare[3].record);
+        record.exe = None;
+        record.cwd = None;
+        record.user = None;
+        record.uid = None;
+    }
+    state.store = ProcessStore::from_entries(bare, SystemSnapshot::default());
+    state.detail.apply(deep_with_platform_facts(k(300)));
+    let text = all_text(&render(&mut state, Rect::new(0, 0, 120, 40), 120, 40));
+    assert!(text.contains("me (501)"), "{text}");
+    assert_eq!(text.matches("Working dir").count(), 1, "{text}");
+    assert!(text.contains("/Users/me/src"), "{text}");
+}
+
+#[test]
+fn limited_access_and_truncation_show_a_notice_under_the_tabs() {
+    let mut state = fixture();
+    let mut d = deep(k(300));
+    d.facts.push((
+        "Access".into(),
+        "limited: run bproc with sudo for full detail".into(),
+    ));
+    d.facts.push((
+        "Truncated".into(),
+        "showing the first 4096 open files".into(),
+    ));
+    state.detail.apply(d);
+    let area = Rect::new(0, 20, 120, 16);
+    let buffer = render(&mut state, area, 120, 40);
+    let tabs = row_text(&buffer, 22);
+    assert!(tabs.contains("Overview"), "{tabs}");
+    let notice = row_text(&buffer, 23);
+    assert!(
+        notice.contains("⚠ Access limited: run bproc with sudo"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("showing the first 4096 open files"),
+        "{notice}"
+    );
+    assert_eq!(rect(&state, Hit::DetailBody).y, 24);
+    // Not repeated in the overview body.
+    assert_eq!(all_text(&buffer).matches("sudo").count(), 1);
+
+    // No caveats, no notice row.
+    state.detail.apply(deep(k(300)));
+    render(&mut state, area, 120, 40);
+    assert_eq!(rect(&state, Hit::DetailBody).y, 23);
+}
+
+#[test]
+fn limits_tab_lists_cgroups_when_known() {
+    let mut state = fixture();
+    let mut d = deep(k(300));
+    d.cgroups = Ok(vec!["0::/user.slice/user-501.slice/session-2.scope".into()]);
+    state.detail.apply(d);
+    state.detail.set_tab(Tab::Limits);
+    let text = all_text(&render(&mut state, Rect::new(0, 0, 110, 24), 110, 24));
+    for needle in ["Max open files", "CGROUP", "user-501.slice/session-2.scope"] {
+        assert!(text.contains(needle), "{needle} missing\n{text}");
+    }
+
+    // Cgroups survive a limits failure; errors elsewhere stay explained.
+    let mut d = deep(k(300));
+    d.limits = Err("permission denied".into());
+    d.cgroups = Ok(vec!["0::/init.scope".into()]);
+    state.detail.apply(d);
+    let text = all_text(&render(&mut state, Rect::new(0, 0, 110, 24), 110, 24));
+    assert!(
+        text.contains("Limits unavailable · permission denied"),
+        "{text}"
+    );
+    assert!(text.contains("/init.scope"), "{text}");
+
+    let mut d = deep(k(300));
+    d.limits = Err("permission denied".into());
+    state.detail.apply(d);
+    let text = all_text(&render(&mut state, Rect::new(0, 0, 110, 24), 110, 24));
+    assert!(text.contains("Limits unavailable"), "{text}");
+    assert!(!text.contains("CGROUP"));
 }
