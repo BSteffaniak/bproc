@@ -34,6 +34,7 @@ pub struct SysinfoSampler {
     enricher: Option<Box<dyn Enricher>>,
     host: Option<HostInfo>,
     last: Option<Instant>,
+    boot_shift: i64,
 }
 
 /// System attributes that do not change while bproc runs.
@@ -49,8 +50,11 @@ impl SysinfoSampler {
     }
 
     pub fn with_enricher(enricher: Option<Box<dyn Enricher>>) -> Self {
+        // Created first so `boot_shift` reads btime right after sysinfo did.
+        let system = System::new();
         Self {
-            system: System::new(),
+            system,
+            boot_shift: boot_shift(),
             users: Users::new_with_refreshed_list(),
             users_loaded: Instant::now(),
             records: HashMap::new(),
@@ -82,7 +86,9 @@ impl SysinfoSampler {
         self.new_pids.clear();
         for (pid, process) in self.system.processes() {
             if process.thread_kind() != Some(ThreadKind::Userland)
-                && !self.records.contains_key(&key_of(*pid, process))
+                && !self
+                    .records
+                    .contains_key(&identity(*pid, process, self.boot_shift).key)
             {
                 self.new_pids.push(*pid);
             }
@@ -136,8 +142,67 @@ fn resolve_user(users: &mut Users, loaded: &mut Instant, uid: Option<u32>) -> Op
     find(users)
 }
 
-fn key_of(pid: Pid, process: &Process) -> ProcessKey {
-    ProcessKey::new(pid.as_u32() as i32, process.start_time())
+/// Seconds to add to sysinfo start times so they are expressed against the
+/// process-wide boot reference that `actions::current_start_time` also uses.
+/// sysinfo bakes the `/proc/stat` btime it read in `System::new()` into every
+/// start time; read right after construction this is normally 0.
+#[cfg(target_os = "linux")]
+fn boot_shift() -> i64 {
+    super::linux::boot_reference() as i64 - System::boot_time() as i64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boot_shift() -> i64 {
+    0
+}
+
+/// Who a process is: its key plus the parent and owner, completed from an
+/// unprivileged source where sysinfo could not read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    key: ProcessKey,
+    ppid: Option<i32>,
+    uid: Option<u32>,
+    /// The start time did not come from sysinfo, so sysinfo may still hold
+    /// the static fields (name, command line) of an earlier PID owner.
+    fallback_start: bool,
+}
+
+fn identity(pid: Pid, process: &Process, boot_shift: i64) -> Identity {
+    let raw_pid = pid.as_u32() as i32;
+    let mut start = process.start_time();
+    if start != 0 {
+        start = start.saturating_add_signed(boot_shift);
+    }
+    #[allow(unused_mut)]
+    let mut ppid = process.parent().map(|p| p.as_u32() as i32);
+    #[allow(unused_mut)]
+    let mut uid = process.user_id().map(|u| **u);
+    #[allow(unused_mut)]
+    let mut fallback_start = false;
+    // Without root, PROC_PIDTBSDINFO is denied for other users' processes and
+    // sysinfo reports start 0, no parent and no owner (~20% of processes).
+    #[cfg(target_os = "macos")]
+    {
+        if start == 0
+            && let Some(sysctl) = super::macos::start_time_sysctl(raw_pid)
+        {
+            start = sysctl;
+            fallback_start = true;
+        }
+        if (ppid.is_none() || uid.is_none())
+            && let Some(info) = super::macos::short_info(raw_pid)
+        {
+            ppid = ppid.or(super::macos::short_ppid(&info));
+            uid = uid.or(Some(info.pbsi_ruid));
+        }
+    }
+    Identity {
+        key: ProcessKey::new(raw_pid, start),
+        ppid,
+        uid,
+        fallback_start,
+    }
 }
 
 pub(crate) fn map_status(status: ProcessStatus) -> ProcState {
@@ -195,10 +260,10 @@ fn base_sample(process: &Process, mem_total: u64, elapsed: f64) -> ProcessSample
     }
 }
 
-fn base_record(key: ProcessKey, ppid: Option<i32>, process: &Process) -> ProcessRecord {
+fn base_record(id: &Identity, process: &Process) -> ProcessRecord {
     ProcessRecord {
-        key,
-        ppid,
+        key: id.key,
+        ppid: id.ppid,
         name: process.name().to_string_lossy().into_owned(),
         cmdline: process
             .cmd()
@@ -207,10 +272,23 @@ fn base_record(key: ProcessKey, ppid: Option<i32>, process: &Process) -> Process
             .collect(),
         exe: process.exe().map(|p| p.display().to_string()),
         cwd: process.cwd().map(|p| p.display().to_string()),
-        uid: process.user_id().map(|u| **u),
+        uid: id.uid,
         kernel_thread: process.thread_kind() == Some(ThreadKind::Kernel),
         ..Default::default()
     }
+}
+
+/// sysinfo cannot tell two unreadable owners of one PID apart, so after a
+/// reuse it still reports the previous owner's name and command line. Keep
+/// only what is known to belong to the new process.
+fn forget_stale_statics(record: &mut ProcessRecord) {
+    #[cfg(target_os = "macos")]
+    if let Some(info) = super::macos::short_info(record.key.pid) {
+        record.name = super::macos::short_comm(&info);
+    }
+    record.cmdline.clear();
+    record.exe = None;
+    record.cwd = None;
 }
 
 impl Sampler for SysinfoSampler {
@@ -240,8 +318,8 @@ impl Sampler for SysinfoSampler {
             if process.thread_kind() == Some(ThreadKind::Userland) {
                 continue; // Threads are reported inside their process.
             }
-            let key = key_of(*pid, process);
-            let ppid = process.parent().map(|p| p.as_u32() as i32);
+            let id = identity(*pid, process, self.boot_shift);
+            let (key, ppid) = (id.key, id.ppid);
             let mut sample = base_sample(process, mem_total, elapsed);
             let record = match self.records.remove(&key) {
                 Some(record) => {
@@ -260,7 +338,10 @@ impl Sampler for SysinfoSampler {
                     }
                 }
                 None => {
-                    let mut record = base_record(key, ppid, process);
+                    let mut record = base_record(&id, process);
+                    if id.fallback_start && self.records.keys().any(|k| k.pid == key.pid) {
+                        forget_stale_statics(&mut record);
+                    }
                     if let Some(enricher) = self.enricher.as_mut() {
                         permission_limited +=
                             enricher.enrich(RecordRef::New(&mut record), &mut sample) as usize;

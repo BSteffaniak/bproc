@@ -594,7 +594,8 @@ mod tests {
             if is_root() {
                 return;
             }
-            let d = collect(ProcessKey::new(1, 0), None);
+            let start = crate::procs::actions::current_start_time(1).unwrap();
+            let d = collect(ProcessKey::new(1, start), None);
             assert_eq!(d.files, Err(PERMISSION_DENIED.to_string()));
             assert_eq!(d.environment, Err(PERMISSION_DENIED.to_string()));
             assert!(d.fact("Access").is_some());

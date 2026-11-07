@@ -32,12 +32,6 @@ impl<T: Copy> Ring<T> {
     pub fn len(&self) -> usize {
         self.values.len()
     }
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
     pub fn last(&self) -> Option<T> {
         self.values.back().copied()
     }
@@ -69,64 +63,6 @@ impl Ring<f32> {
     }
 }
 
-/// Numeric sample types that can be plotted.
-pub trait Metric: Copy {
-    fn as_f64(self) -> f64;
-}
-
-impl Metric for f32 {
-    fn as_f64(self) -> f64 {
-        if self.is_finite() { self as f64 } else { 0.0 }
-    }
-}
-
-impl Metric for u64 {
-    fn as_f64(self) -> f64 {
-        self as f64
-    }
-}
-
-impl<T: Metric> Ring<T> {
-    /// Largest value as `f64` (0 when empty), handy as a graph scale.
-    pub fn peak(&self) -> f64 {
-        self.values.iter().map(|v| v.as_f64()).fold(0.0, f64::max)
-    }
-
-    /// Mean of the stored values (0 when empty).
-    pub fn mean(&self) -> f64 {
-        if self.values.is_empty() {
-            return 0.0;
-        }
-        self.values.iter().map(|v| v.as_f64()).sum::<f64>() / self.values.len() as f64
-    }
-
-    /// The whole series fitted to `width` points, oldest first. See [`resample`].
-    pub fn resampled(&self, width: usize) -> Vec<f64> {
-        let values: Vec<f64> = self.values.iter().map(|v| v.as_f64()).collect();
-        resample(&values, width)
-    }
-}
-
-/// Fit `values` into at most `width` points for a sparkline. Longer series are
-/// split into equal buckets keeping each bucket's maximum so short spikes stay
-/// visible; shorter series are returned unchanged (callers right-align them).
-pub fn resample(values: &[f64], width: usize) -> Vec<f64> {
-    if width == 0 || values.is_empty() {
-        return Vec::new();
-    }
-    if values.len() <= width {
-        return values.to_vec();
-    }
-    let len = values.len();
-    (0..width)
-        .map(|i| {
-            let start = i * len / width;
-            let end = ((i + 1) * len / width).clamp(start + 1, len);
-            values[start..end].iter().copied().fold(f64::MIN, f64::max)
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetricHistory {
     pub cpu: Ring<f32>,
@@ -146,15 +82,6 @@ impl MetricHistory {
         self.net_down
             .push(net.map(|n| n.download_rate).unwrap_or(0));
         self.net_up.push(net.map(|n| n.upload_rate).unwrap_or(0));
-    }
-
-    /// Number of samples recorded (all series advance together).
-    pub fn len(&self) -> usize {
-        self.cpu.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cpu.is_empty()
     }
 }
 
@@ -191,15 +118,6 @@ impl SystemHistory {
         self.net_down.push(nd);
         self.net_up.push(nu);
     }
-
-    /// Number of samples recorded.
-    pub fn len(&self) -> usize {
-        self.cpu_total.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cpu_total.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -217,48 +135,28 @@ mod tests {
         assert_eq!(ring.tail(10), vec![3, 4, 5]);
         assert_eq!(ring.last(), Some(5));
         assert_eq!(ring.max(), 5);
-        assert_eq!(ring.peak(), 5.0);
-        assert_eq!(ring.mean(), 4.0);
-        assert_eq!(ring.capacity(), 3);
+        assert_eq!(ring.len(), 3);
     }
 
     #[test]
     fn empty_and_zero_capacity_rings_are_safe() {
         let ring: Ring<f32> = Ring::new(0);
-        assert!(ring.is_empty());
+        assert_eq!(ring.len(), 0);
         assert_eq!(ring.max(), 0.0);
-        assert_eq!(ring.mean(), 0.0);
-        assert!(ring.resampled(10).is_empty());
+        assert_eq!(ring.tail(10), Vec::<f32>::new());
         let mut zero: Ring<u64> = Ring::new(0);
         zero.push(1);
         zero.push(2);
-        assert!(zero.is_empty());
+        assert_eq!(zero.len(), 0);
         assert_eq!(zero.last(), None);
     }
 
     #[test]
-    fn resample_keeps_peaks() {
-        let mut values = vec![0.0; 100];
-        values[37] = 9.0;
-        let out = resample(&values, 10);
-        assert_eq!(out.len(), 10);
-        assert_eq!(out[3], 9.0);
-        assert_eq!(out.iter().filter(|v| **v > 0.0).count(), 1);
-        assert_eq!(resample(&[1.0, 2.0], 10), vec![1.0, 2.0]);
-        assert!(resample(&[1.0], 0).is_empty());
-        assert!(resample(&[], 4).is_empty());
-        assert_eq!(resample(&[1.0, 5.0, 2.0], 1), vec![5.0]);
-        let odd: Vec<f64> = (0..7).map(f64::from).collect();
-        assert_eq!(resample(&odd, 3), vec![1.0, 3.0, 6.0]);
-    }
-
-    #[test]
-    fn non_finite_cpu_plots_as_zero() {
+    fn non_finite_cpu_does_not_poison_max() {
         let mut ring: Ring<f32> = Ring::default();
         ring.push(f32::NAN);
         ring.push(2.0);
-        assert_eq!(ring.resampled(5), vec![0.0, 2.0]);
-        assert_eq!(ring.peak(), 2.0);
+        assert_eq!(ring.max(), 2.0);
     }
 
     #[test]
@@ -268,8 +166,8 @@ mod tests {
         info.download_rate = 7;
         h.push(&ProcessSample::default(), Some(&info));
         h.push(&ProcessSample::default(), None);
-        assert_eq!(h.len(), 2);
-        assert!(!h.is_empty());
+        assert_eq!(h.cpu.len(), 2);
+        assert_eq!(h.mem_rss.len(), 2);
         assert_eq!(h.net_down.iter().collect::<Vec<_>>(), vec![7, 0]);
     }
 }

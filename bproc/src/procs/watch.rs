@@ -20,8 +20,39 @@ pub enum WatchTarget {
     Any,
 }
 
+/// Anything a watch target can be tested against: a store [`Row`] (what the
+/// UI and the engine hold) or a bare [`ProcessRecord`] (exited processes).
+pub trait WatchSubject {
+    fn watch_record(&self) -> &ProcessRecord;
+}
+
+impl WatchSubject for ProcessRecord {
+    fn watch_record(&self) -> &ProcessRecord {
+        self
+    }
+}
+
+impl WatchSubject for std::sync::Arc<ProcessRecord> {
+    fn watch_record(&self) -> &ProcessRecord {
+        self
+    }
+}
+
+impl WatchSubject for Row {
+    fn watch_record(&self) -> &ProcessRecord {
+        &self.entry.record
+    }
+}
+
 impl WatchTarget {
-    pub fn matches(&self, record: &ProcessRecord) -> bool {
+    /// Whether this target covers `subject` (a [`Row`] or a record):
+    /// `Process` compares the exact key (PID + start time, so a reused PID
+    /// never matches); `Name` is a case-insensitive `*`/`?` glob on the
+    /// process name; `Command` a case-insensitive substring of the command
+    /// line (empty matches all); `User` the exact user name, or the numeric
+    /// uid when the name is unknown.
+    pub fn matches<S: WatchSubject + ?Sized>(&self, subject: &S) -> bool {
+        let record = subject.watch_record();
         match self {
             Self::Process { key, .. } => record.key == *key,
             Self::Name(pattern) => glob_match(pattern, &record.name),
@@ -378,43 +409,6 @@ impl WatchRule {
         self
     }
 
-    /// Ready-made starting points for the rule editor (ids are 0).
-    pub fn templates() -> Vec<WatchRule> {
-        use WatchMetric::*;
-        let any = || WatchTarget::Any;
-        vec![
-            Self::new(0, "High CPU", any(), CpuPercent, Comparison::Above, 80.0).with_sustain(30),
-            Self::new(0, "Memory hog", any(), MemRss, Comparison::Above, 2.0 * GIB),
-            Self::new(
-                0,
-                "Heavy disk writes",
-                any(),
-                DiskWrite,
-                Comparison::Above,
-                50.0 * MIB,
-            ),
-            Self::new(
-                0,
-                "Bandwidth hog",
-                any(),
-                NetDown,
-                Comparison::Above,
-                10.0 * MIB,
-            ),
-            Self::new(
-                0,
-                "File descriptor leak",
-                any(),
-                Fds,
-                Comparison::Above,
-                1000.0,
-            )
-            .with_sustain(60),
-            Self::new(0, "Process exits", any(), Exits, Comparison::Above, 0.0),
-            Self::new(0, "Process starts", any(), Starts, Comparison::Above, 0.0),
-        ]
-    }
-
     /// e.g. "CPU % above 80 for 30s · name node* → notify"
     pub fn describe(&self) -> String {
         let condition = if self.metric.is_event() {
@@ -442,9 +436,6 @@ impl WatchRule {
         )
     }
 }
-
-const MIB: f64 = 1024.0 * 1024.0;
-const GIB: f64 = 1024.0 * MIB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -599,10 +590,10 @@ impl WatchEngine {
                 continue;
             }
             for row in store.rows().iter().filter(|r| !r.is_ghost()) {
-                let record = &row.entry.record;
-                if !rule.target.matches(record) {
+                if !rule.target.matches(row) {
                     continue;
                 }
+                let record = &row.entry.record;
                 let pair = (rule.id, record.key);
                 live_pairs.insert(pair);
                 let value = rule.metric.value(row, network_known);
@@ -756,8 +747,8 @@ fn event_firings(rule: &WatchRule, snapshot: &ProcSnapshot, store: &ProcessStore
                 let Some(row) = store.get(key).filter(|r| !r.is_ghost()) else {
                     continue;
                 };
-                let r = &*row.entry.record;
-                if rule.target.matches(r) {
+                if rule.target.matches(row) {
+                    let r = &*row.entry.record;
                     out.push(fire(
                         r,
                         format!("{} ({}) started", r.name, r.key.pid),
@@ -778,6 +769,7 @@ mod tests {
     use std::sync::Arc;
 
     const T0: u64 = 1_700_000_000_000;
+    const MIB: f64 = 1024.0 * 1024.0;
 
     fn record(pid: i32, name: &str, cmd: &str, user: &str) -> Arc<ProcessRecord> {
         Arc::new(ProcessRecord {
@@ -899,6 +891,28 @@ mod tests {
     }
 
     #[test]
+    fn targets_match_store_rows() {
+        let r = record(42, "node", "/usr/bin/node server.js", "alice");
+        let store = ProcessStore::from_entries(vec![entry(&r, 1.0)], SystemSnapshot::default());
+        let row = store.get(&r.key).expect("row");
+        for target in [
+            WatchTarget::Any,
+            WatchTarget::Name("no*".into()),
+            WatchTarget::Command("server".into()),
+            WatchTarget::User("alice".into()),
+            WatchTarget::Process {
+                key: r.key,
+                name: "node".into(),
+            },
+        ] {
+            assert!(target.matches(row), "{target:?}");
+            assert_eq!(target.matches(row), target.matches(&*r), "{target:?}");
+        }
+        assert!(!WatchTarget::Name("python".into()).matches(row));
+        assert!(!WatchTarget::User("bob".into()).matches(row));
+    }
+
+    #[test]
     fn describe_is_human() {
         let rule = cpu_rule(1, WatchTarget::Name("node*".into()), 30, 60);
         assert_eq!(
@@ -945,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn constructor_defaults_and_templates() {
+    fn constructor_defaults() {
         let rule = cpu_rule(7, WatchTarget::Any, 10, 60);
         let fresh = WatchRule::new(
             7,
@@ -958,19 +972,6 @@ mod tests {
         assert_eq!(fresh, rule);
         assert!(fresh.enabled);
         assert_eq!(fresh.action, WatchAction::Notify);
-        let templates = WatchRule::templates();
-        assert!(templates.len() >= 5);
-        assert!(
-            templates
-                .iter()
-                .all(|t| t.enabled && !t.describe().is_empty())
-        );
-        assert!(
-            templates
-                .iter()
-                .filter(|t| t.metric.is_event())
-                .all(|t| t.sustain_secs == 0)
-        );
     }
 
     #[test]

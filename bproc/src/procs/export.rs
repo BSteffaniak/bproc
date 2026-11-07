@@ -2,6 +2,7 @@
 use super::columns::{ColumnCtx, ColumnId};
 use super::store::{ProcessStore, Row, ViewRow};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -83,14 +84,17 @@ fn csv_field(text: &str) -> String {
 }
 
 /// Neutralise text a spreadsheet would evaluate as a formula (process names
-/// and command lines are attacker controlled). `-` is left alone so login
-/// shells such as `-zsh` keep their names.
+/// and command lines are attacker controlled). A leading `-` is defused unless
+/// a letter or another `-` follows, so login shells (`-zsh`) and flags
+/// (`--verbose`) stay readable while `-1+cmd|…` and `-=…` do not run.
 fn defuse(text: String) -> String {
-    if text.starts_with(['=', '+', '@', '\t', '\r']) {
-        format!("'{text}")
-    } else {
-        text
-    }
+    let mut chars = text.chars();
+    let dangerous = match chars.next() {
+        Some('=' | '+' | '@' | '\t' | '\r') => true,
+        Some('-') => !chars.next().is_some_and(|c| c.is_alphabetic() || c == '-'),
+        _ => false,
+    };
+    if dangerous { format!("'{text}") } else { text }
 }
 
 fn json<'a>(
@@ -140,25 +144,80 @@ fn number(v: f64) -> Value {
     }
 }
 
-/// Write an export to `dir` (default: current directory) and return the path.
-pub fn write(
-    contents: &str,
-    format: ExportFormat,
-    dir: Option<&std::path::Path>,
-) -> std::io::Result<std::path::PathBuf> {
-    let name = format!(
-        "bproc-{}.{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        match format {
-            ExportFormat::Csv => "csv",
-            ExportFormat::Json => "json",
+/// Most numbered variants tried when exports collide within one second.
+const MAX_SUFFIX: u32 = 100;
+
+/// Write an export to `dir` and return its absolute path.
+///
+/// Without `dir` the file goes to the current directory, or, when running as
+/// root, to the invoking account's downloads/home directory so `sudo bproc`
+/// in a shared directory (`/tmp`) does not write where others can plant
+/// files. The file is always created fresh (`O_EXCL`): an existing file or
+/// symlink is never followed or overwritten; a `-1`, `-2`, … suffix is added
+/// instead.
+pub fn write(contents: &str, format: ExportFormat, dir: Option<&Path>) -> std::io::Result<PathBuf> {
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => default_dir(),
+    };
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let ext = match format {
+        ExportFormat::Csv => "csv",
+        ExportFormat::Json => "json",
+    };
+    write_new(&dir, &stamp, ext, contents)
+}
+
+fn write_new(dir: &Path, stamp: &str, ext: &str, contents: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    for n in 0..=MAX_SUFFIX {
+        let name = if n == 0 {
+            format!("bproc-{stamp}.{ext}")
+        } else {
+            format!("bproc-{stamp}-{n}.{ext}")
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(contents.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-    );
-    let path = dir
-        .map(|d| d.join(&name))
-        .unwrap_or_else(|| std::path::PathBuf::from(&name));
-    std::fs::write(&path, contents)?;
-    Ok(path)
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("too many exports named bproc-{stamp}-*.{ext}"),
+    ))
+}
+
+fn default_dir() -> PathBuf {
+    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if running_as_root() {
+        dirs::download_dir()
+            .filter(|d| d.is_dir())
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(cwd)
+    } else {
+        cwd()
+    }
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -267,6 +326,22 @@ mod tests {
     }
 
     #[test]
+    fn defuse_leading_minus_unless_word_or_flag() {
+        let d = |s: &str| defuse(s.to_string());
+        assert_eq!(d("-1+cmd|' /C calc'!A0"), "'-1+cmd|' /C calc'!A0");
+        assert_eq!(d("-=1"), "'-=1");
+        assert_eq!(d("-@SUM(1)"), "'-@SUM(1)");
+        assert_eq!(d("-"), "'-");
+        assert_eq!(d("-zsh"), "-zsh");
+        assert_eq!(d("--flag"), "--flag");
+        assert_eq!(d("+1"), "'+1");
+        assert_eq!(d("@x"), "'@x");
+        assert_eq!(d("\t1"), "'\t1");
+        assert_eq!(d("node"), "node");
+        assert_eq!(d(""), "");
+    }
+
+    #[test]
     fn empty_exports_are_well_formed() {
         let store = ProcessStore::new();
         let ctx = ColumnCtx::default();
@@ -357,13 +432,47 @@ mod tests {
         assert_eq!(number(-5.0), Value::from(-5));
     }
 
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bproc-export-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn write_creates_file() {
-        let dir = std::env::temp_dir().join(format!("bproc-export-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("create");
         let path = write("a,b\r\n", ExportFormat::Csv, Some(&dir)).unwrap();
+        assert!(path.is_absolute());
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("csv"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\r\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_never_overwrites_same_second_exports() {
+        let dir = scratch_dir("collide");
+        let a = write_new(&dir, "20260101-000000", "csv", "first").unwrap();
+        let b = write_new(&dir, "20260101-000000", "csv", "second").unwrap();
+        let c = write_new(&dir, "20260101-000000", "csv", "third").unwrap();
+        assert_eq!(a.file_name().unwrap(), "bproc-20260101-000000.csv");
+        assert_eq!(b.file_name().unwrap(), "bproc-20260101-000000-1.csv");
+        assert_eq!(c.file_name().unwrap(), "bproc-20260101-000000-2.csv");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_does_not_follow_planted_symlinks() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("bproc-20260101-000000.json")).unwrap();
+        let path = write_new(&dir, "20260101-000000", "json", "[]").unwrap();
+        assert_eq!(path.file_name().unwrap(), "bproc-20260101-000000-1.json");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

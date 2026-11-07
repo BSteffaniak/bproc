@@ -536,22 +536,6 @@ impl ColumnId {
         };
         SortKey::Text(text.filter(|t| !t.is_empty()).map(|t| t.to_lowercase()))
     }
-
-    /// Total order for sorting (ascending sense); ties are broken by the
-    /// caller (PID). Missing values order before present ones.
-    pub fn compare(self, a: &Row, b: &Row, ctx: &ColumnCtx) -> Ordering {
-        if self.is_text() {
-            let x = self.text(a, ctx).to_lowercase();
-            let y = self.text(b, ctx).to_lowercase();
-            return x.cmp(&y);
-        }
-        match (self.numeric(a, ctx), self.numeric(b, ctx)) {
-            (Some(x), Some(y)) => x.total_cmp(&y),
-            (Some(_), None) => Ordering::Greater,
-            (None, Some(_)) => Ordering::Less,
-            (None, None) => Ordering::Equal,
-        }
-    }
 }
 
 /// A column value prepared for sorting: numbers compare numerically, text
@@ -717,27 +701,21 @@ mod tests {
     }
 
     #[test]
-    fn compare_is_a_total_order() {
+    fn sort_keys_are_a_total_order() {
         let ctx = ColumnCtx::default();
+        let cmp = |c: ColumnId, a: &Row, b: &Row| {
+            c.sort_key(a, &ctx)
+                .cmp_directed(&c.sort_key(b, &ctx), false)
+        };
         let rows = [default_row(), rich_row(3), rich_row(12), rich_row(3)];
         for &c in ALL_COLUMNS {
             for a in &rows {
-                assert_eq!(c.compare(a, a, &ctx), Ordering::Equal, "{c:?} reflexive");
+                assert_eq!(cmp(c, a, a), Ordering::Equal, "{c:?} reflexive");
                 for b in &rows {
-                    assert_eq!(
-                        c.compare(a, b, &ctx),
-                        c.compare(b, a, &ctx).reverse(),
-                        "{c:?}"
-                    );
+                    assert_eq!(cmp(c, a, b), cmp(c, b, a).reverse(), "{c:?}");
                     for d in &rows {
-                        if c.compare(a, b, &ctx) != Ordering::Greater
-                            && c.compare(b, d, &ctx) != Ordering::Greater
-                        {
-                            assert_ne!(
-                                c.compare(a, d, &ctx),
-                                Ordering::Greater,
-                                "{c:?} transitive"
-                            );
+                        if cmp(c, a, b) != Ordering::Greater && cmp(c, b, d) != Ordering::Greater {
+                            assert_ne!(cmp(c, a, d), Ordering::Greater, "{c:?} transitive");
                         }
                     }
                 }

@@ -862,7 +862,7 @@ mod tests {
             vec![],
         ));
         assert_eq!(s.children(&key(1)), vec![key(7)]);
-        assert_eq!(s.history(&key(7)).map(MetricHistory::len), Some(1));
+        assert_eq!(s.history(&key(7)).map(|h| h.cpu.len()), Some(1));
 
         let worker = entry(7, Some(1), "worker", 3.0);
         s.apply_snapshot(snapshot(
@@ -876,7 +876,7 @@ mod tests {
         assert!(s.by_pid(7).is_none());
         assert!(s.children(&key(1)).is_empty());
         assert_eq!(s.len_live(), 1);
-        assert_eq!(s.history(&key(7)).map(MetricHistory::len), Some(1));
+        assert_eq!(s.history(&key(7)).map(|h| h.cpu.len()), Some(1));
         let rows = Spec::default().run(&s);
         assert!(rows.iter().any(|r| r.key == key(7) && r.ghost));
 
@@ -893,7 +893,7 @@ mod tests {
         ));
         assert!(s.get(&key(7)).is_none());
         assert!(s.history(&key(7)).is_none());
-        assert_eq!(s.history(&key(1)).map(MetricHistory::len), Some(4));
+        assert_eq!(s.history(&key(1)).map(|h| h.cpu.len()), Some(4));
     }
 
     #[test]
@@ -993,6 +993,6 @@ mod tests {
     fn duplicate_entries_in_a_snapshot_are_collapsed() {
         let s = store(vec![entry(1, None, "a", 0.0), entry(1, None, "a", 0.0)]);
         assert_eq!(s.rows().len(), 1);
-        assert_eq!(s.history(&key(1)).map(MetricHistory::len), Some(1));
+        assert_eq!(s.history(&key(1)).map(|h| h.cpu.len()), Some(1));
     }
 }

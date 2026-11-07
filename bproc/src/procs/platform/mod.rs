@@ -140,6 +140,73 @@ mod tests {
     }
 
     #[test]
+    fn keys_match_action_verification() {
+        let mut sampler = create_sampler();
+        let raw = sampler.sample().expect("sample");
+        let me = std::process::id() as i32;
+        let entry = raw
+            .processes
+            .iter()
+            .find(|e| e.key().pid == me)
+            .expect("own process listed");
+        assert_eq!(crate::procs::actions::verify_identity(entry.key()), Ok(()));
+        if cfg!(target_os = "macos") {
+            let launchd = raw
+                .processes
+                .iter()
+                .find(|e| e.key().pid == 1)
+                .expect("launchd listed");
+            assert_eq!(
+                crate::procs::actions::verify_identity(launchd.key()),
+                Ok(())
+            );
+        }
+    }
+
+    /// Without root, sysinfo cannot read other users' processes on macOS;
+    /// the sampler must still give them a start time, parent and owner.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn other_users_processes_have_identity() {
+        let mut sampler = create_sampler();
+        let raw = sampler.sample().expect("sample");
+        let launchd = raw
+            .processes
+            .iter()
+            .find(|e| e.key().pid == 1)
+            .expect("launchd listed");
+        assert!(launchd.key().start_time > 0);
+        assert_eq!(launchd.record.uid, Some(0));
+        assert_eq!(launchd.record.user.as_deref(), Some("root"));
+        assert_eq!(launchd.record.ppid, None);
+        // Every root daemon launched by launchd has a parent and an owner.
+        let daemons: Vec<_> = raw
+            .processes
+            .iter()
+            .filter(|e| e.key().pid > 1 && e.record.uid == Some(0))
+            .collect();
+        assert!(!daemons.is_empty());
+        assert!(daemons.iter().all(|e| e.key().start_time > 0));
+        assert!(daemons.iter().any(|e| e.record.ppid == Some(1)));
+        let orphans = raw
+            .processes
+            .iter()
+            .filter(|e| e.key().pid > 1 && e.record.ppid.is_none())
+            .count();
+        // Only launchd/kernel_task are roots (allow a process exiting mid-tick).
+        assert!(orphans <= 2, "{orphans} processes without a parent");
+
+        // A second tick reuses the records instead of rebuilding them.
+        let again = sampler.sample().expect("sample");
+        let launchd2 = again
+            .processes
+            .iter()
+            .find(|e| e.key().pid == 1)
+            .expect("launchd listed");
+        assert!(std::sync::Arc::ptr_eq(&launchd.record, &launchd2.record));
+    }
+
+    #[test]
     #[ignore = "measures the real system; run with --ignored --nocapture"]
     fn sample_timings() {
         let started = Instant::now();

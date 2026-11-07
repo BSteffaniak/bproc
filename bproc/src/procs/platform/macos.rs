@@ -8,7 +8,7 @@ use super::{Enricher, RecordRef};
 use crate::procs::model::{ProcState, ProcessSample};
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{MaybeUninit, size_of, size_of_val};
 
 /// `NODEV` from `<sys/param.h>`: process has no controlling terminal.
 const NODEV: u32 = u32::MAX;
@@ -82,6 +82,65 @@ fn pidinfo<T>(pid: i32, flavor: i32) -> Result<T, i32> {
             .raw_os_error()
             .unwrap_or(libc::ESRCH))
     }
+}
+
+/// Start time (epoch seconds) of `pid` from `sysctl(KERN_PROC_PID)`, which,
+/// unlike `PROC_PIDTBSDINFO`, also answers for other users' processes without
+/// root. Same clock as sysinfo's `pbi_start_tvsec`. `None` when no such
+/// process exists or the call fails.
+pub fn start_time_sysctl(pid: i32) -> Option<u64> {
+    if pid < 0 {
+        return None;
+    }
+    // `struct kinfo_proc` (648 bytes on 64-bit macOS) is not in `libc`; it
+    // starts with `kp_proc.p_un`, a union whose `p_starttime` is a
+    // `struct timeval`, so `tv_sec` is the first 8 bytes. The buffer is
+    // oversized and 8-byte aligned so any kinfo_proc revision fits.
+    let mut buf = [0u64; 128];
+    let mut len = size_of_val(&buf);
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` names a read-only sysctl; `buf` is writable for `len`
+    // bytes and the kernel never writes more than `len`.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || len < size_of::<libc::timeval>() {
+        return None; // len 0: no such process.
+    }
+    let sec = buf[0] as i64;
+    (sec >= 0).then_some(sec as u64)
+}
+
+/// `PROC_PIDT_SHORTBSDINFO` for `pid`: parent, owner and short command name.
+/// Readable for every process, including other users', without root.
+pub fn short_info(pid: i32) -> Option<libc::proc_bsdshortinfo> {
+    pidinfo::<libc::proc_bsdshortinfo>(pid, libc::PROC_PIDT_SHORTBSDINFO).ok()
+}
+
+/// Parent PID from short info (`None` for launchd / kernel_task, like sysinfo).
+pub fn short_ppid(info: &libc::proc_bsdshortinfo) -> Option<i32> {
+    match info.pbsi_ppid as i32 {
+        0 => None,
+        ppid => Some(ppid),
+    }
+}
+
+/// Short (`MAXCOMLEN`) command name from short info.
+pub fn short_comm(info: &libc::proc_bsdshortinfo) -> String {
+    let bytes: Vec<u8> = info
+        .pbsi_comm
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn devname(dev: u32) -> Option<String> {
@@ -216,6 +275,37 @@ mod tests {
         let mut sample = ProcessSample::default();
         assert!(!enricher.enrich(RecordRef::Known(&record), &mut sample));
         assert_eq!(sample, ProcessSample::default());
+    }
+
+    fn sysinfo_start(pid: i32) -> u64 {
+        let pid = sysinfo::Pid::from_u32(pid as u32);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).expect("visible").start_time()
+    }
+
+    #[test]
+    fn sysctl_start_time_matches_sysinfo() {
+        let me = std::process::id() as i32;
+        let start = start_time_sysctl(me).expect("own process");
+        assert!(start > 0);
+        assert_eq!(start, sysinfo_start(me));
+        assert_eq!(start_time_sysctl(i32::MAX - 7), None);
+        assert_eq!(start_time_sysctl(-1), None);
+    }
+
+    #[test]
+    fn unprivileged_identity_for_launchd() {
+        // Works without root, where sysinfo reports start 0 and no uid.
+        assert!(start_time_sysctl(1).is_some_and(|s| s > 0));
+        let info = short_info(1).expect("launchd short info");
+        assert_eq!(info.pbsi_ruid, 0);
+        assert_eq!(short_ppid(&info), None);
+        assert_eq!(short_comm(&info), "launchd");
+        let me = short_info(std::process::id() as i32).expect("own short info");
+        // SAFETY: getuid/getppid have no preconditions.
+        assert_eq!(me.pbsi_ruid, unsafe { libc::getuid() });
+        assert_eq!(short_ppid(&me), Some(unsafe { libc::getppid() }));
     }
 
     #[test]

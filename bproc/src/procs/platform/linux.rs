@@ -7,6 +7,7 @@ use crate::procs::model::{ProcessKey, ProcessSample};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Read};
+use std::sync::OnceLock;
 
 pub struct ProcfsEnricher {
     path: String,
@@ -31,6 +32,39 @@ impl Default for ProcfsEnricher {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Boot time (epoch seconds) every process start time in bproc is expressed
+/// against. Captured once: `/proc/stat` `btime` is realtime minus boot time,
+/// so it moves whenever the wall clock is stepped, and mixing two readings
+/// would make every live process look like a reused PID.
+static BOOT_REFERENCE: OnceLock<u64> = OnceLock::new();
+
+pub fn boot_reference() -> u64 {
+    *BOOT_REFERENCE.get_or_init(sysinfo::System::boot_time)
+}
+
+/// Kernel clock ticks per second (`USER_HZ`), the unit of stat field 22.
+fn clock_ticks() -> u64 {
+    static TICKS: OnceLock<u64> = OnceLock::new();
+    // SAFETY: sysconf has no preconditions.
+    *TICKS.get_or_init(|| (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64)
+}
+
+/// Start time from boot-relative clock ticks, on the same formula as sysinfo
+/// (`ticks / HZ + btime`) but against [`boot_reference`].
+pub fn start_time_from_ticks(ticks: u64) -> u64 {
+    boot_reference().saturating_add(ticks / clock_ticks())
+}
+
+/// Start time of `pid` from `/proc/<pid>/stat`, or `None` if unreadable.
+pub fn start_time_procfs(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = proc_text::parse_stat(&text)?;
+    Some(start_time_from_ticks(stat.start_ticks))
 }
 
 fn set_path(path: &mut String, pid: i32, file: &str) {
@@ -96,5 +130,31 @@ impl Enricher for ProcfsEnricher {
 
     fn retain(&mut self, live: &dyn Fn(&ProcessKey) -> bool) {
         self.fd_denied.retain(|key| live(key));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procfs_start_time_matches_sysinfo() {
+        let me = sysinfo::get_current_pid().expect("pid");
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[me]), true);
+        let expected = system.process(me).expect("self").start_time();
+        let start = start_time_procfs(me.as_u32() as i32).expect("own stat");
+        // Equal unless the wall clock was stepped while the test ran.
+        assert!(start.abs_diff(expected) <= 1, "{start} vs {expected}");
+        assert_eq!(start_time_procfs(i32::MAX - 7), None);
+        assert_eq!(start_time_procfs(0), None);
+    }
+
+    #[test]
+    fn start_time_uses_fixed_boot_reference() {
+        let boot = boot_reference();
+        assert_eq!(start_time_from_ticks(0), boot);
+        assert_eq!(start_time_from_ticks(clock_ticks() * 10), boot + 10);
+        assert_eq!(boot_reference(), boot);
     }
 }

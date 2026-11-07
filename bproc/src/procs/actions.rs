@@ -193,8 +193,29 @@ impl ActionReport {
 
 /// Current start time for `pid` using the same clock as the collector, or
 /// `None` if no such process exists.
+///
+/// macOS reads `sysctl(KERN_PROC_PID)`, which works for other users'
+/// processes without root (sysinfo reports 0 for those). Linux reads
+/// `/proc/<pid>/stat` against the collector's fixed boot reference so a wall
+/// clock step does not make every process look reused. Both fall back to
+/// sysinfo when the native source fails.
 pub fn current_start_time(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if let Some(start) = super::platform::macos::start_time_sysctl(pid) {
+        return Some(start);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(start) = super::platform::linux::start_time_procfs(pid) {
+        return Some(start);
+    }
+    sysinfo_start_time(pid)
+}
+
+fn sysinfo_start_time(pid: i32) -> Option<u64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    if pid < 0 {
+        return None;
+    }
     let mut system = System::new();
     let pid = Pid::from_u32(pid as u32);
     system.refresh_processes_specifics(
@@ -218,18 +239,19 @@ pub fn exe_path(pid: i32) -> Option<String> {
     system.process(pid)?.exe().map(|p| p.display().to_string())
 }
 
+/// Check that `key.pid` still belongs to the process `key` identifies. A
+/// start time of 0 (unknown) is not a wildcard: it matches only a process
+/// whose start time still reads as unknown, never a readable newcomer.
 pub fn verify_identity(key: ProcessKey) -> Result<(), ActionError> {
-    match current_start_time(key.pid) {
-        None => Err(ActionError::NotFound),
-        Some(start) if key.start_time != 0 && start != key.start_time => {
-            Err(ActionError::PidReused)
-        }
-        Some(_) => Ok(()),
-    }
+    check_identity(key, current_start_time(key.pid))
 }
 
-pub fn is_alive(key: ProcessKey) -> bool {
-    verify_identity(key).is_ok()
+fn check_identity(key: ProcessKey, current: Option<u64>) -> Result<(), ActionError> {
+    match current {
+        None => Err(ActionError::NotFound),
+        Some(start) if start != key.start_time => Err(ActionError::PidReused),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Execute a request (blocking). `names` supplies display names for reports.
@@ -558,11 +580,49 @@ mod tests {
     }
 
     #[test]
+    fn unknown_start_time_is_not_a_wildcard() {
+        // A row keyed with start 0 (unreadable owner) must not match a live
+        // process whose start time is readable: that is a reused PID.
+        let (mut child, key) = sleeper();
+        assert!(key.start_time > 0);
+        let unknown = ProcessKey::new(key.pid, 0);
+        assert_eq!(verify_identity(unknown), Err(ActionError::PidReused));
+        let report = send(unknown, Signal::Kill);
+        assert_eq!(report.outcomes[0].result, Err(ActionError::PidReused));
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(verify_identity(key), Ok(()));
+    }
+
+    #[test]
+    fn check_identity_compares_exactly() {
+        let key = |start| ProcessKey::new(42, start);
+        assert_eq!(check_identity(key(0), Some(0)), Ok(()));
+        assert_eq!(check_identity(key(0), Some(7)), Err(ActionError::PidReused));
+        assert_eq!(check_identity(key(7), Some(0)), Err(ActionError::PidReused));
+        assert_eq!(check_identity(key(7), Some(7)), Ok(()));
+        assert_eq!(check_identity(key(7), None), Err(ActionError::NotFound));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn other_users_processes_have_a_start_time() {
+        // launchd is unreadable through libproc without root; the sysctl
+        // clock still identifies it, so it never needs a 0 wildcard key.
+        let start = current_start_time(1).expect("launchd");
+        assert!(start > 0);
+        assert_eq!(verify_identity(ProcessKey::new(1, start)), Ok(()));
+        assert_eq!(
+            verify_identity(ProcessKey::new(1, start - 1)),
+            Err(ActionError::PidReused)
+        );
+    }
+
+    #[test]
     fn exited_process_is_not_found() {
         let (mut child, key) = sleeper();
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        assert!(!is_alive(key));
+        assert_eq!(verify_identity(key), Err(ActionError::NotFound));
         let report = send(key, Signal::Term);
         assert_eq!(report.outcomes[0].result, Err(ActionError::NotFound));
     }

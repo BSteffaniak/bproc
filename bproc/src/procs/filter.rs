@@ -28,6 +28,9 @@ pub struct Filter {
     source: String,
     /// ANDed groups of ORed terms.
     groups: Vec<Vec<Term>>,
+    /// Non-fatal advice, e.g. a `key:` that was searched as text but looks
+    /// like a misspelled field.
+    hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,6 +348,7 @@ impl Filter {
         let tokens = lex(input)?;
         let mut groups: Vec<Vec<Term>> = Vec::new();
         let mut pending_or: Option<(usize, usize)> = None;
+        let mut hint = None;
         for tok in tokens {
             match tok {
                 Tok::Or(span) => {
@@ -354,7 +358,7 @@ impl Filter {
                     pending_or = Some(span);
                 }
                 Tok::Term(raw) => {
-                    let term = parse_term(input, &raw)?;
+                    let term = parse_term(input, &raw, &mut hint)?;
                     match (pending_or.take(), groups.last_mut()) {
                         (Some(_), Some(group)) => group.push(term),
                         _ => groups.push(vec![term]),
@@ -368,7 +372,14 @@ impl Filter {
         Ok(Filter {
             source: input.to_string(),
             groups,
+            hint,
         })
+    }
+
+    /// Advice to show next to a query that parsed but may not do what the
+    /// user meant (e.g. `usr:root` searched as text: "did you mean user:?").
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
     }
 
     pub fn source(&self) -> &str {
@@ -530,12 +541,14 @@ fn eval(
                 .numeric(row, ctx)
                 .is_some_and(|v| compare(*cmp, v, *value, unit_of(*column)))
         }
-        Kind::Port { cmp, value } => row.net.as_ref().is_some_and(|n| {
-            n.connections.iter().any(|c| {
-                compare(*cmp, c.local_port as f64, *value, Unit::Count)
-                    || compare(*cmp, c.remote_port as f64, *value, Unit::Count)
-            })
-        }),
+        // `port!=N` means "not using port N": the negation of `port:N`, so it
+        // also holds for processes without connections, and a connection's
+        // other (ephemeral) end does not make it match.
+        Kind::Port {
+            cmp: Cmp::Ne,
+            value,
+        } => !uses_port(row, Cmp::Eq, *value),
+        Kind::Port { cmp, value } => uses_port(row, *cmp, *value),
         Kind::Is(flag) => match flag {
             Flag::Ghost => row.is_ghost(),
             Flag::Kernel => record.kernel_thread,
@@ -550,6 +563,16 @@ fn eval(
             }),
         },
     }
+}
+
+/// Whether any connection of `row` has a local or remote port matching.
+fn uses_port(row: &Row, cmp: Cmp, value: f64) -> bool {
+    row.net.as_ref().is_some_and(|n| {
+        n.connections.iter().any(|c| {
+            compare(cmp, c.local_port as f64, value, Unit::Count)
+                || compare(cmp, c.remote_port as f64, value, Unit::Count)
+        })
+    })
 }
 
 fn text_op(op: TextOp, needle: &Needle, hay: &str) -> bool {
@@ -1005,7 +1028,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn unknown_key(key: &str, span: (usize, usize)) -> FilterError {
+/// Known keys close to `key`, nearest first (at most three).
+fn key_candidates(key: &str) -> Vec<(usize, &'static str)> {
     let lower = key.to_ascii_lowercase();
     let mut candidates: Vec<(usize, &str)> = ALL_COLUMNS
         .iter()
@@ -1023,6 +1047,11 @@ fn unknown_key(key: &str, span: (usize, usize)) -> FilterError {
         .collect();
     candidates.sort();
     candidates.truncate(3);
+    candidates
+}
+
+fn unknown_key(key: &str, span: (usize, usize)) -> FilterError {
+    let candidates = key_candidates(key);
     let hint = if candidates.is_empty() {
         "try cpu, mem, user, name, or quote text".to_string()
     } else {
@@ -1043,7 +1072,7 @@ fn current_uid() -> Option<u32> {
     None
 }
 
-fn parse_term(input: &str, raw: &RawTerm) -> Result<Term, FilterError> {
+fn parse_term(input: &str, raw: &RawTerm, hint: &mut Option<String>) -> Result<Term, FilterError> {
     let body = &input[raw.body.0..raw.body.1];
     let negated = raw.negated;
     let text_term = |s: &str, fuzzy: bool| -> Result<Term, FilterError> {
@@ -1072,7 +1101,19 @@ fn parse_term(input: &str, raw: &RawTerm) -> Result<Term, FilterError> {
     let value_span = (raw.body.0 + key_len + op_len, raw.body.1);
     let op_text = &body[key_len..key_len + op_len];
     let Some(resolved) = resolve_key(key) else {
-        return Err(unknown_key(key, key_span));
+        if op != Op::Colon {
+            return Err(unknown_key(key, key_span));
+        }
+        // `localhost:8080`, `https://…`, `node:internal`: plain text with a
+        // colon, searched literally (no fuzzy matching).
+        if hint.is_none()
+            && let Some((_, near)) = key_candidates(key).into_iter().find(|(d, _)| *d <= 1)
+        {
+            *hint = Some(format!(
+                "searching text '{key}:'; did you mean {near}{op_text}?"
+            ));
+        }
+        return text_term(&unquote(body), false);
     };
     let value = unquote(value_raw);
     if value.is_empty() {

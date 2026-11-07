@@ -420,6 +420,20 @@ fn network_terms() {
     assert!(hit("port>50000", &r));
     assert!(!hit("port:80", &r));
     assert!(!hit("port:443", &node()));
+    // `port!=N` is "not using port N": the ephemeral local end (52000 != 443)
+    // must not make a connection to 443 match, and no connections means the
+    // port is not in use.
+    assert!(!hit("port!=443", &r));
+    assert!(!hit("port!=52000", &r));
+    assert!(hit("port!=80", &r));
+    assert!(hit("port!=443", &node()));
+    for q in ["port:443", "port:80", "port>50000"] {
+        let negated = format!("-{q}");
+        for row in [&r, &node()] {
+            assert_ne!(hit(q, row), hit(&negated, row), "{q}");
+        }
+    }
+    assert_eq!(hit("port!=443", &r), hit("-port:443", &r));
     assert!(hit("conn=1", &r));
     assert!(hit("is:net", &r));
     assert!(!hit("is:net", &node()));
@@ -474,7 +488,7 @@ fn errors_are_friendly_with_spans() {
     let e = error("cpux>10");
     assert_eq!(e.message, "unknown field 'cpux' (try cpu)");
     assert_eq!(e.span, (0, 4));
-    let e = error("node zzzzz:1");
+    let e = error("node zzzzz>1");
     assert!(
         e.message
             .starts_with("unknown field 'zzzzz' (try cpu, mem, user, name"),
@@ -535,10 +549,53 @@ fn errors_are_friendly_with_spans() {
 
 #[test]
 fn suggestions_for_near_misses() {
-    assert!(error("usr:root").message.contains("user"));
+    assert!(error("usr>root").message.contains("user"));
     assert!(error("thr0eads>1").message.contains("threads"));
-    assert!(error("pr:1").message.contains("pri"));
+    assert!(error("pr>1").message.contains("pri"));
     assert!(error("thread_count>1").message.starts_with("unknown field"));
+    // With ':' an unknown key is searched as text; near misses keep a hint.
+    let f = Filter::parse("usr:root").unwrap();
+    assert!(
+        f.hint().is_some_and(|h| h.contains("user:")),
+        "{:?}",
+        f.hint()
+    );
+    assert!(
+        Filter::parse("pr:1")
+            .unwrap()
+            .hint()
+            .unwrap()
+            .contains("pri:")
+    );
+    assert_eq!(Filter::parse("localhost:8080").unwrap().hint(), None);
+    assert_eq!(Filter::parse("cpu>1").unwrap().hint(), None);
+}
+
+#[test]
+fn colon_words_are_plain_text() {
+    let r = row(
+        7,
+        "node",
+        &[
+            "node",
+            "--inspect=localhost:9229",
+            "https://example.com/a",
+            "node:internal",
+        ],
+    );
+    assert!(hit("localhost:9229", &r));
+    assert!(!hit("localhost:8080", &r));
+    assert!(hit("https://example.com", &r));
+    assert!(hit("node:internal", &r));
+    assert!(hit("zzzzz:1", &row(1, "x", &["x", "--zzzzz:1"])));
+    assert!(!hit("zzzzz:1", &r));
+    assert!(hit("-localhost:8080", &r));
+    // Literal substring only: no fuzzy subsequence match.
+    assert!(!hit("lclhst:9229", &r));
+    // Real keys still parse as fields.
+    assert!(hit("name:node", &r));
+    let e = error("localhost>8080");
+    assert!(e.message.starts_with("unknown field 'localhost'"));
 }
 
 #[test]
