@@ -18,3 +18,11 @@ opt-level = 3
 [profile.release]
 lto = true
 opt-level = 3
+
+# Local bmux development checkout; replace with the pushed git revision before release.
+[patch."https://github.com/BSteffaniak/bmux"]
+bmux_tui = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui" }
+bmux_tui_components = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-components" }
+bmux_tui_runtime = { path = "/Volumes/ehdd/GitHub/bmux/packages/tui-runtime" }
+bmux_keyboard = { path = "/Volumes/ehdd/GitHub/bmux/packages/keyboard" }
+bmux_text_edit = { path = "/Volumes/ehdd/GitHub/bmux/packages/text-edit" }

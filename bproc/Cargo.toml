@@ -56,6 +56,10 @@ bmux_tui_components = { git = "https://github.com/BSteffaniak/bmux", branch = "m
   "tab-bar",
   "canvas",
   "compact",
+  "table",
+  "menu",
+  "sparkline",
+  "scrollbar",
 ] }
 bmux_tui_runtime = { git = "https://github.com/BSteffaniak/bmux", branch = "master", default-features = false, features = [
   "crossterm",
@@ -65,7 +69,7 @@ bmux_keyboard = { git = "https://github.com/BSteffaniak/bmux", branch = "master"
 bmux_text_edit = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
 tokio = { version = "1", features = ["full"] }
 pretty_env_logger = "0.5.0"
-sysinfo = "0.31"
+sysinfo = "0.38"
 anyhow = "1.0"
 log = { version = "0.4.28", features = ["release_max_level_trace"] }
 clap = { version = "4", features = ["derive"] }

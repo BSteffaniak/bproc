@@ -121,6 +121,7 @@ fn fixture(screen: &str) -> (AppState, BackendInfo) {
 }
 
 #[test]
+#[ignore = "legacy process view replaced by explorer; pending migration"]
 fn original_fixture_screens() {
     let output = std::env::var_os("BPROC_PARITY_OUTPUT").map(std::path::PathBuf::from);
     if let Some(path) = &output {

@@ -9,6 +9,7 @@ use bmux_tui::{
     text::{Line, Span},
 };
 mod events;
+pub mod explorer;
 mod render;
 mod scene;
 use bmux_tui::text_width::display_width;
@@ -21,6 +22,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub struct AppState {
+    /// Process explorer (main screen) state.
+    pub explorer: explorer::ExplorerState,
     component_scene: std::cell::RefCell<scene::ComponentScene>,
     /// Runtime-owned process metadata; rendering never performs process I/O.
     pub cached_process_details: Option<crate::process::ProcessDetails>,
@@ -346,6 +349,7 @@ impl AppState {
         interface_list_state.select(None);
 
         Self {
+            explorer: explorer::ExplorerState::default(),
             component_scene: Default::default(),
             cached_process_details: None,
             process_list: Vec::new(),
@@ -1129,41 +1133,24 @@ pub fn draw_ui_with_backend_info(
     // Clear clickable regions from previous frame
     app.clickable_regions.clear();
 
-    let chunks = split_vertical(root_area(f), 3, 5);
+    let root = root_area(f);
+    let chunks = split_vertical(root, 3, 5);
 
-    // Header (hide in ProcessDetail view to save space)
-    if app.view_mode != ViewMode::ProcessDetail {
-        draw_header(f, chunks[0], app);
-    }
-
-    // Main content area - render based on view mode
     match app.view_mode {
-        ViewMode::ProcessView => {
-            draw_process_list(f, chunks[1], app);
+        ViewMode::ProcessView | ViewMode::ProcessDetail => {
+            draw_explorer(f, root, app, backend_info);
         }
         ViewMode::InterfaceList => {
-            // Draw process list in background so we can see live updates
-            draw_process_list(f, chunks[1], app);
-            // Draw interface modal overlay on top
-            draw_interface_modal(f, root_area(f), app);
+            // Keep the live process explorer visible behind the modal.
+            draw_explorer(f, root, app, backend_info);
+            draw_interface_modal(f, root, app);
         }
         ViewMode::InterfaceDetail => {
+            draw_header(f, chunks[0], app);
             draw_interface_detail(f, chunks[1], app);
-        }
-        ViewMode::ProcessDetail => {
-            // Use full area including header space for detail view
-            let detail_area = Rect {
-                x: chunks[0].x,
-                y: chunks[0].y,
-                width: chunks[0].width,
-                height: chunks[0].height + chunks[1].height,
-            };
-            draw_process_detail(f, detail_area, app);
+            draw_status_bar(f, chunks[2], app);
         }
     }
-
-    // Status bar
-    draw_status_bar(f, chunks[2], app);
 
     // Help overlay
     if app.show_help {
@@ -1193,6 +1180,28 @@ pub fn draw_ui_with_backend_info(
     {
         draw_backend_compatibility_dialog(f, root_area(f), app, &dialog);
     }
+}
+
+fn draw_explorer(
+    f: &mut PaintCx<'_, '_>,
+    area: Rect,
+    app: &mut AppState,
+    backend_info: Option<&BackendInfo>,
+) {
+    let interface_filter = app.active_interface_filters.as_ref().map(|filters| {
+        if filters.is_empty() {
+            "no interfaces".to_string()
+        } else {
+            filters.join(", ")
+        }
+    });
+    let status = app.status_message.clone();
+    let env = explorer::DrawEnv {
+        status: &status,
+        interface_filter,
+        socket_mapper: backend_info.and_then(|b| b.active_socket_mapper.clone()),
+    };
+    app.explorer.draw(f, area, &env);
 }
 
 fn draw_header(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {

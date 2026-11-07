@@ -13,6 +13,10 @@ const CONFIG_FILE: &str = "throttles.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedThrottle {
     pub process_name: String,
+    /// Executable path; restoration matches name + exe because PIDs do not
+    /// survive restarts (the map key is only the PID at save time).
+    #[serde(default)]
+    pub exe: Option<String>,
     pub upload_limit: Option<u64>,
     pub download_limit: Option<u64>,
 }
@@ -47,6 +51,89 @@ pub struct Config {
     /// Traffic view mode: All, Internet, or Local
     #[serde(default)]
     pub traffic_view_mode: Option<crate::process::TrafficType>,
+
+    /// Process explorer preferences (columns, sort, refresh, layout).
+    #[serde(default)]
+    pub explorer: ExplorerSettings,
+
+    /// Watch / alert rules.
+    #[serde(default)]
+    pub watch_rules: Vec<crate::procs::watch::WatchRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DockPosition {
+    #[default]
+    Bottom,
+    Right,
+}
+
+/// Persisted process explorer preferences. Every field has a default so
+/// older config files keep loading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExplorerSettings {
+    pub preset: crate::procs::columns::Preset,
+    /// Column overrides per preset (absent = preset defaults).
+    pub preset_columns: HashMap<String, Vec<crate::procs::columns::ColumnId>>,
+    /// User-resized column widths.
+    pub column_widths: HashMap<String, u16>,
+    pub sort_column: Option<crate::procs::columns::ColumnId>,
+    pub sort_descending: bool,
+    pub tree: bool,
+    pub refresh_ms: u64,
+    pub hide_kernel_threads: bool,
+    pub only_mine: bool,
+    pub net_active_only: bool,
+    pub dock: DockPosition,
+    /// Detail panel height (bottom) or width (right) in cells.
+    pub dock_size: u16,
+    pub show_meters: bool,
+    pub per_core_meters: bool,
+    pub heat_colors: bool,
+    /// Pause re-sorting while the pointer hovers the table.
+    pub hover_freeze: bool,
+    pub confirm_signals: bool,
+    /// Offer SIGKILL when a terminated process is still alive after this long.
+    pub escalate_after_secs: u64,
+}
+
+impl Default for ExplorerSettings {
+    fn default() -> Self {
+        Self {
+            preset: crate::procs::columns::Preset::Overview,
+            preset_columns: HashMap::new(),
+            column_widths: HashMap::new(),
+            sort_column: None,
+            sort_descending: true,
+            tree: false,
+            refresh_ms: 1500,
+            hide_kernel_threads: true,
+            only_mine: false,
+            net_active_only: false,
+            dock: DockPosition::Bottom,
+            dock_size: 14,
+            show_meters: true,
+            per_core_meters: true,
+            heat_colors: true,
+            hover_freeze: true,
+            confirm_signals: true,
+            escalate_after_secs: 5,
+        }
+    }
+}
+
+impl ExplorerSettings {
+    pub fn columns_for(
+        &self,
+        preset: crate::procs::columns::Preset,
+    ) -> Vec<crate::procs::columns::ColumnId> {
+        self.preset_columns
+            .get(preset.label())
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .unwrap_or_else(|| preset.default_columns())
+    }
 }
 
 fn default_auto_restore() -> bool {
@@ -63,6 +150,8 @@ impl Default for Config {
             preferred_socket_mapper: None,
             filtered_interfaces: None, // Show all by default
             traffic_view_mode: None,   // Use default (All) if not set
+            explorer: ExplorerSettings::default(),
+            watch_rules: Vec::new(),
         }
     }
 }
@@ -153,6 +242,7 @@ mod tests {
             1234,
             SavedThrottle {
                 process_name: "firefox".to_string(),
+                exe: None,
                 upload_limit: Some(1000000),
                 download_limit: Some(5000000),
             },

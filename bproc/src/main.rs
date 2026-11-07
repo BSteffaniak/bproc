@@ -281,6 +281,7 @@ mod monitor {
 }
 
 mod process;
+mod procs;
 #[cfg(any(feature = "monitor-pnet", test))]
 mod traffic_classifier;
 mod tui_runtime;
@@ -655,11 +656,22 @@ async fn main() -> Result<()> {
         return run_cli_mode(&args).await;
     }
 
-    // Create app state
-    let mut app = AppState::new();
-
     // Load config FIRST to get backend preferences
     let config = config::Config::load().unwrap_or_default();
+
+    // Create app state
+    let mut app = AppState::new();
+    app.explorer =
+        ui::explorer::ExplorerState::new(config.explorer.clone(), config.watch_rules.clone());
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } != 0 {
+        app.explorer.network_note =
+            Some("Per-process bandwidth needs packet-capture privileges — run with sudo".into());
+    }
+    #[cfg(not(feature = "monitor-pnet"))]
+    {
+        app.explorer.network_note = Some("Built without network monitoring".into());
+    }
 
     // Load interface filter from config
     if let Some(ref filters) = config.filtered_interfaces {
@@ -770,22 +782,50 @@ async fn main() -> Result<()> {
     // Restore throttles before spawning monitor thread
     if !args.no_restore {
         log::info!("Restoring saved throttles...");
-        for (pid, saved_throttle) in config.get_throttles() {
+        // PIDs do not survive restarts: re-target by executable/name instead.
+        let running =
+            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_processes(
+                sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
+            ));
+        for (saved_pid, saved_throttle) in config.get_throttles() {
             let limit = ThrottleLimit {
                 upload_limit: saved_throttle.upload_limit,
                 download_limit: saved_throttle.download_limit,
                 traffic_type: crate::process::TrafficType::All, // Default for restored throttles
             };
-            if let Err(e) =
-                throttle_manager.throttle_process(*pid, saved_throttle.process_name.clone(), &limit)
-            {
-                log::warn!("Failed to restore throttle for PID {}: {}", pid, e);
-            } else {
+            let targets: Vec<i32> = running
+                .processes()
+                .iter()
+                .filter(|(_, p)| {
+                    p.name().to_string_lossy() == saved_throttle.process_name
+                        && match (&saved_throttle.exe, p.exe()) {
+                            (Some(exe), Some(path)) => path.display().to_string() == *exe,
+                            _ => true,
+                        }
+                })
+                .map(|(pid, _)| pid.as_u32() as i32)
+                .collect();
+            if targets.is_empty() {
                 log::info!(
-                    "Restored throttle for {} (PID {})",
+                    "Saved throttle for {} (was PID {}) has no running match",
                     saved_throttle.process_name,
-                    pid
+                    saved_pid
                 );
+            }
+            for pid in targets {
+                if let Err(e) = throttle_manager.throttle_process(
+                    pid,
+                    saved_throttle.process_name.clone(),
+                    &limit,
+                ) {
+                    log::warn!("Failed to restore throttle for PID {}: {}", pid, e);
+                } else {
+                    log::info!(
+                        "Restored throttle for {} (PID {})",
+                        saved_throttle.process_name,
+                        pid
+                    );
+                }
             }
         }
     } else {
@@ -798,8 +838,13 @@ async fn main() -> Result<()> {
     });
     log::info!("Spawned background monitoring thread");
 
+    let refresh = std::time::Duration::from_millis(config.explorer.refresh_ms.max(250));
+    let (collector, procs) = crate::procs::collector::spawn(refresh);
+
     // Run the app with channel receivers
     tui_runtime::run(tui_runtime::Startup {
+        collector,
+        procs,
         app,
         manager: throttle_manager,
         config,

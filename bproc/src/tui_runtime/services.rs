@@ -30,6 +30,11 @@ pub(super) enum Effect {
         filters: Option<Vec<String>>,
         traffic: Option<TrafficType>,
     },
+    /// Persist explorer preferences and watch rules.
+    Explorer {
+        settings: crate::config::ExplorerSettings,
+        rules: Vec<crate::procs::watch::WatchRule>,
+    },
     Refresh,
     Shutdown {
         filters: Option<Vec<String>>,
@@ -347,6 +352,12 @@ impl Owner {
                     self.persist()?;
                     Ok(None)
                 }
+                Effect::Explorer { settings, rules } => {
+                    self.config.explorer = settings;
+                    self.config.watch_rules = rules;
+                    self.persist()?;
+                    Ok(None)
+                }
                 Effect::Refresh => Ok(None),
                 Effect::Shutdown { filters, traffic } => {
                     self.config.filtered_interfaces = filters;
@@ -357,6 +368,7 @@ impl Owner {
                             self.config.set_throttle(
                                 pid,
                                 config::SavedThrottle {
+                                    exe: crate::procs::actions::exe_path(pid),
                                     process_name: throttle.process_name,
                                     upload_limit: throttle.upload_limit,
                                     download_limit: throttle.download_limit,
