@@ -818,19 +818,24 @@ fn net_columns_drop_first_only_when_capture_is_off() {
         net_available: false,
         ..LayoutHints::default()
     };
-    let width = 7 + 1 + 8 + 1 + 8 + 1 + 24;
+    // Fixed columns need 7+5+7+9 plus 4 gaps; at 40 cells the flexible
+    // column's comfort width (12) forces exactly one fixed column out.
+    let width = 40;
     let ids = kept(&layout_columns_with(&cols, &settings, 0, width, &off));
     assert!(ids.contains(&ColumnId::Started), "{ids:?}");
-    assert!(!ids.contains(&ColumnId::Connections), "{ids:?}");
+    assert_eq!(ids.len(), cols.len() - 1, "{ids:?}");
 }
 
 #[test]
 fn net_column_hint_follows_capture_state() {
     let mut state = state_with(many(3));
     assert!(layout_hints(&state).net_available);
+    let width = (40..120)
+        .find(|&w| render(&mut state, w, 6).row(0).contains("NET"))
+        .expect("NET column appears at some width");
     state.network_note = Some("capture off".into());
     assert!(!layout_hints(&state).net_available);
-    let out = render(&mut state, 78, 6);
+    let out = render(&mut state, width, 6);
     assert!(!out.row(0).contains("NET"), "{}", out.row(0));
 }
 
