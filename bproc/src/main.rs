@@ -1,4 +1,5 @@
 mod backends;
+mod cli;
 mod config;
 mod history;
 mod keybindings;
@@ -367,6 +368,10 @@ struct Args {
     /// BPF attach method: auto (try link, fallback to legacy), link (bpf_link_create), legacy (bpf_prog_attach)
     #[arg(long, value_name = "METHOD")]
     bpf_attach_method: Option<String>,
+
+    /// Headless subcommand (ps, tree, signal, watch); omit to start the TUI
+    #[command(subcommand)]
+    command: Option<cli::Command>,
 }
 
 fn print_available_backends() {
@@ -625,12 +630,16 @@ async fn run_cli_mode(args: &Args) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if std::env::var("RUST_LOG").is_ok() {
         pretty_env_logger::formatted_builder()
             .parse_default_env()
             .init();
+    }
+
+    if let Some(command) = args.command.take() {
+        return cli::run(command).await;
     }
 
     // Initialize BPF configuration
