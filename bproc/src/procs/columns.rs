@@ -262,7 +262,7 @@ impl ColumnId {
             Self::Name => "Process name",
             Self::Command => "Full command line (tree mode draws the hierarchy here)",
             Self::State => "Scheduler state (R running, S sleeping, D disk, T stopped, Z zombie)",
-            Self::Cpu => "CPU usage, percent of one core",
+            Self::Cpu => "CPU usage, percent of one core (can exceed 100 on multicore)",
             Self::Mem => "Resident memory as percent of physical memory",
             Self::Rss => "Resident memory",
             Self::Virt => "Virtual memory size",
@@ -407,7 +407,12 @@ impl ColumnId {
             Self::Nice => s.nice? as f64,
             Self::Priority => s.priority? as f64,
             Self::CpuTime => s.cpu_time_ms as f64,
-            Self::Started => (ctx.now_ms / 1000).saturating_sub(r.key.start_time) as f64,
+            Self::Started => {
+                if r.key.start_time == 0 {
+                    return None;
+                }
+                (ctx.now_ms / 1000).saturating_sub(r.key.start_time) as f64
+            }
             Self::DiskRead => s.disk_read_rate as f64,
             Self::DiskWrite => s.disk_write_rate as f64,
             Self::DiskReadTotal => s.disk_read_total as f64,
@@ -509,21 +514,83 @@ impl ColumnId {
         }
     }
 
-    /// Total order for sorting; ties are broken by the caller (PID).
+    /// True for columns whose values are text (sorted case-insensitively).
+    pub const fn is_text(self) -> bool {
+        matches!(self.align(), Align::Left)
+    }
+
+    /// Precomputed sort key so large views compute each value once per sort.
+    pub fn sort_key(self, row: &Row, ctx: &ColumnCtx) -> SortKey {
+        if !self.is_text() {
+            return SortKey::Num(self.numeric(row, ctx).filter(|v| !v.is_nan()));
+        }
+        let r = &row.entry.record;
+        let text = match self {
+            Self::User => r.user.clone().or_else(|| r.uid.map(|u| u.to_string())),
+            Self::Name => Some(r.name.clone()),
+            Self::Command => Some(r.command()),
+            Self::Tty => r.tty.clone(),
+            Self::Group => r.group.clone(),
+            Self::Exe => r.exe.clone(),
+            _ => Some(self.text(row, ctx)),
+        };
+        SortKey::Text(text.filter(|t| !t.is_empty()).map(|t| t.to_lowercase()))
+    }
+
+    /// Total order for sorting (ascending sense); ties are broken by the
+    /// caller (PID). Missing values order before present ones.
     pub fn compare(self, a: &Row, b: &Row, ctx: &ColumnCtx) -> Ordering {
+        if self.is_text() {
+            let x = self.text(a, ctx).to_lowercase();
+            let y = self.text(b, ctx).to_lowercase();
+            return x.cmp(&y);
+        }
         match (self.numeric(a, ctx), self.numeric(b, ctx)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Some(x), Some(y)) => x.total_cmp(&y),
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
-            (None, None) => {
-                if self.align() == Align::Left {
-                    let x = self.text(a, ctx);
-                    let y = self.text(b, ctx);
-                    x.to_lowercase().cmp(&y.to_lowercase())
-                } else {
-                    Ordering::Equal
+            (None, None) => Ordering::Equal,
+        }
+    }
+}
+
+/// A column value prepared for sorting: numbers compare numerically, text
+/// lowercased. `None` marks a missing value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortKey {
+    Num(Option<f64>),
+    Text(Option<String>),
+}
+
+impl SortKey {
+    /// Compare two keys in the requested direction. Missing values always sort
+    /// last, whatever the direction, so blanks never crowd the top.
+    pub fn cmp_directed(&self, other: &Self, descending: bool) -> Ordering {
+        fn directed<T>(
+            a: Option<T>,
+            b: Option<T>,
+            ord: impl Fn(T, T) -> Ordering,
+            desc: bool,
+        ) -> Ordering {
+            match (a, b) {
+                (Some(x), Some(y)) => {
+                    let o = ord(x, y);
+                    if desc { o.reverse() } else { o }
                 }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
             }
+        }
+        match (self, other) {
+            (Self::Num(a), Self::Num(b)) => {
+                directed(a.as_ref(), b.as_ref(), |x, y| x.total_cmp(y), descending)
+            }
+            (Self::Text(a), Self::Text(b)) => {
+                directed(a.as_deref(), b.as_deref(), |x, y| x.cmp(y), descending)
+            }
+            (Self::Num(_), Self::Text(_)) => Ordering::Less,
+            (Self::Text(_), Self::Num(_)) => Ordering::Greater,
         }
     }
 }
@@ -531,4 +598,188 @@ impl ColumnId {
 /// Stable tiebreak shared by all sorts.
 pub fn tiebreak(a: &ProcessKey, b: &ProcessKey) -> Ordering {
     a.pid.cmp(&b.pid).then(a.start_time.cmp(&b.start_time))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::{ProcessInfo, ThrottleLimit};
+    use crate::procs::model::{ProcState, ProcessEntry, ProcessRecord, ProcessSample};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn default_row() -> Row {
+        Row {
+            entry: ProcessEntry {
+                record: Arc::new(ProcessRecord::default()),
+                sample: ProcessSample::default(),
+            },
+            net: None,
+            exited_at_ms: None,
+        }
+    }
+
+    fn rich_row(pid: i32) -> Row {
+        let mut info = ProcessInfo::new(pid, "x".into());
+        info.download_rate = pid as u64 * 10;
+        info.throttle_limit = Some(ThrottleLimit {
+            download_limit: Some(1024),
+            upload_limit: None,
+            traffic_type: TrafficType::All,
+        });
+        Row {
+            entry: ProcessEntry {
+                record: Arc::new(ProcessRecord {
+                    key: ProcessKey::new(pid, 100),
+                    ppid: Some(1),
+                    name: format!("proc{pid}"),
+                    cmdline: vec!["/bin/x".into(), "ünïcode".into()],
+                    exe: Some("/bin/x".into()),
+                    user: Some("root".into()),
+                    uid: Some(0),
+                    tty: Some("pts/0".into()),
+                    ..Default::default()
+                }),
+                sample: ProcessSample {
+                    state: ProcState::Running,
+                    cpu_percent: pid as f32,
+                    threads: Some(pid as u32),
+                    nice: Some(-(pid % 20)),
+                    open_fds: Some(3),
+                    ..Default::default()
+                },
+            },
+            net: Some(Arc::new(info)),
+            exited_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn filter_keys_are_unique_and_round_trip() {
+        let mut seen = HashSet::new();
+        for &c in ALL_COLUMNS {
+            assert!(
+                seen.insert(c.filter_key()),
+                "duplicate key {}",
+                c.filter_key()
+            );
+            assert_eq!(ColumnId::from_filter_key(c.filter_key()), Some(c));
+            assert_eq!(
+                ColumnId::from_filter_key(&c.filter_key().to_uppercase()),
+                Some(c)
+            );
+            assert!(!c.title().is_empty());
+            assert!(!c.description().is_empty());
+        }
+        assert_eq!(ColumnId::from_filter_key("nope"), None);
+        assert_eq!(seen.len(), ALL_COLUMNS.len());
+    }
+
+    #[test]
+    fn registry_is_complete_and_consistent() {
+        let unique: HashSet<_> = ALL_COLUMNS.iter().collect();
+        assert_eq!(unique.len(), ALL_COLUMNS.len());
+        assert!(ALL_COLUMNS.contains(&ColumnId::Throttle));
+        for &c in ALL_COLUMNS {
+            if c.is_flexible() {
+                assert_eq!(c.width(), 0);
+            } else {
+                assert!(c.width() as usize >= c.title().chars().count(), "{c:?}");
+            }
+            if c.is_text() {
+                assert!(c.numeric(&rich_row(5), &ColumnCtx::default()).is_none());
+                assert_eq!(c.align(), Align::Left);
+            }
+        }
+        for preset in Preset::ALL {
+            let cols = preset.default_columns();
+            assert!(cols.contains(&ColumnId::Pid));
+            assert!(cols.contains(&preset.default_sort()), "{preset:?}");
+        }
+    }
+
+    #[test]
+    fn text_never_panics_on_sparse_rows() {
+        let ctx = ColumnCtx {
+            now_ms: u64::MAX,
+            ..ColumnCtx::default()
+        };
+        for &c in ALL_COLUMNS {
+            let _ = c.text(&default_row(), &ColumnCtx::default());
+            let _ = c.text(&default_row(), &ctx);
+            let _ = c.text(&rich_row(7), &ctx);
+            let _ = c.numeric(&default_row(), &ctx);
+            let _ = c.sort_key(&default_row(), &ctx);
+        }
+        assert_eq!(ColumnId::Started.text(&default_row(), &ctx), "–");
+        assert_eq!(ColumnId::Started.numeric(&default_row(), &ctx), None);
+        assert_eq!(ColumnId::Throttle.text(&rich_row(1), &ctx), "1.0K/∞");
+    }
+
+    #[test]
+    fn compare_is_a_total_order() {
+        let ctx = ColumnCtx::default();
+        let rows = [default_row(), rich_row(3), rich_row(12), rich_row(3)];
+        for &c in ALL_COLUMNS {
+            for a in &rows {
+                assert_eq!(c.compare(a, a, &ctx), Ordering::Equal, "{c:?} reflexive");
+                for b in &rows {
+                    assert_eq!(
+                        c.compare(a, b, &ctx),
+                        c.compare(b, a, &ctx).reverse(),
+                        "{c:?}"
+                    );
+                    for d in &rows {
+                        if c.compare(a, b, &ctx) != Ordering::Greater
+                            && c.compare(b, d, &ctx) != Ordering::Greater
+                        {
+                            assert_ne!(
+                                c.compare(a, d, &ctx),
+                                Ordering::Greater,
+                                "{c:?} transitive"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_keys_put_missing_last() {
+        let present = SortKey::Num(Some(1.0));
+        let missing = SortKey::Num(None);
+        for desc in [false, true] {
+            assert_eq!(present.cmp_directed(&missing, desc), Ordering::Less);
+            assert_eq!(missing.cmp_directed(&present, desc), Ordering::Greater);
+            assert_eq!(missing.cmp_directed(&missing, desc), Ordering::Equal);
+        }
+        let a = SortKey::Text(Some("alpha".into()));
+        let b = SortKey::Text(Some("beta".into()));
+        assert_eq!(a.cmp_directed(&b, false), Ordering::Less);
+        assert_eq!(a.cmp_directed(&b, true), Ordering::Greater);
+        assert_eq!(
+            ColumnId::Name.sort_key(&rich_row(4), &ColumnCtx::default()),
+            SortKey::Text(Some("proc4".into()))
+        );
+        assert_eq!(
+            ColumnId::Tty.sort_key(&default_row(), &ColumnCtx::default()),
+            SortKey::Text(None)
+        );
+        let mut nan = default_row();
+        nan.entry.sample.cpu_percent = f32::NAN;
+        assert_eq!(
+            ColumnId::Cpu.sort_key(&nan, &ColumnCtx::default()),
+            SortKey::Num(None)
+        );
+    }
+
+    #[test]
+    fn default_directions() {
+        assert!(ColumnId::Cpu.default_descending());
+        assert!(ColumnId::Rss.default_descending());
+        assert!(!ColumnId::Pid.default_descending());
+        assert!(!ColumnId::Name.default_descending());
+        assert!(!ColumnId::Nice.default_descending());
+    }
 }
