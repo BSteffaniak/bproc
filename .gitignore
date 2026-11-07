@@ -4,3 +4,6 @@ target/
 .direnv/
 
 __pycache__/
+
+# Claude Code local state (worktrees, settings)
+.claude/
