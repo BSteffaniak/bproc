@@ -36,9 +36,13 @@ pub(super) enum Effect {
         rules: Vec<crate::procs::watch::WatchRule>,
     },
     Refresh,
+    /// Final save. Carries the explorer state too, so a SaveSettings that was
+    /// rejected while the service was busy still reaches disk on exit.
     Shutdown {
         filters: Option<Vec<String>>,
         traffic: Option<TrafficType>,
+        settings: Box<crate::config::ExplorerSettings>,
+        rules: Vec<crate::procs::watch::WatchRule>,
     },
 }
 pub(super) struct ServiceResult {
@@ -359,16 +363,26 @@ impl Owner {
                     Ok(None)
                 }
                 Effect::Refresh => Ok(None),
-                Effect::Shutdown { filters, traffic } => {
+                Effect::Shutdown {
+                    filters,
+                    traffic,
+                    settings,
+                    rules,
+                } => {
                     self.config.filtered_interfaces = filters;
                     self.config.traffic_view_mode = traffic;
+                    self.config.explorer = *settings;
+                    self.config.watch_rules = rules;
                     if self.save {
                         self.config.clear_throttles();
                         for (pid, throttle) in self.manager.get_all_throttles() {
+                            let identity = saved_identity(pid);
                             self.config.set_throttle(
                                 pid,
                                 config::SavedThrottle {
-                                    exe: crate::procs::actions::exe_path(pid),
+                                    exe: identity.exe,
+                                    start_time: identity.start_time,
+                                    cmdline: identity.cmdline,
                                     process_name: throttle.process_name,
                                     upload_limit: throttle.upload_limit,
                                     download_limit: throttle.download_limit,
@@ -392,6 +406,43 @@ impl Owner {
             backend: self.backend(),
             throttles: self.manager.get_all_throttles(),
         }
+    }
+}
+
+/// What a saved throttle remembers about its process so a restart can find
+/// exactly that process again.
+#[derive(Debug, Default)]
+struct SavedIdentity {
+    exe: Option<String>,
+    start_time: Option<u64>,
+    cmdline: Option<String>,
+}
+
+fn saved_identity(pid: i32) -> SavedIdentity {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Some(start_time) = crate::procs::actions::current_start_time(pid) else {
+        return SavedIdentity::default();
+    };
+    let mut system = System::new();
+    let sys_pid = Pid::from_u32(pid as u32);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        false,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let cmd: Vec<String> = system
+        .process(sys_pid)
+        .map(|p| {
+            p.cmd()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    SavedIdentity {
+        exe: crate::procs::actions::exe_path(pid),
+        start_time: Some(start_time),
+        cmdline: (!cmd.is_empty()).then(|| cmd.join(" ")),
     }
 }
 
@@ -472,6 +523,8 @@ mod tests {
             service.finish(Effect::Shutdown {
                 filters: None,
                 traffic: None,
+                settings: Default::default(),
+                rules: vec![],
             }),
         )
         .await
@@ -527,6 +580,42 @@ mod tests {
         assert!(!result.dialog.unwrap().is_upload);
         assert!(!result.close_throttle);
         assert_eq!(owner.manager.get_default_backends(), (None, None));
+    }
+    #[test]
+    fn shutdown_persists_explorer_state_even_after_a_rejected_save() {
+        let (monitor, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut owner = Owner {
+            manager: ThrottleManager::new(None, None),
+            config: config::Config::default(),
+            monitor,
+            save: false,
+            pending_resolution: None,
+            socket_mapper: None,
+            socket_mappers: vec![],
+        };
+        let settings = crate::config::ExplorerSettings {
+            tree: true,
+            ..Default::default()
+        };
+        let rule = crate::procs::watch::WatchRule::new(
+            9,
+            "hot",
+            crate::procs::watch::WatchTarget::Any,
+            crate::procs::watch::WatchMetric::CpuPercent,
+            crate::procs::watch::Comparison::Above,
+            90.0,
+        );
+        owner.apply(
+            1,
+            Effect::Shutdown {
+                filters: None,
+                traffic: None,
+                settings: Box::new(settings.clone()),
+                rules: vec![rule],
+            },
+        );
+        assert_eq!(owner.config.explorer, settings);
+        assert_eq!(owner.config.watch_rules.len(), 1);
     }
     #[test]
     fn admission_preserves_mutation_then_preferences_then_refresh() {

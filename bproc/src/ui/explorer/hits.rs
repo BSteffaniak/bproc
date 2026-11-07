@@ -160,6 +160,7 @@ impl HitMap {
             .find(|(_, h)| pred(h))
             .map(|(r, _)| *r)
     }
+    #[allow(dead_code)] // inspected by tests across the explorer
     pub fn committed(&self) -> &[(Rect, Hit)] {
         &self.committed
     }

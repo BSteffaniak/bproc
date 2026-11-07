@@ -1,5 +1,6 @@
 //! BMUX owns scheduling, terminal ingress, and committed presentation. All kernel/config
 //! effects are serialized by `services`; update only performs local state transitions.
+mod export_file;
 mod services;
 use crate::backends::throttle::{BackendInfo, ThrottleManager};
 use crate::{
@@ -411,6 +412,8 @@ enum Message {
     EffectFailed(String),
     Procs(crate::procs::ProcSnapshot),
     DeepDetail(Box<crate::procs::detail::DeepDetail>),
+    /// The deep-detail scan for this process panicked or was cancelled.
+    DeepDetailFailed(crate::procs::ProcessKey),
     Report(crate::procs::actions::ActionReport),
     Exported(std::result::Result<std::path::PathBuf, String>),
 }
@@ -428,8 +431,83 @@ struct Application {
     in_flight_effects: usize,
     procs: Option<tokio::sync::mpsc::Receiver<crate::procs::ProcSnapshot>>,
     collector: Option<std::sync::mpsc::Sender<crate::procs::collector::CollectorCommand>>,
+    /// Deep-detail load currently running; a new snapshot never restarts it.
+    detail_in_flight: Option<crate::procs::ProcessKey>,
+    /// Identity of the process the throttle dialog was opened for.
+    throttle_target: Option<crate::procs::ProcessKey>,
 }
 impl Application {
+    /// Route a service / legacy notice: failures become error toasts,
+    /// completed throttle changes success toasts, everything else an
+    /// expiring status-line flash.
+    fn notify(&mut self, status: String) {
+        use ui::explorer::toasts::Severity;
+        if status.starts_with("Failed") {
+            self.app.explorer.toasts.push(Severity::Error, status);
+        } else if status.starts_with("Throttle applied")
+            || status.starts_with("Throttle removed")
+            || status.starts_with("Backend →")
+        {
+            self.app.explorer.toasts.push(Severity::Success, status);
+        } else {
+            self.app.explorer.flash(status);
+        }
+    }
+    /// The live identity behind a throttle target PID, refusing exited and
+    /// reused PIDs.
+    fn throttle_identity(&self, pid: i32) -> std::result::Result<crate::procs::ProcessKey, String> {
+        let row = self
+            .app
+            .explorer
+            .store
+            .rows()
+            .iter()
+            .find(|r| r.key().pid == pid && !r.is_ghost());
+        let Some(row) = row else {
+            return Err(format!("PID {pid} has exited"));
+        };
+        let key = row.key();
+        crate::procs::actions::verify_identity(key)
+            .map(|()| key)
+            .map_err(|e| format!("{} (PID {pid}): {e}", row.name()))
+    }
+    /// Re-check the throttle target right before a throttle is applied.
+    fn throttle_still_valid(&mut self, pid: i32) -> bool {
+        let verified = match self.throttle_target {
+            Some(key) if key.pid == pid => {
+                crate::procs::actions::verify_identity(key).map_err(|e| format!("PID {pid}: {e}"))
+            }
+            _ => Err(format!(
+                "PID {pid} is no longer the process the dialog was opened for"
+            )),
+        };
+        match verified {
+            Ok(()) => true,
+            Err(error) => {
+                self.app.dismiss(ui::Layer::Compatibility);
+                self.app.dismiss(ui::Layer::Throttle);
+                self.throttle_target = None;
+                self.notify(format!("Failed: throttle not applied — {error}"));
+                false
+            }
+        }
+    }
+    /// Queue effects from legacy input, re-verifying throttle targets.
+    fn queue_effects(&mut self, effects: Vec<Effect>, update: &mut Update<Message>) -> Result<()> {
+        for effect in effects {
+            let pid = match &effect {
+                Effect::Apply(request) | Effect::Resolve { request, .. } => Some(request.pid),
+                _ => None,
+            };
+            if let Some(pid) = pid
+                && !self.throttle_still_valid(pid)
+            {
+                continue;
+            }
+            self.effect(effect, update)?;
+        }
+        Ok(())
+    }
     /// True while a legacy (network) modal or interface view owns input.
     fn legacy_active(&self) -> bool {
         let app = &self.app;
@@ -475,6 +553,13 @@ impl Application {
                     }));
                 }
                 UiRequest::LoadDetail(key) => {
+                    // A scan slower than the refresh interval must finish
+                    // instead of being cancelled (and leaking its blocking
+                    // thread) by every snapshot.
+                    if self.detail_in_flight == Some(key) {
+                        continue;
+                    }
+                    self.detail_in_flight = Some(key);
                     let previous = self
                         .app
                         .explorer
@@ -488,9 +573,11 @@ impl Application {
                             let detail = tokio::task::spawn_blocking(move || {
                                 crate::procs::detail::collect(key, previous.as_ref())
                             })
-                            .await
-                            .ok()?;
-                            Some(Message::DeepDetail(Box::new(detail)))
+                            .await;
+                            Some(match detail {
+                                Ok(detail) => Message::DeepDetail(Box::new(detail)),
+                                Err(_) => Message::DeepDetailFailed(key),
+                            })
                         },
                     ));
                 }
@@ -522,8 +609,7 @@ impl Application {
                     );
                     update.commands.push(Command::concurrent(async move {
                         let written = tokio::task::spawn_blocking(move || {
-                            crate::procs::export::write(&contents, format, None)
-                                .map_err(|e| e.to_string())
+                            export_file::write(&contents, format).map_err(|e| e.to_string())
                         })
                         .await
                         .ok()?;
@@ -534,6 +620,16 @@ impl Application {
                 UiRequest::Quit => update.lifecycle = Lifecycle::Exit,
                 UiRequest::Legacy(legacy) => match legacy {
                     LegacyRequest::OpenThrottle { pid, name } => {
+                        let key = match self.throttle_identity(pid) {
+                            Ok(key) => key,
+                            Err(error) => {
+                                self.app
+                                    .explorer
+                                    .flash(format!("Cannot throttle {name}: {error}"));
+                                continue;
+                            }
+                        };
+                        self.throttle_target = Some(key);
                         self.app.throttle_dialog.reset();
                         self.app.throttle_dialog.target_pid = Some(pid);
                         self.app.throttle_dialog.target_name = Some(name);
@@ -542,7 +638,7 @@ impl Application {
                     }
                     LegacyRequest::RemoveThrottle { pid, name } => {
                         if self.throttles.contains_key(&pid) {
-                            self.app.status_message = "Removing throttle...".into();
+                            self.app.explorer.flash("Removing throttle…");
                             self.effect(Effect::Remove { pid, name }, update)?;
                         } else {
                             self.app
@@ -564,13 +660,17 @@ impl Application {
                         }
                     }
                     LegacyRequest::Graph => {
+                        // History is recorded for every process, whatever the
+                        // legacy interface filter hides.
                         let pid = self.app.explorer.table.selected().map(|k| k.pid);
-                        match pid
-                            .and_then(|pid| self.app.process_list.iter().position(|p| p.pid == pid))
-                        {
-                            Some(index) => {
-                                self.app.selected_index = Some(index);
-                                self.app.list_state.select(Some(index));
+                        match pid.filter(|pid| {
+                            self.app
+                                .history
+                                .get_history(*pid)
+                                .is_some_and(|h| !h.samples.is_empty())
+                        }) {
+                            Some(pid) => {
+                                self.app.graph_pid = Some(pid);
                                 self.app.show_graph = true;
                             }
                             None => self
@@ -585,6 +685,8 @@ impl Application {
                             self.app.build_backend_items(&backend);
                             self.app.reset_backend_info_scroll();
                             self.app.show_backend_info = true;
+                        } else {
+                            self.app.explorer.flash("Backends are still loading…");
                         }
                     }
                 },
@@ -636,15 +738,16 @@ impl Application {
     fn effect(&mut self, effect: Effect, update: &mut Update<Message>) -> Result<()> {
         // Bound accepted-but-unconsumed receipts as well as the service's FIFO.
         if self.in_flight_effects >= 32 {
-            self.app.status_message =
-                "Failed to queue action: service busy; retry after pending work completes".into();
+            self.notify(
+                "Failed to queue action: service busy; retry after pending work completes".into(),
+            );
             return Ok(());
         }
         // Admission happens now, not when command futures happen to be polled.
         let reply = match self.service.request(effect) {
             Ok(reply) => reply,
             Err(error) => {
-                self.app.status_message = format!("Failed to queue action: {error:#}");
+                self.notify(format!("Failed to queue action: {error:#}"));
                 return Ok(());
             }
         };
@@ -739,9 +842,7 @@ impl Program for Application {
                 if identity != self.dialog_identity() {
                     self.dialog_generation += 1;
                 }
-                for effect in effects {
-                    self.effect(effect, &mut update)?;
-                }
+                self.queue_effects(effects, &mut update)?;
             }
             RuntimeEvent::Message(Message::Monitor(mut data)) => {
                 for (pid, process) in &mut data.process_map {
@@ -763,6 +864,19 @@ impl Program for Application {
                 if let Some(backend) = &mut self.backend {
                     backend.active_socket_mapper = Some(data.socket_mapper_name);
                     backend.socket_mapper_capabilities = Some(data.socket_mapper_capabilities);
+                }
+                // Attributed traffic proves capture works (e.g. bpf group
+                // access without root): drop the privilege guess.
+                if self.app.explorer.network_note.as_deref()
+                    == Some(ui::explorer::CAPTURE_PRIVILEGE_NOTE)
+                    && data.process_map.values().any(|p| {
+                        p.download_rate > 0
+                            || p.upload_rate > 0
+                            || p.total_download > 0
+                            || p.total_upload > 0
+                    })
+                {
+                    self.app.explorer.network_note = None;
                 }
                 self.app.explorer.apply_network(&data.process_map);
                 self.app.update_processes(data.process_map);
@@ -788,7 +902,7 @@ impl Program for Application {
                     self.throttles = result.throttles;
                     self.backend = Some(result.backend);
                     if let Some(status) = result.status {
-                        self.app.status_message = status;
+                        self.notify(status);
                     }
                     if generation == self.dialog_generation
                         && dialog_pid == self.app.throttle_dialog.target_pid
@@ -813,7 +927,15 @@ impl Program for Application {
                 self.app.explorer.apply_snapshot(snapshot);
                 self.drain_explorer(&mut update)?;
             }
+            RuntimeEvent::Message(Message::DeepDetailFailed(key)) => {
+                if self.detail_in_flight == Some(key) {
+                    self.detail_in_flight = None;
+                }
+            }
             RuntimeEvent::Message(Message::DeepDetail(detail)) => {
+                if self.detail_in_flight == Some(detail.key) {
+                    self.detail_in_flight = None;
+                }
                 self.app.explorer.apply_detail(*detail);
             }
             RuntimeEvent::Message(Message::Report(report)) => {
@@ -823,11 +945,15 @@ impl Program for Application {
             RuntimeEvent::Message(Message::Exported(result)) => {
                 use ui::explorer::toasts::Severity;
                 match result {
-                    Ok(path) => self
-                        .app
-                        .explorer
-                        .toasts
-                        .push(Severity::Success, format!("Exported to {}", path.display())),
+                    Ok(path) => {
+                        let path = path.display().to_string();
+                        self.app.explorer.toasts.push_action(
+                            Severity::Success,
+                            format!("Exported to {path}"),
+                            "Copy path",
+                            ui::explorer::UiRequest::Copy(path),
+                        );
+                    }
                     Err(error) => self
                         .app
                         .explorer
@@ -919,6 +1045,8 @@ pub(super) async fn run(startup: Startup) -> Result<()> {
         in_flight_effects: 0,
         procs: Some(procs),
         collector: Some(collector.commands.clone()),
+        detail_in_flight: None,
+        throttle_target: None,
     };
     let terminal = bmux_tui::terminal::Terminal::new(
         std::io::stdout(),
@@ -984,6 +1112,8 @@ pub(super) async fn run(startup: Startup) -> Result<()> {
         .finish(Effect::Shutdown {
             filters: output.program.app.active_interface_filters.clone(),
             traffic: output.program.config.traffic_view_mode,
+            settings: Box::new(output.program.app.explorer.settings.clone()),
+            rules: output.program.app.explorer.watch.rules.clone(),
         })
         .await;
     let save_error = match shutdown {
@@ -1110,7 +1240,21 @@ mod tests {
             in_flight_effects: 0,
             procs: None,
             collector: None,
+            detail_in_flight: None,
+            throttle_target: None,
         }
+    }
+    /// Text of the newest error toast (service failures are toasts now).
+    fn error_toast(program: &Application) -> Option<String> {
+        program
+            .app
+            .explorer
+            .toasts
+            .items
+            .iter()
+            .rev()
+            .find(|t| t.severity == ui::explorer::toasts::Severity::Error)
+            .map(|t| t.text.clone())
     }
     fn key(key: KeyCode) -> RuntimeEvent<Message> {
         RuntimeEvent::Terminal(Event::Key(bmux_keyboard::KeyStroke::simple(key)))
@@ -1354,7 +1498,7 @@ mod tests {
         );
         program.update(key(KeyCode::Space)).unwrap();
         // The disconnected test service rejects the queued SelectBackend effect.
-        assert!(program.app.status_message.starts_with("Failed to queue"));
+        assert!(error_toast(&program).is_some_and(|t| t.starts_with("Failed to queue")));
         // Clicking a row selects it; clicking outside the panel closes it.
         paint_commit(&mut program);
         let (area, line) = program
@@ -1408,6 +1552,153 @@ mod tests {
         assert!(program.app.show_graph);
         program.update(left_click(0, 0)).unwrap();
         assert!(!program.app.show_graph);
+    }
+    fn request_graph(program: &mut Application, pid: i32) {
+        program
+            .app
+            .explorer
+            .table
+            .select(crate::procs::ProcessKey::new(pid, 0));
+        program
+            .app
+            .explorer
+            .request(ui::explorer::UiRequest::Legacy(
+                ui::explorer::LegacyRequest::Graph,
+            ));
+        let mut update = Update::none();
+        program.drain_explorer(&mut update).unwrap();
+    }
+    #[test]
+    fn graph_opens_for_processes_the_interface_filter_hides() {
+        let mut program = application();
+        program.app.history.update_at(1, 10, "curl".into(), 100, 5);
+        // "Show nothing" filter: the legacy list is empty.
+        program.app.active_interface_filters = Some(vec![]);
+        program.app.update_processes([(10, on_en0(10))].into());
+        assert!(program.app.process_list.is_empty());
+        request_graph(&mut program, 10);
+        assert!(program.app.show_graph);
+        assert_eq!(program.app.graph_pid, Some(10));
+        // A non-matching interface filter behaves the same.
+        program.app.dismiss(ui::Layer::Graph);
+        assert_eq!(program.app.graph_pid, None);
+        program.app.active_interface_filters = Some(vec!["utun3".into()]);
+        program.app.update_processes([(10, on_en0(10))].into());
+        request_graph(&mut program, 10);
+        assert!(program.app.show_graph);
+    }
+    #[test]
+    fn graph_follows_a_process_that_drops_out_for_a_sample() {
+        let mut program = application();
+        program.app.history.update_at(1, 10, "curl".into(), 100, 5);
+        program.app.update_processes([(10, on_en0(10))].into());
+        request_graph(&mut program, 10);
+        program.app.update_processes(Default::default());
+        assert_eq!(program.app.graph_pid, Some(10));
+        program.app.update_processes([(10, on_en0(10))].into());
+        assert_eq!(program.app.graph_pid, Some(10));
+        assert!(program.app.show_graph);
+    }
+    #[test]
+    fn graph_without_history_explains_instead_of_opening() {
+        let mut program = application();
+        request_graph(&mut program, 99);
+        assert!(!program.app.show_graph);
+        assert!(program.app.explorer.flash.is_some());
+    }
+    #[test]
+    fn deep_detail_is_not_restarted_while_loading_the_same_process() {
+        let mut program = application();
+        let key = crate::procs::ProcessKey::new(std::process::id() as i32, 0);
+        let mut update = Update::none();
+        for _ in 0..3 {
+            program
+                .app
+                .explorer
+                .request(ui::explorer::UiRequest::LoadDetail(key));
+            program.drain_explorer(&mut update).unwrap();
+        }
+        assert_eq!(update.commands.len(), 1);
+        program
+            .update(RuntimeEvent::Message(Message::DeepDetailFailed(key)))
+            .unwrap();
+        program
+            .app
+            .explorer
+            .request(ui::explorer::UiRequest::LoadDetail(key));
+        program.drain_explorer(&mut update).unwrap();
+        assert_eq!(update.commands.len(), 2, "reloads once the scan finished");
+    }
+    #[test]
+    fn throttle_dialog_refuses_exited_processes_and_verifies_before_applying() {
+        let mut program = application();
+        program
+            .app
+            .explorer
+            .request(ui::explorer::UiRequest::Legacy(
+                ui::explorer::LegacyRequest::OpenThrottle {
+                    pid: 999_999,
+                    name: "gone".into(),
+                },
+            ));
+        let mut update = Update::none();
+        program.drain_explorer(&mut update).unwrap();
+        assert!(!program.app.show_throttle_dialog);
+        // A dialog whose recorded identity no longer matches never applies.
+        program.app.show_throttle_dialog = true;
+        program.app.throttle_dialog.target_pid = Some(999_999);
+        program.throttle_target = Some(crate::procs::ProcessKey::new(999_999, 1));
+        program.app.throttle_dialog.download_input = "100".into();
+        program.update(key(KeyCode::Enter)).unwrap();
+        assert!(!program.app.show_throttle_dialog);
+        assert!(error_toast(&program).is_some_and(|t| t.contains("throttle not applied")));
+    }
+    #[test]
+    fn service_statuses_become_toasts_and_flashes() {
+        use ui::explorer::toasts::Severity;
+        let mut program = application();
+        program.notify("Throttle applied to curl (PID 1)".into());
+        program.notify("Failed: boom".into());
+        program.notify("Switching…".into());
+        let severities: Vec<_> = program
+            .app
+            .explorer
+            .toasts
+            .items
+            .iter()
+            .map(|t| t.severity)
+            .collect();
+        assert_eq!(severities, vec![Severity::Success, Severity::Error]);
+        assert!(
+            program
+                .app
+                .explorer
+                .flash
+                .as_ref()
+                .is_some_and(|(m, _)| m == "Switching…")
+        );
+    }
+    #[test]
+    fn closing_interfaces_without_a_filter_leaves_no_stale_notice() {
+        let mut program = application();
+        program.app.view_mode = ui::ViewMode::InterfaceList;
+        program.app.dismiss(ui::Layer::InterfaceList);
+        assert!(program.app.status_message.is_empty());
+        program.app.active_interface_filters = Some(vec!["en0".into()]);
+        program.app.view_mode = ui::ViewMode::InterfaceList;
+        program.app.dismiss(ui::Layer::InterfaceList);
+        assert!(program.app.status_message.contains("en0"));
+        // Drawing turns the notice into an expiring flash.
+        paint_commit(&mut program);
+        assert!(program.app.status_message.is_empty());
+        assert!(
+            program
+                .app
+                .explorer
+                .flash
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("en0"))
+        );
     }
     #[test]
     fn interface_modal_mouse_selects_toggles_and_dismisses() {
@@ -1625,7 +1916,7 @@ mod tests {
         assert!(program.app.show_throttle_dialog);
         assert_eq!(program.app.throttle_dialog.target_pid, Some(20));
         assert!(!program.app.show_backend_compatibility_dialog);
-        assert_eq!(program.app.status_message, "Failed old action");
+        assert_eq!(error_toast(&program).as_deref(), Some("Failed old action"));
     }
     #[test]
     fn queued_monitor_samples_keep_acquisition_timestamps_and_all_history_updates() {
@@ -1666,6 +1957,6 @@ mod tests {
         program.effect(Effect::Refresh, &mut update).unwrap();
         assert!(update.commands.is_empty());
         assert_eq!(update.lifecycle, Lifecycle::Continue);
-        assert!(program.app.status_message.starts_with("Failed to queue"));
+        assert!(error_toast(&program).is_some_and(|t| t.starts_with("Failed to queue")));
     }
 }

@@ -73,8 +73,8 @@ fn graph_preserves_boxed_legend_full_plot_extent_and_border_under_instructions()
     app.history.update_at(2, 1, "graph".into(), 2048, 256);
     let buffer = paint(&mut app, 120, 40);
     assert_eq!(buffer.get(Point::new(6, 32)).unwrap().symbol, "│");
-    assert_eq!(buffer.get(Point::new(103, 7)).unwrap().symbol, "┌");
-    assert_eq!(buffer.get(Point::new(112, 10)).unwrap().symbol, "┘");
+    assert_eq!(buffer.get(Point::new(103, 7)).unwrap().symbol, "╭");
+    assert_eq!(buffer.get(Point::new(112, 10)).unwrap().symbol, "╯");
     assert_eq!(buffer.get(Point::new(7, 7)).unwrap().symbol, "B");
 }
 

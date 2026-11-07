@@ -439,6 +439,24 @@ fn terminal_width() -> Option<usize> {
     None
 }
 
+/// Text safe to print to a terminal: control characters (C0, DEL, C1) and
+/// bidi overrides/isolates become `?`, as procps does, so another user's argv
+/// cannot inject escape sequences (OSC 52 clipboard writes, screen clears,
+/// title changes) or reorder what is displayed.
+pub fn printable(s: &str) -> std::borrow::Cow<'_, str> {
+    let unsafe_char =
+        |c: char| c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if s.chars().any(unsafe_char) {
+        std::borrow::Cow::Owned(
+            s.chars()
+                .map(|c| if unsafe_char(c) { '?' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
@@ -477,7 +495,7 @@ pub fn render_table(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let text = c.text(row, ctx);
+                        let text = printable(&c.text(row, ctx)).into_owned();
                         if Some(i) == tree_column && !view.tree_prefix.is_empty() {
                             format!("{}{text}", view.tree_prefix)
                         } else {
@@ -549,7 +567,12 @@ pub fn render_table(
         out.push('\n');
         out
     };
-    let mut out = line(&mut columns.iter().map(|c| c.title().to_string()).enumerate());
+    let mut out = line(
+        &mut columns
+            .iter()
+            .map(|c| printable(c.title()).into_owned())
+            .enumerate(),
+    );
     for row in cells {
         out.push_str(&line(&mut row.into_iter().enumerate()));
     }
@@ -561,7 +584,13 @@ pub fn render_table(
 fn signal(args: &SignalArgs) -> Result<()> {
     let start = actions::current_start_time(args.pid)
         .ok_or_else(|| anyhow!("no process with PID {}", args.pid))?;
-    let store = sample_store(None).ok();
+    let store = match sample_store(None) {
+        Ok(store) => Some(store),
+        // Without a process table the children cannot be found; signalling
+        // only the root would silently leave them running.
+        Err(e) if args.tree => bail!("cannot enumerate descendants: {e:#}"),
+        Err(_) => None,
+    };
     let key = store
         .as_ref()
         .and_then(|s| s.by_pid(args.pid))
@@ -572,6 +601,11 @@ fn signal(args: &SignalArgs) -> Result<()> {
         && let Some(store) = &store
     {
         targets.extend(store.descendants(&key));
+        eprintln!(
+            "Sending {} to {} process(es)",
+            args.signal.name(),
+            targets.len()
+        );
     }
     let request = ActionRequest::Signal {
         targets,
@@ -588,17 +622,21 @@ fn signal(args: &SignalArgs) -> Result<()> {
     if report.outcomes.len() > 1 {
         for outcome in &report.outcomes {
             match &outcome.result {
-                Ok(()) => println!("  {} ({}) ok", outcome.name, outcome.key.pid),
-                Err(e) => eprintln!("  {} ({}) failed: {e}", outcome.name, outcome.key.pid),
+                Ok(()) => println!("  {} ({}) ok", printable(&outcome.name), outcome.key.pid),
+                Err(e) => eprintln!(
+                    "  {} ({}) failed: {e}",
+                    printable(&outcome.name),
+                    outcome.key.pid
+                ),
             }
         }
     }
     let failed = report.failed().count();
     if failed == 0 {
-        println!("{}", report.summary());
+        println!("{}", printable(&report.summary()));
         Ok(())
     } else {
-        bail!("{}", report.summary())
+        bail!("{}", printable(&report.summary()))
     }
 }
 
@@ -699,17 +737,19 @@ async fn watch(args: &WatchArgs) -> Result<()> {
             }
             eprintln!(
                 "Watching: {} (every {:.1}s, Ctrl+C to stop)",
-                rule.describe(),
+                printable(&rule.describe()),
                 args.interval.as_secs_f64()
             );
             engine.upsert(rule.clone());
             announced = true;
         }
-        for firing in engine.evaluate(&evaluate, &store) {
+        let firings =
+            crate::ui::explorer::guard_firings(engine.evaluate(&evaluate, &store), &store);
+        for firing in firings {
             println!(
                 "[{}] {}",
                 timestamp(evaluate.acquired_at_ms),
-                firing.message
+                printable(&firing.message)
             );
             if let WatchAction::Signal(signal) = firing.action {
                 let request = ActionRequest::Signal {
@@ -717,7 +757,11 @@ async fn watch(args: &WatchArgs) -> Result<()> {
                     signal,
                 };
                 let report = actions::execute(&request, &|_| firing.name.clone());
-                println!("[{}]   {}", timestamp(now_ms()), report.summary());
+                println!(
+                    "[{}]   {}",
+                    timestamp(now_ms()),
+                    printable(&report.summary())
+                );
             }
             fired += 1;
         }
@@ -728,7 +772,7 @@ async fn watch(args: &WatchArgs) -> Result<()> {
         if let WatchTarget::Process { key, name } = &rule.target
             && store.get(key).is_none_or(|r| r.is_ghost())
         {
-            eprintln!("{name} ({}) exited; stopping", key.pid);
+            eprintln!("{} ({}) exited; stopping", printable(name), key.pid);
             break;
         }
     }
@@ -1109,6 +1153,47 @@ mod tests {
             None,
         );
         assert_eq!(out.lines().nth(1), Some("300 └─ zsh"));
+    }
+
+    #[test]
+    fn hostile_argv_cannot_inject_terminal_escapes() {
+        let hostile = ProcessEntry {
+            record: Arc::new(ProcessRecord {
+                key: ProcessKey::new(66, 1000),
+                ppid: Some(1),
+                name: "evil\x1b]0;x\x07".into(),
+                cmdline: vec!["\x1b]52;c;AAAA\x07".into(), "\u{202E}gnp.exe".into()],
+                user: Some("mallory".into()),
+                ..Default::default()
+            }),
+            sample: ProcessSample::default(),
+        };
+        let store = ProcessStore::from_entries(
+            vec![hostile, {
+                let mut e = fixture()
+                    .get(&ProcessKey::new(20, 1000))
+                    .unwrap()
+                    .entry
+                    .clone();
+                e.sample.cpu_percent = 0.0;
+                e
+            }],
+            SystemSnapshot::default(),
+        );
+        let rows = ps_rows(&store, &ps_args(&["--sort", "pid"]), None);
+        let columns = [ColumnId::Pid, ColumnId::Name, ColumnId::Command];
+        let out = render_table(&store, &rows, &columns, &column_ctx(&store), None);
+        assert!(!out.contains('\x1b') && !out.contains('\x07') && !out.contains('\u{202E}'));
+        let lines: Vec<&str> = out.lines().collect();
+        let name_col = lines[0].find("NAME").unwrap();
+        let cmd_col = lines[0].find("COMMAND").unwrap();
+        for line in &lines[1..] {
+            let chars: Vec<char> = line.chars().collect();
+            assert_eq!(chars[name_col - 1], ' ', "{line:?}");
+            assert_eq!(chars[cmd_col - 1], ' ', "{line:?}");
+        }
+        assert_eq!(printable("ok"), "ok");
+        assert_eq!(printable("a\x1bb\u{9b}c"), "a?b?c");
     }
 
     #[test]

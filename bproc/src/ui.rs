@@ -35,6 +35,10 @@ pub struct AppState {
     pub status_message: String,
     pub history: HistoryTracker,
     pub show_graph: bool,
+    /// Process shown by the bandwidth graph. Independent of the interface
+    /// filter, so the graph keeps following a process that drops out of the
+    /// filtered list for a sample (or never appears in it).
+    pub graph_pid: Option<i32>,
     // Interface view state
     pub view_mode: ViewMode,
     pub interface_list: Vec<InterfaceInfo>,
@@ -348,6 +352,7 @@ impl AppState {
             list_state,
             history: HistoryTracker::new(),
             show_graph: false,
+            graph_pid: None,
             show_help: false,
             show_throttle_dialog: false,
             show_backend_info: false,
@@ -506,14 +511,25 @@ impl AppState {
                 self.show_backend_info = false;
                 self.reset_backend_info_scroll();
             }
-            Layer::Graph => self.show_graph = false,
+            Layer::Graph => {
+                self.show_graph = false;
+                self.graph_pid = None;
+            }
             Layer::Help => {
                 self.show_help = false;
                 self.reset_help_scroll();
             }
             Layer::InterfaceList => {
                 self.view_mode = ViewMode::ProcessView;
-                self.status_message = "Closed interface filter - filter still active".into();
+                self.status_message = match &self.active_interface_filters {
+                    Some(filters) if filters.is_empty() => {
+                        "Interface filter still active: showing no interfaces".into()
+                    }
+                    Some(filters) => {
+                        format!("Interface filter still active: {}", filters.join(", "))
+                    }
+                    None => String::new(),
+                };
             }
             Layer::InterfaceDetail => {
                 self.exit_interface_detail();
@@ -1005,9 +1021,14 @@ fn draw_explorer(
             filters.join(", ")
         }
     });
-    let status = app.status_message.clone();
+    // Legacy notices are transient: show them as an expiring flash instead
+    // of a status line that never clears.
+    if !app.status_message.is_empty() {
+        let message = std::mem::take(&mut app.status_message);
+        app.explorer.flash(message);
+    }
     let env = explorer::DrawEnv {
-        status: &status,
+        status: "",
         interface_filter,
         socket_mapper: backend_info.and_then(|b| b.active_socket_mapper.clone()),
     };
@@ -1363,20 +1384,37 @@ fn draw_backend_compatibility_dialog(
     );
 }
 
+/// Display name for the graphed PID: the live network row, else the
+/// explorer row, else the name recorded with its history.
+fn graph_name(app: &AppState, pid: i32) -> Option<String> {
+    app.unfiltered_process_list
+        .iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.name.clone())
+        .or_else(|| app.explorer.store.by_pid(pid).map(|r| r.name().to_string()))
+        .or_else(|| app.history.get_history(pid).map(|h| h.process_name.clone()))
+}
+
 fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    let selected = app.get_selected_process().map(|p| {
+    let pid = app
+        .graph_pid
+        .or_else(|| app.get_selected_process().map(|p| p.pid));
+    let selected = pid.map(|pid| {
         (
-            p.pid,
-            p.name.clone(),
-            app.history.get_history(p.pid).cloned(),
+            pid,
+            graph_name(app, pid).unwrap_or_else(|| format!("PID {pid}")),
+            app.history.get_history(pid).cloned(),
         )
     });
     let Some((pid, name, Some(history))) =
         selected.filter(|(_, _, h)| h.as_ref().is_some_and(|h| !h.samples.is_empty()))
     else {
-        let (title, message) = match app.get_selected_process() {
-            Some(p) => (
-                format!("Bandwidth Graph: {} (PID {})", p.name, p.pid),
+        let (title, message) = match pid {
+            Some(pid) => (
+                format!(
+                    "Bandwidth Graph: {} (PID {pid})",
+                    graph_name(app, pid).unwrap_or_else(|| format!("PID {pid}"))
+                ),
                 "No historical data available yet...",
             ),
             None => (
@@ -1647,225 +1685,8 @@ fn draw_backend_info(
         }
     }
 
-    text.push(line(""));
-    text.push(line(""));
-
-    // Upload Backends Section
-    text.push(line(Span::styled(
-        "Upload Backends:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if backend_info.available_upload.is_empty() {
-        text.push(line(Span::styled(
-            "  ⚪ (none compiled)",
-            Style::default().fg(Color::BrightWhite),
-        )));
-    } else {
-        for (name, priority, available) in &backend_info.available_upload {
-            let is_active = backend_info.active_upload.as_ref() == Some(name);
-            let (symbol, color) = if is_active {
-                ("⭐", Color::Yellow)
-            } else if *available {
-                ("✅", Color::Green)
-            } else {
-                ("❌", Color::Red)
-            };
-
-            let status = if is_active {
-                "[DEFAULT]"
-            } else if *available {
-                "Available"
-            } else {
-                "Unavailable"
-            };
-
-            let priority_str = format!("{:?}", priority);
-            let throttle_count = backend_info.backend_stats.get(name).copied().unwrap_or(0);
-            let throttle_info = if throttle_count > 0 {
-                format!(" ({} active)", throttle_count)
-            } else {
-                String::new()
-            };
-
-            text.push(line(vec![
-                Span::raw("  "),
-                Span::styled(symbol, Style::default().fg(color)),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:15}", name),
-                    if is_active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::BrightWhite)
-                    },
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:12}", status),
-                    Style::default().fg(if is_active {
-                        Color::Yellow
-                    } else {
-                        Color::BrightWhite
-                    }),
-                ),
-                Span::raw("  Priority: "),
-                Span::styled(
-                    format!("{:8}", priority_str),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(throttle_info, Style::default().fg(Color::BrightWhite)),
-            ]));
-        }
-    }
-
-    text.push(line(""));
-
-    // Download Backends Section
-    text.push(line(Span::styled(
-        "Download Backends:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if backend_info.available_download.is_empty() {
-        text.push(line(Span::styled(
-            "  ⚪ (none compiled)",
-            Style::default().fg(Color::BrightWhite),
-        )));
-    } else {
-        for (name, priority, available) in &backend_info.available_download {
-            let is_active = backend_info.active_download.as_ref() == Some(name);
-            let (symbol, color) = if is_active {
-                ("⭐", Color::Yellow)
-            } else if *available {
-                ("✅", Color::Green)
-            } else {
-                ("❌", Color::Red)
-            };
-
-            let status = if is_active {
-                "[DEFAULT]"
-            } else if *available {
-                "Available"
-            } else {
-                "Unavailable"
-            };
-
-            let priority_str = format!("{:?}", priority);
-            let throttle_count = backend_info.backend_stats.get(name).copied().unwrap_or(0);
-            let throttle_info = if throttle_count > 0 {
-                format!(" ({} active)", throttle_count)
-            } else {
-                String::new()
-            };
-
-            text.push(line(vec![
-                Span::raw("  "),
-                Span::styled(symbol, Style::default().fg(color)),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:15}", name),
-                    if is_active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::BrightWhite)
-                    },
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:12}", status),
-                    Style::default().fg(if is_active {
-                        Color::Yellow
-                    } else {
-                        Color::BrightWhite
-                    }),
-                ),
-                Span::raw("  Priority: "),
-                Span::styled(
-                    format!("{:8}", priority_str),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(throttle_info, Style::default().fg(Color::BrightWhite)),
-            ]));
-        }
-    }
-
-    text.push(line(""));
-
-    // Socket Mapper Backends Section
-    text.push(line(Span::styled(
-        "Socket Mapper Backends:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    if backend_info.available_socket_mappers.is_empty() {
-        text.push(line(Span::styled(
-            "  ⚪ (none available)",
-            Style::default().fg(Color::BrightWhite),
-        )));
-    } else {
-        for (name, priority, available) in &backend_info.available_socket_mappers {
-            let is_active = backend_info.active_socket_mapper.as_ref() == Some(name);
-            let (symbol, color) = if is_active {
-                ("⭐", Color::Yellow)
-            } else if *available {
-                ("✅", Color::Green)
-            } else {
-                ("❌", Color::Red)
-            };
-
-            let status = if is_active {
-                "[DEFAULT]"
-            } else if *available {
-                "Available"
-            } else {
-                "Unavailable"
-            };
-
-            let priority_str = format!("{:?}", priority);
-
-            text.push(line(vec![
-                Span::raw("  "),
-                Span::styled(symbol, Style::default().fg(color)),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:15}", name),
-                    if is_active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::BrightWhite)
-                    },
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:12}", status),
-                    Style::default().fg(if is_active {
-                        Color::Yellow
-                    } else {
-                        Color::BrightWhite
-                    }),
-                ),
-                Span::raw("  Priority: "),
-                Span::styled(
-                    format!("{:8}", priority_str),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]));
-        }
-    }
-
+    // The selector above already lists every backend group; only the
+    // saved preferences remain to show.
     text.push(line(""));
 
     // Configuration Section

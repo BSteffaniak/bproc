@@ -557,7 +557,10 @@ async fn run_cli_mode(args: &Args) -> Result<()> {
     println!();
 
     // Load config to get backend preferences (CLI mode also respects config)
-    let config = config::Config::load().unwrap_or_default();
+    let config = config::Config::load().unwrap_or_else(|e| {
+        eprintln!("bproc: ignoring unreadable config: {e:#}");
+        config::Config::default()
+    });
 
     // Determine backend preferences: CLI args override config file preferences
     let upload_preference = args
@@ -665,19 +668,31 @@ async fn main() -> Result<()> {
         return run_cli_mode(&args).await;
     }
 
-    // Load config FIRST to get backend preferences
-    let config = config::Config::load().unwrap_or_default();
+    // Load config FIRST to get backend preferences. An unreadable file is
+    // moved aside (never silently overwritten) and reported in the UI.
+    let config::Loaded {
+        config,
+        warning: config_warning,
+    } = config::Config::load_checked();
 
     // Create app state
     let mut app = AppState::new();
     app.explorer =
         ui::explorer::ExplorerState::new(config.explorer.clone(), config.watch_rules.clone());
-    #[cfg(unix)]
-    if unsafe { libc::geteuid() } != 0 {
-        app.explorer.network_note =
-            Some("Per-process bandwidth needs packet-capture privileges — run with sudo".into());
+    if let Some(warning) = config_warning {
+        eprintln!("bproc: {warning}");
+        app.explorer
+            .toasts
+            .push(ui::explorer::toasts::Severity::Warning, warning);
     }
-    #[cfg(not(feature = "monitor-pnet"))]
+    // A first guess; the runtime clears it as soon as packets are attributed
+    // (e.g. macOS with ChmodBPF access works without root).
+    #[cfg(all(unix, feature = "monitor-pnet"))]
+    if unsafe { libc::geteuid() } != 0 {
+        app.explorer.network_note = Some(ui::explorer::CAPTURE_PRIVILEGE_NOTE.into());
+    }
+    // Windows polls per-process traffic without pnet.
+    #[cfg(not(any(feature = "monitor-pnet", target_os = "windows")))]
     {
         app.explorer.network_note = Some("Built without network monitoring".into());
     }
@@ -791,51 +806,64 @@ async fn main() -> Result<()> {
     // Restore throttles before spawning monitor thread
     if !args.no_restore {
         log::info!("Restoring saved throttles...");
-        // PIDs do not survive restarts: re-target by executable/name instead.
-        let running =
-            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_processes(
-                sysinfo::ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::Always),
-            ));
-        for (saved_pid, saved_throttle) in config.get_throttles() {
+        // Threads are not processes: never let a TID receive its own limit.
+        let system = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_processes(
+                sysinfo::ProcessRefreshKind::nothing()
+                    .with_exe(sysinfo::UpdateKind::Always)
+                    .with_cmd(sysinfo::UpdateKind::Always)
+                    .without_tasks(),
+            ),
+        );
+        let running: Vec<restore::Running> = system
+            .processes()
+            .iter()
+            .filter(|(_, p)| p.thread_kind().is_none())
+            .map(|(pid, p)| restore::Running {
+                pid: pid.as_u32() as i32,
+                name: p.name().to_string_lossy().into_owned(),
+                exe: p.exe().map(|e| e.display().to_string()),
+                cmdline: {
+                    let cmd: Vec<String> = p
+                        .cmd()
+                        .iter()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect();
+                    (!cmd.is_empty()).then(|| cmd.join(" "))
+                },
+                start_time: p.start_time(),
+            })
+            .collect();
+        let plan = restore::plan(config.get_throttles(), &running);
+        for skipped in &plan.skipped {
+            log::warn!("{skipped}");
+        }
+        for (pid, saved_throttle) in plan.targets {
             let limit = ThrottleLimit {
                 upload_limit: saved_throttle.upload_limit,
                 download_limit: saved_throttle.download_limit,
                 traffic_type: crate::process::TrafficType::All, // Default for restored throttles
             };
-            let targets: Vec<i32> = running
-                .processes()
-                .iter()
-                .filter(|(_, p)| {
-                    p.name().to_string_lossy() == saved_throttle.process_name
-                        && match (&saved_throttle.exe, p.exe()) {
-                            (Some(exe), Some(path)) => path.display().to_string() == *exe,
-                            _ => true,
-                        }
-                })
-                .map(|(pid, _)| pid.as_u32() as i32)
-                .collect();
-            if targets.is_empty() {
+            if let Err(e) =
+                throttle_manager.throttle_process(pid, saved_throttle.process_name.clone(), &limit)
+            {
+                log::warn!("Failed to restore throttle for PID {}: {}", pid, e);
+            } else {
                 log::info!(
-                    "Saved throttle for {} (was PID {}) has no running match",
+                    "Restored throttle for {} (PID {})",
                     saved_throttle.process_name,
-                    saved_pid
+                    pid
                 );
             }
-            for pid in targets {
-                if let Err(e) = throttle_manager.throttle_process(
-                    pid,
-                    saved_throttle.process_name.clone(),
-                    &limit,
-                ) {
-                    log::warn!("Failed to restore throttle for PID {}: {}", pid, e);
-                } else {
-                    log::info!(
-                        "Restored throttle for {} (PID {})",
-                        saved_throttle.process_name,
-                        pid
-                    );
-                }
-            }
+        }
+        if !plan.skipped.is_empty() {
+            app.explorer.toasts.push(
+                ui::explorer::toasts::Severity::Warning,
+                format!(
+                    "{} saved throttle(s) not restored (process not uniquely found)",
+                    plan.skipped.len()
+                ),
+            );
         }
     } else {
         log::info!("Skipping throttle restoration (--no-restore flag)");
@@ -864,4 +892,181 @@ async fn main() -> Result<()> {
         socket_mapper: socket_mapper_preference_str,
     })
     .await
+}
+
+/// Re-targeting saved throttles after a restart. PIDs do not survive a
+/// restart, so a saved entry applies to the same process (PID + start time)
+/// or to exactly one unambiguous match by executable; never to every process
+/// sharing a name.
+mod restore {
+    use crate::config::SavedThrottle;
+    use std::collections::{HashMap, HashSet};
+
+    /// A running process as seen at startup (threads already excluded).
+    #[derive(Debug, Clone)]
+    pub struct Running {
+        pub pid: i32,
+        pub name: String,
+        pub exe: Option<String>,
+        pub cmdline: Option<String>,
+        pub start_time: u64,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct Plan<'a> {
+        /// Each PID at most once.
+        pub targets: Vec<(i32, &'a SavedThrottle)>,
+        /// Human explanations for entries that were not restored.
+        pub skipped: Vec<String>,
+    }
+
+    pub fn plan<'a>(saved: &'a HashMap<i32, SavedThrottle>, running: &[Running]) -> Plan<'a> {
+        let mut plan = Plan::default();
+        let mut seen = HashSet::new();
+        // Deterministic order for logs and tests.
+        let mut entries: Vec<_> = saved.iter().collect();
+        entries.sort_by_key(|(pid, _)| **pid);
+        for (saved_pid, throttle) in entries {
+            let same = running.iter().find(|r| {
+                r.pid == *saved_pid
+                    && r.name == throttle.process_name
+                    && throttle.start_time.is_some_and(|t| t == r.start_time)
+            });
+            let target = match same {
+                Some(r) => Some(r.pid),
+                None => match &throttle.exe {
+                    None => {
+                        plan.skipped.push(format!(
+                            "Saved throttle for {} (was PID {saved_pid}) has no executable path; not re-targeted",
+                            throttle.process_name
+                        ));
+                        None
+                    }
+                    Some(exe) => {
+                        let matches: Vec<&Running> = running
+                            .iter()
+                            .filter(|r| {
+                                r.name == throttle.process_name
+                                    && r.exe.as_deref() == Some(exe.as_str())
+                                    && throttle
+                                        .cmdline
+                                        .as_ref()
+                                        .is_none_or(|c| r.cmdline.as_ref() == Some(c))
+                            })
+                            .collect();
+                        match matches.as_slice() {
+                            [only] => Some(only.pid),
+                            [] => {
+                                log::info!(
+                                    "Saved throttle for {} (was PID {saved_pid}) has no running match",
+                                    throttle.process_name
+                                );
+                                None
+                            }
+                            many => {
+                                plan.skipped.push(format!(
+                                    "Saved throttle for {} (was PID {saved_pid}) matches {} processes; not restored",
+                                    throttle.process_name,
+                                    many.len()
+                                ));
+                                None
+                            }
+                        }
+                    }
+                },
+            };
+            if let Some(pid) = target
+                && seen.insert(pid)
+            {
+                plan.targets.push((pid, throttle));
+            }
+        }
+        plan
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn saved(name: &str, exe: Option<&str>, start: Option<u64>) -> SavedThrottle {
+            SavedThrottle {
+                process_name: name.into(),
+                exe: exe.map(String::from),
+                start_time: start,
+                cmdline: None,
+                upload_limit: Some(1),
+                download_limit: None,
+            }
+        }
+
+        fn running(pid: i32, name: &str, exe: &str, start: u64) -> Running {
+            Running {
+                pid,
+                name: name.into(),
+                exe: Some(exe.into()),
+                cmdline: None,
+                start_time: start,
+            }
+        }
+
+        #[test]
+        fn same_process_is_restored_alone_even_when_others_share_its_name() {
+            let saved: HashMap<_, _> =
+                [(4242, saved("node", Some("/usr/bin/node"), Some(77)))].into();
+            let procs: Vec<_> = (0..12)
+                .map(|i| running(4000 + i, "node", "/usr/bin/node", 10 + i as u64))
+                .chain([running(4242, "node", "/usr/bin/node", 77)])
+                .collect();
+            let plan = plan(&saved, &procs);
+            assert_eq!(
+                plan.targets.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                vec![4242]
+            );
+        }
+
+        #[test]
+        fn ambiguous_or_exe_less_entries_are_skipped() {
+            let saved: HashMap<_, _> = [
+                (1, saved("node", Some("/usr/bin/node"), Some(5))),
+                (2, saved("python", None, None)),
+            ]
+            .into();
+            let procs = vec![
+                running(10, "node", "/usr/bin/node", 1),
+                running(11, "node", "/usr/bin/node", 2),
+                running(12, "python", "/usr/bin/python", 3),
+            ];
+            let plan = plan(&saved, &procs);
+            assert!(plan.targets.is_empty());
+            assert_eq!(plan.skipped.len(), 2);
+        }
+
+        #[test]
+        fn a_unique_exe_match_is_retargeted_once() {
+            let saved: HashMap<_, _> = [
+                (1, saved("db", Some("/opt/db"), Some(5))),
+                (2, saved("db", Some("/opt/db"), Some(6))),
+            ]
+            .into();
+            let procs = vec![running(99, "db", "/opt/db", 1)];
+            let plan = plan(&saved, &procs);
+            assert_eq!(
+                plan.targets.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                vec![99],
+                "a PID is never throttled twice"
+            );
+        }
+
+        #[test]
+        fn a_reused_pid_with_another_start_time_is_not_the_same_process() {
+            let saved: HashMap<_, _> = [(7, saved("db", Some("/opt/db"), Some(5)))].into();
+            let procs = vec![
+                running(7, "db", "/opt/db", 6),
+                running(8, "db", "/opt/db", 9),
+            ];
+            let plan = plan(&saved, &procs);
+            assert!(plan.targets.is_empty());
+            assert_eq!(plan.skipped.len(), 1);
+        }
+    }
 }

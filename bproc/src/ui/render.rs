@@ -150,14 +150,28 @@ pub fn paint_label(cx: &mut PaintCx<'_, '_>, area: Rect, label: Line, style: Sty
     paint_component(cx, area, block);
 }
 
+/// `─ Title ` in the explorer's panel style: the title sits one dash in from
+/// the corner, padded, bold, so legacy panels read like the explorer's
+/// `╭─ Title ─` dialogs.
+fn decorate_title(title: Line, border: Style) -> Line {
+    let bold = border.add_modifier(bmux_tui::style::Modifier::BOLD);
+    let mut spans = vec![Span::styled("─", border), Span::styled(" ", bold)];
+    spans.extend(title.spans.into_iter().map(|span| {
+        let style = bold.patch(span.style);
+        Span::styled(span.content, style)
+    }));
+    spans.push(Span::styled(" ", bold));
+    Line::from_spans(spans)
+}
+
 pub fn paint_border(cx: &mut PaintCx<'_, '_>, area: Rect, chrome: PanelChrome) {
     // Surface owns border rasterization; a text view owns the rich border title.
     paint_component(
         cx,
         area,
-        Surface::new(Stack::new()).border(Border::single().style(chrome.style)),
+        Surface::new(Stack::new()).border(Border::rounded().style(chrome.style)),
     );
-    if let Some(title) = chrome.title {
+    if let Some(title) = chrome.title.map(|t| decorate_title(t, chrome.style)) {
         let title_area = Rect::new(
             area.x.saturating_add(1),
             area.y,
@@ -223,10 +237,13 @@ pub fn paint_text(
             ModalSizing::new(area.size(), area.size(), Insets::all(0)),
             theme,
         )
-        .border(Border::single().style(presentation.style.patch(chrome.style)))
+        .border(Border::rounded().style(presentation.style.patch(chrome.style)))
         .padding(Insets::all(0));
         if let Some(title) = chrome.title {
-            frame = frame.title(title);
+            frame = frame.title(decorate_title(
+                title,
+                presentation.style.patch(chrome.style),
+            ));
         }
         let layout = paint_component(
             cx,

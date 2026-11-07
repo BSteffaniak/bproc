@@ -172,12 +172,42 @@ pub const FKEYS: &[(&str, Action, &str)] = &[
 ];
 
 impl Action {
+    /// Actions that act on one process (or the marked set): off the
+    /// Processes screen they resolve to the highlighted event / alert.
+    pub const fn is_process_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::ContextMenu
+                | Self::Signal
+                | Self::Terminate
+                | Self::Kill
+                | Self::Suspend
+                | Self::Resume
+                | Self::NiceUp
+                | Self::NiceDown
+                | Self::Mark
+                | Self::MarkTree
+                | Self::Pin
+                | Self::Details
+                | Self::FullDetails
+                | Self::WatchProcess
+                | Self::Expand
+                | Self::Collapse
+                | Self::GoParent
+                | Self::Throttle
+                | Self::RemoveThrottle
+                | Self::Graph
+        )
+    }
+    #[allow(dead_code)] // registry lookups for help/menus
     pub fn binding(self) -> Option<&'static Binding> {
         BINDINGS.iter().find(|b| b.action == self)
     }
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         self.binding().map(|b| b.label).unwrap_or("")
     }
+    #[allow(dead_code)]
     pub fn keys(self) -> &'static str {
         self.binding().map(|b| b.keys).unwrap_or("")
     }
