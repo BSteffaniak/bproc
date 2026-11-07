@@ -165,7 +165,9 @@ pub mod theme {
         Style::new().fg(Color::Black).bg(Color::BrightCyan)
     }
     pub fn selected_unfocused() -> Style {
-        Style::new().bg(Color::BrightBlack)
+        Style::new()
+            .fg(Color::BrightWhite)
+            .bg(Color::Rgb(58, 62, 72))
     }
     pub fn hovered() -> Style {
         Style::new().bg(Color::Rgb(40, 44, 52))

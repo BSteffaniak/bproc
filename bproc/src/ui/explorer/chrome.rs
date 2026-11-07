@@ -1129,7 +1129,7 @@ fn status_parts(
     let mut left = Vec::new();
     if opts.counts {
         let live = state.store.len_live();
-        let showing = state.table.rows().len();
+        let showing = state.table.rows().iter().filter(|r| !r.ghost).count();
         let text = if opts.short_counts {
             format!("{showing}/{live}")
         } else {

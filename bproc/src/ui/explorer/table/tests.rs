@@ -457,9 +457,9 @@ fn dragging_a_header_edge_resizes_and_saves_on_release() {
         0,
         none,
     ));
-    assert_eq!(state.settings.column_widths.get("user"), Some(&12));
+    assert_eq!(state.settings.column_widths.get("user"), Some(&14));
     let out = render(&mut state, 100, 10);
-    assert_eq!(header_rect(&state, ColumnId::User).width, 12);
+    assert_eq!(header_rect(&state, ColumnId::User).width, 14);
     assert!(out.row(0).contains('┃'), "edge lit while dragging");
     state.handle_event(&mouse(
         MouseEventKind::Drag(MouseButton::Left),
@@ -467,7 +467,7 @@ fn dragging_a_header_edge_resizes_and_saves_on_release() {
         0,
         none,
     ));
-    assert_eq!(state.settings.column_widths.get("user"), Some(&14));
+    assert_eq!(state.settings.column_widths.get("user"), Some(&16));
     assert!(!state.take_requests().contains(&UiRequest::SaveSettings));
     state.handle_event(&mouse(
         MouseEventKind::Up(MouseButton::Left),

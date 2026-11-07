@@ -351,7 +351,7 @@ impl ColumnId {
     pub const fn width(self) -> u16 {
         match self {
             Self::Pid | Self::Ppid => 7,
-            Self::User => 9,
+            Self::User => 11,
             Self::Name => 16,
             Self::Command | Self::Exe => 0,
             Self::State => 1,

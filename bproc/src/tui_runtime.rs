@@ -475,7 +475,13 @@ impl Application {
                     }));
                 }
                 UiRequest::LoadDetail(key) => {
-                    let previous = self.app.explorer.detail.detail().cloned();
+                    let previous = self
+                        .app
+                        .explorer
+                        .detail
+                        .detail()
+                        .filter(|d| d.key == key)
+                        .cloned();
                     update.commands.push(Command::replace(
                         bmux_tui_runtime::CommandKey::new("deep-detail"),
                         async move {
@@ -761,7 +767,10 @@ impl Program for Application {
                 self.app.explorer.apply_network(&data.process_map);
                 self.app.update_processes(data.process_map);
                 self.app.update_interfaces(data.interface_map);
-                if !self.app.status_message.starts_with("Throttle")
+                // The explorer status line has its own counts; only the legacy
+                // interface detail view still shows this summary.
+                if self.app.view_mode == ui::ViewMode::InterfaceDetail
+                    && !self.app.status_message.starts_with("Throttle")
                     && !self.app.status_message.starts_with("Failed")
                 {
                     self.app.status_message = format!(

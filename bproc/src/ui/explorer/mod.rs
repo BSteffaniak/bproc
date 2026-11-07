@@ -877,8 +877,14 @@ mod key_tests {
         let mut shift = Modifiers::NONE;
         shift.shift = true;
         let tree = state.settings.tree;
-        state.handle_event(&Event::Key(KeyStroke::with_modifiers(KeyCode::Char('t'), shift)));
-        assert_ne!(state.settings.tree, tree, "Shift+t must toggle tree, not throttle");
+        state.handle_event(&Event::Key(KeyStroke::with_modifiers(
+            KeyCode::Char('t'),
+            shift,
+        )));
+        assert_ne!(
+            state.settings.tree, tree,
+            "Shift+t must toggle tree, not throttle"
+        );
         assert!(
             !state
                 .take_requests()

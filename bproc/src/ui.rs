@@ -352,7 +352,7 @@ impl AppState {
             show_throttle_dialog: false,
             show_backend_info: false,
             throttle_dialog: ThrottleDialog::new(),
-            status_message: String::from("bproc started. Press F1 or ? for help."),
+            status_message: String::new(),
             view_mode: ViewMode::ProcessView,
             interface_list: Vec::new(),
             interface_list_state,
