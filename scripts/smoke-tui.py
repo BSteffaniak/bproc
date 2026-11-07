@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """PTY smoke test for the actual bproc executable, with isolated configuration.
 
-Usage: python3 scripts/smoke-tui.py /absolute/path/to/bproc
+Usage: python3 scripts/smoke-tui.py [--allow-missing-chrome] /absolute/path/to/bproc
 Use a --no-default-features build for deterministic unprivileged lifecycle tests.
 This never applies throttles or restores saved policies.
+
+Besides lifecycle (alternate screen, restored input modes, clean exit), each
+case checks that expected text reached the terminal: the explorer's F-key bar
+("F10" / "Quit") and the legacy interface filter modal. Pass
+--allow-missing-chrome to only warn when the explorer chrome is absent.
 """
 import errno
 import fcntl
@@ -11,6 +16,7 @@ import hashlib
 import os
 import pathlib
 import pty
+import re
 import select
 import signal
 import struct
@@ -21,7 +27,7 @@ import termios
 import time
 
 
-def run_case(binary, keys, size, resize=None):
+def run_case(binary, keys, size, resize=None, expect=()):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
@@ -67,6 +73,10 @@ def run_case(binary, keys, size, resize=None):
             mask = termios.ICANON | termios.ECHO | termios.ISIG
             assert before[3] & mask == after[3] & mask, "input modes not restored"
             assert not list(pathlib.Path(state).rglob("throttles.json")), "--no-save wrote configuration"
+            screen = visible_text(bytes(output))
+            missing = [text for text in expect if text not in screen]
+            assert not missing, f"never painted {missing!r}"
+            return screen
         finally:
             if child.poll() is None:
                 child.kill()
@@ -75,17 +85,39 @@ def run_case(binary, keys, size, resize=None):
             os.close(slave)
 
 
+def visible_text(output):
+    """Terminal output with escape sequences removed (cell text runs joined)."""
+    text = output.decode("utf-8", "replace")
+    return re.sub(r"\x1b(\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[@-Z\\-_])", "", text)
+
+
+CHROME = ("F10", "Quit")
+
+
 def main():
-    binary = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    args = sys.argv[1:]
+    allow_missing_chrome = "--allow-missing-chrome" in args
+    args = [a for a in args if a != "--allow-missing-chrome"]
+    binary = pathlib.Path(args[0]).resolve(strict=True)
     print(f"artifact: {binary}")
     print(f"sha256: {hashlib.sha256(binary.read_bytes()).hexdigest()}")
-    for label, keys, size, resize in [
-        ("quit", b"q", (24, 80), None),
-        ("modal-and-resize", [(1.1, b"h"), (1.5, b"\x1b"), (1.9, b"q")], (40, 120), (24, 80)),
-        ("ctrl-c", b"\x03", (24, 80), None),
-        ("tiny-terminal", b"q", (3, 8), None),
+    for label, keys, size, resize, expect, chrome in [
+        ("quit", [(1.5, b"q")], (24, 80), None, (), True),
+        # F1 opens the explorer help overlay; Esc closes it before q quits.
+        ("modal-and-resize", [(1.1, b"h"), (1.5, b"\x1b"), (1.9, b"q")], (40, 120), (24, 80), (), True),
+        # 'i' opens the legacy interface filter over the explorer.
+        ("interfaces", [(1.1, b"i"), (1.6, b"\x1b"), (2.0, b"q")], (40, 120), None,
+         ("Interface Filter",), False),
+        ("ctrl-c", b"\x03", (24, 80), None, (), False),
+        ("tiny-terminal", b"q", (3, 8), None, (), False),
     ]:
-        run_case(binary, keys, size, resize)
+        screen = run_case(binary, keys, size, resize, expect)
+        if chrome:
+            missing = [text for text in CHROME if text not in screen]
+            if missing and allow_missing_chrome:
+                print(f"WARN {label}: explorer chrome {missing!r} not painted")
+            else:
+                assert not missing, f"{label}: explorer chrome {missing!r} not painted"
         print(f"PASS {label}")
 
 

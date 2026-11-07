@@ -35,26 +35,115 @@ fn queue_preferences(config: &config::Config, effects: &mut Vec<Effect>) -> Resu
     });
     Ok(())
 }
-fn region_allowed(app: &AppState, region: &ui::ClickableRegionType) -> bool {
-    if app.show_backend_compatibility_dialog {
-        return false;
+fn save_interface_filters(app: &AppState, config: &mut config::Config, effects: &mut Vec<Effect>) {
+    config.filtered_interfaces = app.active_interface_filters.clone();
+    if let Err(e) = queue_preferences(config, effects) {
+        log::error!("Failed to save filter config: {}", e);
     }
-    if app.show_backend_info {
-        return matches!(region, ui::ClickableRegionType::BackendModal { .. });
-    }
-    if app.show_help || app.show_throttle_dialog || app.show_graph {
-        return false;
-    }
-    if app.view_mode == ui::ViewMode::InterfaceList {
-        return matches!(region, ui::ClickableRegionType::InterfaceModal { .. });
-    }
-    true
 }
+/// Rows in the interface detail list (processes using the selected interface).
+fn interface_detail_rows(app: &AppState) -> usize {
+    let Some(name) = &app.selected_interface_name else {
+        return 0;
+    };
+    app.unfiltered_process_list
+        .iter()
+        .filter(|p| p.interface_stats.contains_key(name))
+        .count()
+}
+/// Move the interface detail selection by `delta` rows (clamped, no wrap).
+fn move_interface_detail(app: &mut AppState, delta: isize) {
+    let rows = interface_detail_rows(app);
+    if rows == 0 {
+        app.interface_detail_state.select(None);
+        return;
+    }
+    let next = match app.interface_detail_state.selected() {
+        None => 0,
+        Some(index) => index.saturating_add_signed(delta).min(rows - 1),
+    };
+    app.interface_detail_state.select(Some(next));
+}
+/// Left click while a legacy surface owns input. Regions come from the last
+/// committed frame; clicks outside the topmost panel dismiss it.
+fn click(
+    app: &mut AppState,
+    x: u16,
+    y: u16,
+    config: &mut config::Config,
+    committed_regions: &[ui::ClickableRegion],
+    effects: &mut Vec<Effect>,
+) {
+    let Some(layer) = app.top_layer() else {
+        return;
+    };
+    let contains = |area: &ui::Rect| {
+        x >= area.x
+            && y >= area.y
+            && u32::from(x) < u32::from(area.x) + u32::from(area.width)
+            && u32::from(y) < u32::from(area.y) + u32::from(area.height)
+    };
+    let mut painted = false;
+    let mut target = None;
+    for region in committed_regions.iter().rev() {
+        if region.region_type.layer() != layer {
+            continue;
+        }
+        painted = true;
+        if contains(&region.area) {
+            target = Some(region);
+            break;
+        }
+    }
+    let Some(region) = target else {
+        if painted && layer.dismissible() {
+            app.dismiss(layer);
+        }
+        return;
+    };
+    match &region.region_type {
+        ui::ClickableRegionType::InterfaceModal { header_lines } => {
+            if let Some((index, on_box)) = ui::interface_click(
+                region.area,
+                *header_lines,
+                app.interface_modal_scroll_offset,
+                app.interface_list.len(),
+                x,
+                y,
+            ) {
+                app.selected_interface_index = Some(index);
+                app.interface_list_state.select(Some(index));
+                if on_box {
+                    let name = app.interface_list[index].name.clone();
+                    app.toggle_interface_filter(name);
+                    save_interface_filters(app, config, effects);
+                }
+            }
+        }
+        ui::ClickableRegionType::BackendModal { line_to_item } => {
+            let relative_y = y.saturating_sub(region.area.y.saturating_add(1));
+            let visual_line = usize::from(relative_y) + app.backend_info_scroll_offset;
+            if let Some(&item_index) = line_to_item.get(&visual_line)
+                && matches!(
+                    app.backend_items.get(item_index),
+                    Some(ui::BackendSelectorItem::Backend { .. })
+                )
+            {
+                app.backend_selected_index = item_index;
+            }
+        }
+        ui::ClickableRegionType::InterfaceBack => app.dismiss(ui::Layer::InterfaceDetail),
+        ui::ClickableRegionType::ThrottleTraffic => app.throttle_dialog.cycle_traffic_type(),
+        ui::ClickableRegionType::Panel(_) => {}
+    }
+}
+/// Input for the legacy network surfaces (modals and interface views). The
+/// explorer handles everything else. Returns true to quit.
 fn input(
     app: &mut AppState,
     event: Event,
     config: &mut config::Config,
-    backend_info: &BackendInfo,
+    backend_info: Option<&BackendInfo>,
     committed_regions: &[ui::ClickableRegion],
     effects: &mut Vec<Effect>,
 ) -> bool {
@@ -79,13 +168,11 @@ fn input(
                         }
                     }
                     KeyCode::PageUp => {
-                        // Scroll up by 10 lines
                         for _ in 0..10 {
                             app.scroll_backend_compat_up();
                         }
                     }
                     KeyCode::PageDown => {
-                        // Scroll down by 10 lines
                         for _ in 0..10 {
                             app.scroll_backend_compat_down();
                         }
@@ -109,15 +196,13 @@ fn input(
                     }
                     KeyCode::Escape | KeyCode::Char('q') => {
                         // Cancel - close modal, keep throttle dialog open
-                        app.show_backend_compatibility_dialog = false;
-                        app.backend_compatibility_dialog = None;
+                        app.dismiss(ui::Layer::Compatibility);
                     }
                     _ => {}
                 }
                 return false;
             }
 
-            // If backend info is shown, Enter switches to selector, Esc/q closes it
             if app.show_backend_info {
                 match key.key {
                     KeyCode::Space | KeyCode::Char(' ') => {
@@ -129,70 +214,49 @@ fn input(
                             app.status_message = format!("Switching to {}...", name);
                         }
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.select_previous_backend();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.select_next_backend();
-                    }
+                    KeyCode::Up | KeyCode::Char('k') => app.select_previous_backend(),
+                    KeyCode::Down | KeyCode::Char('j') => app.select_next_backend(),
                     KeyCode::PageUp => {
-                        // Scroll up by 10 lines
                         for _ in 0..10 {
                             app.scroll_backend_info_up();
                         }
                     }
                     KeyCode::PageDown => {
-                        // Scroll down by 10 lines
                         for _ in 0..10 {
                             app.scroll_backend_info_down();
                         }
                     }
                     KeyCode::Enter | KeyCode::Char('b') | KeyCode::Char('q') | KeyCode::Escape => {
-                        app.show_backend_info = false;
-                        app.reset_backend_info_scroll();
+                        app.dismiss(ui::Layer::Backends);
                     }
                     _ => {}
                 }
                 return false;
             }
 
-            // If graph is shown, g/Esc/q closes it
             if app.show_graph {
-                match key.key {
-                    KeyCode::Char('g') | KeyCode::Char('q') | KeyCode::Escape => {
-                        app.show_graph = false;
-                    }
-                    _ => {}
+                if matches!(
+                    key.key,
+                    KeyCode::Char('g') | KeyCode::Char('q') | KeyCode::Escape
+                ) {
+                    app.dismiss(ui::Layer::Graph);
                 }
                 return false;
             }
 
-            // Handle throttle dialog input
             if app.show_throttle_dialog {
                 match key.key {
-                    KeyCode::Escape | KeyCode::Char('q') => {
-                        app.show_throttle_dialog = false;
-                        app.throttle_dialog.reset();
-                    }
-                    KeyCode::Tab => {
-                        app.throttle_dialog.toggle_field();
-                    }
-                    KeyCode::Char('t') => {
-                        app.throttle_dialog.cycle_traffic_type();
-                    }
-                    KeyCode::Char(c) if c.is_numeric() => {
-                        app.throttle_dialog.handle_char(c);
-                    }
-                    KeyCode::Backspace => {
-                        app.throttle_dialog.handle_backspace();
-                    }
+                    KeyCode::Escape | KeyCode::Char('q') => app.dismiss(ui::Layer::Throttle),
+                    KeyCode::Tab => app.throttle_dialog.toggle_field(),
+                    KeyCode::Char('t') => app.throttle_dialog.cycle_traffic_type(),
+                    KeyCode::Char(c) if c.is_ascii_digit() => app.throttle_dialog.handle_char(c),
+                    KeyCode::Backspace => app.throttle_dialog.handle_backspace(),
                     KeyCode::Enter => {
                         if let Some(request) = throttle_request(app) {
                             effects.push(Effect::Apply(request));
                             app.status_message = "Checking throttle compatibility...".into();
                         } else {
-                            app.show_throttle_dialog = false;
-                            app.throttle_dialog.reset();
+                            app.dismiss(ui::Layer::Throttle);
                         }
                     }
                     _ => {}
@@ -200,164 +264,81 @@ fn input(
                 return false;
             }
 
-            // If help is shown, handle scroll or close it
             if app.show_help {
                 match key.key {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.scroll_help_up();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.scroll_help_down();
-                    }
+                    KeyCode::Up | KeyCode::Char('k') => app.scroll_help_up(),
+                    KeyCode::Down | KeyCode::Char('j') => app.scroll_help_down(),
                     KeyCode::PageUp => {
-                        // Scroll up by 10 lines
                         for _ in 0..10 {
                             app.scroll_help_up();
                         }
                     }
                     KeyCode::PageDown => {
-                        // Scroll down by 10 lines
                         for _ in 0..10 {
                             app.scroll_help_down();
                         }
                     }
-                    _ => {
-                        app.show_help = false;
-                        app.reset_help_scroll();
-                    }
+                    _ => app.dismiss(ui::Layer::Help),
                 }
                 return false;
             }
 
+            // Interface views. The process view itself belongs to the explorer.
+            let view = app.view_mode;
+            if view == ui::ViewMode::ProcessView {
+                return false;
+            }
+            if view == ui::ViewMode::InterfaceList {
+                app.ensure_interface_cursor();
+            }
             match key.key {
-                KeyCode::Char('q') | KeyCode::Escape => {
-                    // Special handling for interface views and process detail
-                    match app.view_mode {
-                        ui::ViewMode::InterfaceDetail => {
-                            app.exit_interface_detail();
-                            app.status_message = "Back to interface list".to_string();
-                        }
-                        ui::ViewMode::InterfaceList => {
-                            app.view_mode = ui::ViewMode::ProcessView;
-                            app.status_message =
-                                "Closed interface modal - filter still active".to_string();
-                        }
-                        ui::ViewMode::ProcessDetail => {
-                            app.exit_process_detail();
-                            app.status_message = "Back to process list".to_string();
-                        }
-                        ui::ViewMode::ProcessView => {
-                            return true;
-                        }
-                    }
-                }
+                KeyCode::Char('q') | KeyCode::Escape => match view {
+                    ui::ViewMode::InterfaceDetail => app.dismiss(ui::Layer::InterfaceDetail),
+                    _ => app.dismiss(ui::Layer::InterfaceList),
+                },
                 KeyCode::Char('h') | KeyCode::Char('?') => {
                     app.reset_help_scroll();
                     app.show_help = true;
                 }
                 KeyCode::Char('b') => {
-                    if !app.show_backend_info {
-                        // Build backend items when opening modal
-                        let backend_info = backend_info.clone();
-                        app.build_backend_items(&backend_info);
+                    if let Some(backend_info) = backend_info {
+                        app.build_backend_items(backend_info);
                         app.reset_backend_info_scroll();
                         app.show_backend_info = true;
                     } else {
-                        app.show_backend_info = false;
-                        app.reset_backend_info_scroll();
+                        app.status_message = "Backends are still loading...".into();
                     }
                 }
-                KeyCode::Char('f') => {
-                    app.toggle_sort_freeze();
-                    app.status_message = if app.sort_frozen {
-                        "Sort order frozen ❄️ - Stats continue updating, order preserved"
-                            .to_string()
-                    } else {
-                        "Sort order unfrozen - Dynamic sorting re-enabled".to_string()
-                    };
-                }
-                KeyCode::Char('g') => {
-                    app.show_graph = !app.show_graph;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    match app.view_mode {
-                        ui::ViewMode::ProcessView => app.select_next(),
-                        ui::ViewMode::InterfaceList => app.select_next_interface(),
-                        ui::ViewMode::InterfaceDetail => {} // No selection in detail view
-                        ui::ViewMode::ProcessDetail => app.scroll_detail_down(),
-                    }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    match app.view_mode {
-                        ui::ViewMode::ProcessView => app.select_previous(),
-                        ui::ViewMode::InterfaceList => app.select_previous_interface(),
-                        ui::ViewMode::InterfaceDetail => {} // No selection in detail view
-                        ui::ViewMode::ProcessDetail => app.scroll_detail_up(),
-                    }
-                }
-                KeyCode::PageUp => {
-                    match app.view_mode {
-                        ui::ViewMode::ProcessView => {
-                            // Select previous by 10
-                            for _ in 0..10 {
-                                app.select_previous();
-                            }
-                        }
-                        ui::ViewMode::InterfaceList => {
-                            // Scroll interface modal up
-                            for _ in 0..10 {
-                                app.scroll_interface_modal_up();
-                            }
-                        }
-                        ui::ViewMode::InterfaceDetail => {}
-                        ui::ViewMode::ProcessDetail => {
-                            // Scroll detail view up by 10 lines
-                            for _ in 0..10 {
-                                app.scroll_detail_up();
-                            }
+                KeyCode::Down | KeyCode::Char('j') => match view {
+                    ui::ViewMode::InterfaceList => app.select_next_interface(),
+                    _ => move_interface_detail(app, 1),
+                },
+                KeyCode::Up | KeyCode::Char('k') => match view {
+                    ui::ViewMode::InterfaceList => app.select_previous_interface(),
+                    _ => move_interface_detail(app, -1),
+                },
+                KeyCode::PageUp => match view {
+                    ui::ViewMode::InterfaceList => {
+                        for _ in 0..10 {
+                            app.scroll_interface_modal_up();
                         }
                     }
-                }
-                KeyCode::PageDown => {
-                    match app.view_mode {
-                        ui::ViewMode::ProcessView => {
-                            // Select next by 10
-                            for _ in 0..10 {
-                                app.select_next();
-                            }
-                        }
-                        ui::ViewMode::InterfaceList => {
-                            // Scroll interface modal down
-                            for _ in 0..10 {
-                                app.scroll_interface_modal_down();
-                            }
-                        }
-                        ui::ViewMode::InterfaceDetail => {}
-                        ui::ViewMode::ProcessDetail => {
-                            // Scroll detail view down by 10 lines
-                            for _ in 0..10 {
-                                app.scroll_detail_down();
-                            }
+                    _ => move_interface_detail(app, -10),
+                },
+                KeyCode::PageDown => match view {
+                    ui::ViewMode::InterfaceList => {
+                        for _ in 0..10 {
+                            app.scroll_interface_modal_down();
                         }
                     }
-                }
+                    _ => move_interface_detail(app, 10),
+                },
                 KeyCode::Char('i') => {
                     app.toggle_view_mode();
-                    app.status_message = match app.view_mode {
-                        ui::ViewMode::ProcessView => "Switched to process view".to_string(),
-                        ui::ViewMode::InterfaceList => format!(
-                            "Switched to interface view ({} interfaces)",
-                            app.interface_list.len()
-                        ),
-                        ui::ViewMode::InterfaceDetail => "Viewing interface details".to_string(),
-                        ui::ViewMode::ProcessDetail => "Back to process list".to_string(),
-                    };
+                    app.status_message = "Closed interface views".to_string();
                 }
                 KeyCode::Char('l') => {
                     app.toggle_traffic_view_mode();
-                    // status_message is set by toggle_traffic_view_mode()
-
-                    // Save traffic view mode to config
                     config.traffic_view_mode = Some(match app.traffic_view_mode {
                         ui::TrafficViewMode::All => crate::process::TrafficType::All,
                         ui::TrafficViewMode::Internet => crate::process::TrafficType::Internet,
@@ -367,296 +348,56 @@ fn input(
                         log::warn!("Failed to save traffic view mode to config: {}", e);
                     }
                 }
-                KeyCode::Enter => match app.view_mode {
-                    ui::ViewMode::InterfaceList => {
-                        app.enter_interface_detail();
-                        if let Some(iface) = app.get_selected_interface() {
-                            app.status_message =
-                                format!("Viewing processes on interface: {}", iface.name);
-                        }
-                    }
-                    ui::ViewMode::ProcessView => {
-                        if app.get_selected_process().is_some() {
-                            app.enter_process_detail();
-                            app.status_message = "Viewing process details".to_string();
-                        }
-                    }
-                    _ => {}
-                },
-                KeyCode::Tab if key.modifiers.shift => {
-                    // Shift+Tab switches tabs backwards in process detail view
-                    if app.view_mode == ui::ViewMode::ProcessDetail {
-                        app.previous_detail_tab();
-                        let tab_name = match app.detail_tab {
-                            ui::ProcessDetailTab::Overview => "Overview",
-                            ui::ProcessDetailTab::Connections => "Connections",
-                            ui::ProcessDetailTab::Traffic => "Traffic",
-                            ui::ProcessDetailTab::System => "System",
-                        };
-                        app.status_message = format!("Switched to {} tab", tab_name);
+                KeyCode::Enter if view == ui::ViewMode::InterfaceList => {
+                    app.enter_interface_detail();
+                    if let Some(iface) = app.get_selected_interface() {
+                        app.status_message =
+                            format!("Viewing processes on interface: {}", iface.name);
                     }
                 }
-                KeyCode::Tab => {
-                    // Tab switches tabs in process detail view
-                    if app.view_mode == ui::ViewMode::ProcessDetail {
-                        app.next_detail_tab();
-                        let tab_name = match app.detail_tab {
-                            ui::ProcessDetailTab::Overview => "Overview",
-                            ui::ProcessDetailTab::Connections => "Connections",
-                            ui::ProcessDetailTab::Traffic => "Traffic",
-                            ui::ProcessDetailTab::System => "System",
-                        };
-                        app.status_message = format!("Switched to {} tab", tab_name);
-                    }
-                }
-                KeyCode::Space | KeyCode::Char(' ') => {
-                    // Space bar toggles filter in interface list view
-                    if app.view_mode == ui::ViewMode::InterfaceList
-                        && let Some(iface) = app.get_selected_interface()
-                    {
+                KeyCode::Space | KeyCode::Char(' ') if view == ui::ViewMode::InterfaceList => {
+                    if let Some(iface) = app.get_selected_interface() {
                         let iface_name = iface.name.clone();
                         app.toggle_interface_filter(iface_name);
-
-                        // Save to config immediately
-                        config.filtered_interfaces = app.active_interface_filters.clone();
-                        if let Err(e) = queue_preferences(config, effects) {
-                            log::error!("Failed to save filter config: {}", e);
-                        }
+                        save_interface_filters(app, config, effects);
                     }
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    // 'A' - Toggle all/none in interface list view
-                    if app.view_mode == ui::ViewMode::InterfaceList {
-                        app.toggle_all_interface_filters();
-
-                        // Save to config immediately
-                        config.filtered_interfaces = app.active_interface_filters.clone();
-                        if let Err(e) = queue_preferences(config, effects) {
-                            log::error!("Failed to save filter config: {}", e);
-                        }
-                    }
-                }
-                KeyCode::Char('t') => {
-                    if let Some(process) = app.get_selected_process() {
-                        // Clone the values we need
-                        let pid = process.pid;
-                        let name = process.name.clone();
-
-                        // Open throttle dialog
-                        app.throttle_dialog.target_pid = Some(pid);
-                        app.throttle_dialog.target_name = Some(name);
-                        app.show_throttle_dialog = true;
-                    } else {
-                        app.status_message = "No process selected".to_string();
-                    }
-                }
-                KeyCode::Char('r') => {
-                    if let Some(process) = app.get_selected_process() {
-                        effects.push(Effect::Remove {
-                            pid: process.pid,
-                            name: process.name.clone(),
-                        });
-                        app.status_message = "Removing throttle...".into();
-                    }
+                KeyCode::Char('a') | KeyCode::Char('A') if view == ui::ViewMode::InterfaceList => {
+                    app.toggle_all_interface_filters();
+                    save_interface_filters(app, config, effects);
                 }
                 _ => {}
             }
         }
-        Event::Mouse(mouse) => {
-            // Handle mouse scroll events
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    // Handle scroll up based on current state (priority: modals first, then view modes)
-                    if app.show_backend_compatibility_dialog {
-                        app.scroll_backend_compat_up();
-                    } else if app.show_backend_info {
-                        app.scroll_backend_info_up();
-                    } else if app.show_graph || app.show_throttle_dialog {
-                        return false;
-                    } else if app.show_help {
-                        app.scroll_help_up();
-                    } else if app.show_throttle_dialog {
-                        return false;
-                    } else {
-                        // Handle based on view mode
-                        match app.view_mode {
-                            ui::ViewMode::ProcessView => {
-                                // Don't scroll lists with mouse - would change selection
-                                // Use arrow keys or PageUp/PageDown instead
-                            }
-                            ui::ViewMode::InterfaceList => {
-                                // Interface modal uses Paragraph widget, so scroll it
-                                // (auto-scroll keeps selection visible)
-                                app.scroll_interface_modal_up();
-                            }
-                            ui::ViewMode::ProcessDetail => {
-                                // Scroll detail view up (3 lines)
-                                for _ in 0..3 {
-                                    app.scroll_detail_up();
-                                }
-                            }
-                            ui::ViewMode::InterfaceDetail => {
-                                // No scrolling needed for interface detail
-                            }
-                        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = mouse.kind == MouseEventKind::ScrollUp;
+                match app.top_layer() {
+                    Some(ui::Layer::Compatibility) if up => app.scroll_backend_compat_up(),
+                    Some(ui::Layer::Compatibility) => app.scroll_backend_compat_down(),
+                    Some(ui::Layer::Backends) if up => app.scroll_backend_info_up(),
+                    Some(ui::Layer::Backends) => app.scroll_backend_info_down(),
+                    Some(ui::Layer::Help) if up => app.scroll_help_up(),
+                    Some(ui::Layer::Help) => app.scroll_help_down(),
+                    Some(ui::Layer::InterfaceList) if up => app.scroll_interface_modal_up(),
+                    Some(ui::Layer::InterfaceList) => app.scroll_interface_modal_down(),
+                    Some(ui::Layer::InterfaceDetail) => {
+                        move_interface_detail(app, if up { -3 } else { 3 })
                     }
-                }
-                MouseEventKind::ScrollDown => {
-                    // Handle scroll down based on current state (priority: modals first, then view modes)
-                    if app.show_backend_compatibility_dialog {
-                        app.scroll_backend_compat_down();
-                    } else if app.show_backend_info {
-                        app.scroll_backend_info_down();
-                    } else if app.show_graph || app.show_throttle_dialog {
-                        return false;
-                    } else if app.show_help {
-                        app.scroll_help_down();
-                    } else if app.show_throttle_dialog {
-                        return false;
-                    } else {
-                        // Handle based on view mode
-                        match app.view_mode {
-                            ui::ViewMode::ProcessView => {
-                                // Don't scroll lists with mouse - would change selection
-                                // Use arrow keys or PageUp/PageDown instead
-                            }
-                            ui::ViewMode::InterfaceList => {
-                                // Interface modal uses Paragraph widget, so scroll it
-                                // (auto-scroll keeps selection visible)
-                                app.scroll_interface_modal_down();
-                            }
-                            ui::ViewMode::ProcessDetail => {
-                                // Scroll detail view down (3 lines)
-                                for _ in 0..3 {
-                                    app.scroll_detail_down();
-                                }
-                            }
-                            ui::ViewMode::InterfaceDetail => {
-                                // No scrolling needed for interface detail
-                            }
-                        }
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // Handle left mouse click for selection
-                    let click_x = mouse.position.x;
-                    let click_y = mouse.position.y;
-
-                    // Check each clickable region
-                    for region in committed_regions.iter().rev() {
-                        if !region_allowed(app, &region.region_type) {
-                            continue;
-                        }
-                        // Check if click is within region bounds
-                        if click_x >= region.area.x
-                            && click_x < region.area.x + region.area.width
-                            && click_y >= region.area.y
-                            && click_y < region.area.y + region.area.height
-                        {
-                            match &region.region_type {
-                                ui::ClickableRegionType::ProcessList {
-                                    first_visible_index,
-                                } => {
-                                    // Only handle process list clicks when it's actually visible
-                                    // (not covered by any overlays/modals)
-                                    if app.view_mode != ui::ViewMode::ProcessView
-                                        || app.show_backend_info
-                                        || app.show_help
-                                        || app.show_throttle_dialog
-                                        || app.show_graph
-                                        || app.show_backend_compatibility_dialog
-                                    {
-                                        return false; // Skip this region, check next one
-                                    }
-
-                                    // Calculate which list item was clicked
-                                    // inner_list_area.y doesn't include border, but List widget does
-                                    // Remove the +1 offset that was causing off-by-one error
-                                    let relative_y = click_y.saturating_sub(region.area.y);
-                                    let clicked_index = first_visible_index + relative_y as usize;
-
-                                    // Validate index is within bounds
-                                    if clicked_index < app.process_list.len() {
-                                        app.selected_index = Some(clicked_index);
-                                        app.list_state.select(Some(clicked_index));
-                                    }
-                                }
-                                ui::ClickableRegionType::ProcessDetailTabs { tab_ranges } => {
-                                    // Only handle tab clicks in ProcessDetail mode
-                                    if app.view_mode != ui::ViewMode::ProcessDetail {
-                                        return false;
-                                    }
-
-                                    // Find which tab was clicked based on column
-                                    for (start_col, end_col, tab) in tab_ranges {
-                                        if click_x >= *start_col && click_x < *end_col {
-                                            app.detail_tab = *tab;
-                                            app.detail_scroll_offset = 0; // Reset scroll when switching tabs
-                                            break;
-                                        }
-                                    }
-                                }
-                                ui::ClickableRegionType::InterfaceModal { header_lines } => {
-                                    // Only handle interface modal clicks when modal is open
-                                    if app.view_mode != ui::ViewMode::InterfaceList {
-                                        return false;
-                                    }
-
-                                    // Calculate which interface was clicked
-                                    // Account for border and header lines
-                                    let relative_y = click_y.saturating_sub(region.area.y + 1);
-
-                                    if relative_y >= *header_lines as u16 {
-                                        let clicked_index =
-                                            (relative_y - *header_lines as u16) as usize;
-
-                                        // Validate index is within bounds
-                                        if clicked_index < app.interface_list.len() {
-                                            app.selected_interface_index = Some(clicked_index);
-                                            // Don't update last_interface_selection here
-                                            // Let the auto-scroll code detect the change on next frame
-                                        }
-                                    }
-                                }
-                                ui::ClickableRegionType::BackendModal { line_to_item } => {
-                                    // Only handle backend modal clicks when modal is open
-                                    if !app.show_backend_info {
-                                        return false;
-                                    }
-
-                                    // Calculate which line was clicked (accounting for scroll)
-                                    let relative_y = click_y.saturating_sub(region.area.y + 1);
-                                    let visual_line =
-                                        relative_y as usize + app.backend_info_scroll_offset;
-
-                                    // Look up which backend item this line corresponds to
-                                    if let Some(&item_index) = line_to_item.get(&visual_line) {
-                                        // Make sure it's a backend (not a group header)
-                                        if matches!(
-                                            app.backend_items.get(item_index),
-                                            Some(ui::BackendSelectorItem::Backend { .. })
-                                        ) {
-                                            app.backend_selected_index = item_index;
-                                            // Don't update last_backend_selection here
-                                            // Let the auto-scroll code detect the change on next frame
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Found matching region, stop searching
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    // Ignore other mouse events (moves, etc.)
+                    Some(ui::Layer::Graph | ui::Layer::Throttle) | None => {}
                 }
             }
-        }
-        _ => {
-            // Ignore other event types
-        }
+            MouseEventKind::Down(MouseButton::Left) => click(
+                app,
+                mouse.position.x,
+                mouse.position.y,
+                config,
+                committed_regions,
+                effects,
+            ),
+            _ => {}
+        },
+        _ => {}
     }
     false
 }
@@ -668,11 +409,6 @@ enum Message {
     MonitorClosed,
     Effect(Box<ServiceResult>, u64, Option<i32>),
     EffectFailed(String),
-    Details {
-        generation: u64,
-        pid: i32,
-        details: crate::process::ProcessDetails,
-    },
     Procs(crate::procs::ProcSnapshot),
     DeepDetail(Box<crate::procs::detail::DeepDetail>),
     Report(crate::procs::actions::ActionReport),
@@ -690,8 +426,6 @@ struct Application {
     receipts: OrderedReceipts<(ServiceResult, u64, Option<i32>)>,
     dialog_generation: u64,
     in_flight_effects: usize,
-    detail_generation: u64,
-    detail_pid: Option<i32>,
     procs: Option<tokio::sync::mpsc::Receiver<crate::procs::ProcSnapshot>>,
     collector: Option<std::sync::mpsc::Sender<crate::procs::collector::CollectorCommand>>,
 }
@@ -891,17 +625,6 @@ impl Application {
             self.router.set_focused(&bmux_tui::hit::HitId::new(id));
             return true;
         }
-        if self.app.show_help {
-            return false;
-        }
-        if self.app.view_mode == ui::ViewMode::ProcessDetail {
-            if key.modifiers.shift {
-                self.app.previous_detail_tab();
-            } else {
-                self.app.next_detail_tab();
-            }
-            return true;
-        }
         false
     }
     fn effect(&mut self, effect: Effect, update: &mut Update<Message>) -> Result<()> {
@@ -929,35 +652,6 @@ impl Application {
             })
         }));
         Ok(())
-    }
-    fn refresh_details(&mut self, update: &mut Update<Message>, force: bool) {
-        let pid = self.app.selected_process_detail_pid;
-        if !force && pid == self.detail_pid {
-            return;
-        }
-        if pid != self.detail_pid {
-            self.app.update_process_details(None);
-        }
-        self.detail_pid = pid;
-        self.detail_generation += 1;
-        if let Some(pid) = pid {
-            let generation = self.detail_generation;
-            update.commands.push(Command::replace(
-                bmux_tui_runtime::CommandKey::new("process-details"),
-                async move {
-                    let details = tokio::task::spawn_blocking(move || {
-                        crate::process::ProcessDetails::from_pid(pid)
-                    })
-                    .await
-                    .ok()?;
-                    Some(Message::Details {
-                        generation,
-                        pid,
-                        details,
-                    })
-                },
-            ));
-        }
     }
 }
 impl Program for Application {
@@ -1002,10 +696,6 @@ impl Program for Application {
                     return Ok(update);
                 }
                 if !self.legacy_active() {
-                    let route_view = self.app.view_mode;
-                    if route_view == ui::ViewMode::ProcessDetail {
-                        self.app.view_mode = ui::ViewMode::ProcessView;
-                    }
                     self.app.explorer.handle_event(&event);
                     let identity = self.dialog_identity();
                     self.drain_explorer(&mut update)?;
@@ -1019,39 +709,32 @@ impl Program for Application {
                 }
                 let identity = self.dialog_identity();
                 let route = self.router.route(event.clone());
-                let force_quit = matches!(&event, Event::Key(key) if key.key == KeyCode::Char('c') && key.modifiers.ctrl);
-                if !force_quit && self.app.handle_component_event(&route) {
+                if self.app.handle_component_event(&route) {
                     if identity != self.dialog_identity() {
                         self.dialog_generation += 1;
                     }
-                    self.refresh_details(&mut update, false);
                     return Ok(update);
                 }
-                {
-                    let mut effects = Vec::new();
-                    // Input before the first service snapshot still supports quit/resize.
-                    if let Some(backend) = &self.backend {
-                        if input(
-                            &mut self.app,
-                            event,
-                            &mut self.config,
-                            backend,
-                            &self.committed_regions,
-                            &mut effects,
-                        ) {
-                            update.lifecycle = Lifecycle::Exit;
-                        }
-                    } else if matches!(event, Event::Key(key) if key.key == KeyCode::Char('q') || (key.key == KeyCode::Char('c') && key.modifiers.ctrl))
-                    {
-                        update.lifecycle = Lifecycle::Exit;
-                    }
-                    if identity != self.dialog_identity() {
-                        self.dialog_generation += 1;
-                    }
-                    for effect in effects {
-                        self.effect(effect, &mut update)?;
-                    }
-                    self.refresh_details(&mut update, false);
+                let traffic = self.app.traffic_view_mode;
+                let mut effects = Vec::new();
+                if input(
+                    &mut self.app,
+                    event,
+                    &mut self.config,
+                    self.backend.as_ref(),
+                    &self.committed_regions,
+                    &mut effects,
+                ) {
+                    update.lifecycle = Lifecycle::Exit;
+                }
+                if traffic != self.app.traffic_view_mode {
+                    self.sync_traffic();
+                }
+                if identity != self.dialog_identity() {
+                    self.dialog_generation += 1;
+                }
+                for effect in effects {
+                    self.effect(effect, &mut update)?;
                 }
             }
             RuntimeEvent::Message(Message::Monitor(mut data)) => {
@@ -1087,7 +770,6 @@ impl Program for Application {
                         self.app.interface_list.len()
                     );
                 }
-                self.refresh_details(&mut update, true);
             }
             RuntimeEvent::Message(Message::Effect(result, generation, dialog_pid)) => {
                 self.in_flight_effects = self.in_flight_effects.saturating_sub(1);
@@ -1117,18 +799,6 @@ impl Program for Application {
                         self.app.build_backend_items(self.backend.as_ref().unwrap());
                     }
                 }
-            }
-            RuntimeEvent::Message(Message::Details {
-                generation,
-                pid,
-                details,
-            }) => {
-                if generation != self.detail_generation
-                    || Some(pid) != self.app.selected_process_detail_pid
-                {
-                    return Ok(Update::none());
-                }
-                self.app.update_process_details(Some(details));
             }
             RuntimeEvent::Message(Message::Procs(snapshot)) => {
                 self.app.explorer.apply_snapshot(snapshot);
@@ -1238,8 +908,6 @@ pub(super) async fn run(startup: Startup) -> Result<()> {
         receipts: OrderedReceipts::default(),
         dialog_generation: 0,
         in_flight_effects: 0,
-        detail_generation: 0,
-        detail_pid: None,
         procs: Some(procs),
         collector: Some(collector.commands.clone()),
     };
@@ -1431,8 +1099,6 @@ mod tests {
             receipts: Default::default(),
             dialog_generation: 0,
             in_flight_effects: 0,
-            detail_generation: 0,
-            detail_pid: None,
             procs: None,
             collector: None,
         }
@@ -1457,26 +1123,79 @@ mod tests {
         );
         program.committed_regions = program.app.clickable_regions.clone();
     }
+    fn shifted(code: KeyCode) -> RuntimeEvent<Message> {
+        let mut modifiers = bmux_keyboard::Modifiers::NONE;
+        modifiers.shift = true;
+        RuntimeEvent::Terminal(Event::Key(bmux_keyboard::KeyStroke::with_modifiers(
+            code, modifiers,
+        )))
+    }
+    fn ctrl_c() -> RuntimeEvent<Message> {
+        let mut modifiers = bmux_keyboard::Modifiers::NONE;
+        modifiers.ctrl = true;
+        RuntimeEvent::Terminal(Event::Key(bmux_keyboard::KeyStroke::with_modifiers(
+            KeyCode::Char('c'),
+            modifiers,
+        )))
+    }
+    fn left_click(x: u16, y: u16) -> RuntimeEvent<Message> {
+        RuntimeEvent::Terminal(Event::Mouse(bmux_tui::event::MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            bmux_tui::geometry::Point::new(x, y),
+        )))
+    }
+    fn wheel(down: bool) -> RuntimeEvent<Message> {
+        RuntimeEvent::Terminal(Event::Mouse(bmux_tui::event::MouseEvent::new(
+            if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            bmux_tui::geometry::Point::new(0, 0),
+        )))
+    }
+    fn with_interfaces(program: &mut Application) {
+        for name in ["en0", "lo0"] {
+            program
+                .app
+                .interface_list
+                .push(crate::process::InterfaceInfo {
+                    name: name.into(),
+                    mac_address: None,
+                    ip_addresses: vec![],
+                    is_up: true,
+                    is_loopback: name == "lo0",
+                    total_download_rate: 0,
+                    total_upload_rate: 0,
+                    process_count: 0,
+                });
+        }
+    }
+    fn on_en0(pid: i32) -> crate::process::ProcessInfo {
+        let mut process = crate::process::ProcessInfo::new(pid, format!("net-{pid}"));
+        process.download_rate = pid as u64;
+        process
+            .interface_stats
+            .insert("en0".into(), Default::default());
+        process
+    }
+    fn region(
+        program: &Application,
+        matches: impl Fn(&ui::ClickableRegionType) -> bool,
+    ) -> ui::Rect {
+        program
+            .committed_regions
+            .iter()
+            .find(|r| matches(&r.region_type))
+            .map(|r| r.area)
+            .expect("region painted and committed")
+    }
     #[test]
-    #[ignore = "legacy process view replaced by explorer; pending migration"]
     fn committed_interface_space_toggles_selected_filter_for_both_backends() {
         for space in [KeyCode::Space, KeyCode::Char(' ')] {
             let mut program = application();
-            for name in ["en0", "lo0"] {
-                program
-                    .app
-                    .interface_list
-                    .push(crate::process::InterfaceInfo {
-                        name: name.into(),
-                        mac_address: None,
-                        ip_addresses: vec![],
-                        is_up: true,
-                        is_loopback: name == "lo0",
-                        total_download_rate: 0,
-                        total_upload_rate: 0,
-                        process_count: 0,
-                    });
-            }
+            with_interfaces(&mut program);
+            // 'i' is an explorer action that opens the legacy interface modal.
             program.update(key(KeyCode::Char('i'))).unwrap();
             assert_eq!(program.app.view_mode, ui::ViewMode::InterfaceList);
             paint_commit(&mut program);
@@ -1498,27 +1217,277 @@ mod tests {
             program.update(key(space)).unwrap();
             assert!(program.app.is_interface_filtered("en0"), "{space:?}");
             assert!(!program.app.is_interface_filtered("lo0"), "{space:?}");
+            assert!(program.app.explorer.take_requests().is_empty());
         }
     }
-
     #[test]
-    #[ignore = "legacy process view replaced by explorer; pending migration"]
-    fn committed_detail_scene_preserves_semantic_tab_and_shift_tab() {
+    fn explorer_owns_tab_and_shift_tab_when_no_legacy_surface_is_open() {
+        use crate::procs::columns::Preset;
         let mut program = application();
-        program.app.view_mode = ui::ViewMode::ProcessDetail;
-        program.app.detail_tab = ui::ProcessDetailTab::Overview;
-        paint_commit(&mut program);
+        let start = program.app.explorer.settings.preset;
+        let index = |p: Preset| Preset::ALL.iter().position(|q| *q == p).unwrap();
         program.update(key(KeyCode::Tab)).unwrap();
-        assert_eq!(program.app.detail_tab, ui::ProcessDetailTab::Connections);
+        let next = program.app.explorer.settings.preset;
+        assert_eq!(index(next), (index(start) + 1) % Preset::ALL.len());
+        program.update(shifted(KeyCode::Tab)).unwrap();
+        assert_eq!(program.app.explorer.settings.preset, start);
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+    }
+    #[test]
+    fn modal_escape_closes_top_scope_before_quitting() {
+        let mut program = application();
+        // Explorer help overlay.
+        program.update(key(KeyCode::Char('h'))).unwrap();
+        assert!(matches!(
+            program.app.explorer.overlays.last(),
+            Some(ui::explorer::overlays::Overlay::Help(_))
+        ));
+        assert_eq!(
+            program.update(key(KeyCode::Escape)).unwrap().lifecycle,
+            Lifecycle::Continue
+        );
+        assert!(program.app.explorer.overlays.is_empty());
+        // Legacy interface modal and its help.
+        program.update(key(KeyCode::Char('i'))).unwrap();
+        program.update(key(KeyCode::Char('?'))).unwrap();
+        assert!(program.app.show_help);
+        for _ in 0..2 {
+            assert_eq!(
+                program.update(key(KeyCode::Escape)).unwrap().lifecycle,
+                Lifecycle::Continue
+            );
+        }
+        assert!(!program.app.show_help);
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+        assert_eq!(
+            program.update(key(KeyCode::Char('q'))).unwrap().lifecycle,
+            Lifecycle::Exit
+        );
+    }
+    #[test]
+    fn ctrl_c_precedes_every_modal() {
+        let open: [fn(&mut Application); 6] = [
+            |p| p.app.show_help = true,
+            |p| p.app.show_throttle_dialog = true,
+            |p| p.app.show_graph = true,
+            |p| p.app.show_backend_info = true,
+            |p| p.app.view_mode = ui::ViewMode::InterfaceDetail,
+            |p| p.app.explorer.run(ui::explorer::actions::Action::Settings),
+        ];
+        for open in open {
+            let mut program = application();
+            open(&mut program);
+            assert_eq!(program.update(ctrl_c()).unwrap().lifecycle, Lifecycle::Exit);
+        }
+        let mut program = application();
+        program.backend = None;
+        program.app.view_mode = ui::ViewMode::InterfaceList;
+        // Before the first service snapshot, 'q' closes the modal instead of quitting.
+        assert_eq!(
+            program.update(key(KeyCode::Char('q'))).unwrap().lifecycle,
+            Lifecycle::Continue
+        );
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+    }
+    #[test]
+    fn throttle_dialog_owns_input_while_open() {
+        let mut program = application();
+        program.app.show_throttle_dialog = true;
+        program.app.throttle_dialog.target_pid = Some(10);
+        program.app.throttle_dialog.target_name = Some("net-10".into());
         paint_commit(&mut program);
-        let mut modifiers = bmux_keyboard::Modifiers::NONE;
-        modifiers.shift = true;
-        program
-            .update(RuntimeEvent::Terminal(Event::Key(
-                bmux_keyboard::KeyStroke::with_modifiers(KeyCode::Tab, modifiers),
-            )))
+        for code in [KeyCode::Char('4'), KeyCode::Char('2')] {
+            program.update(key(code)).unwrap();
+        }
+        assert_eq!(program.app.throttle_dialog.download_input, "42");
+        program.update(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(program.app.throttle_dialog.traffic_type_index, 1);
+        // Keys the explorer would act on are swallowed by the dialog.
+        for code in [KeyCode::Char('i'), KeyCode::Char('h'), KeyCode::Char('x')] {
+            program.update(key(code)).unwrap();
+        }
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+        assert!(program.app.explorer.overlays.is_empty());
+        // The traffic row is clickable; a click outside never discards input.
+        paint_commit(&mut program);
+        let row = region(&program, |r| {
+            matches!(r, ui::ClickableRegionType::ThrottleTraffic)
+        });
+        program.update(left_click(row.x + 2, row.y)).unwrap();
+        assert_eq!(program.app.throttle_dialog.traffic_type_index, 2);
+        program.update(left_click(0, 0)).unwrap();
+        assert!(program.app.show_throttle_dialog);
+        assert_eq!(
+            program.update(key(KeyCode::Char('q'))).unwrap().lifecycle,
+            Lifecycle::Continue
+        );
+        assert!(!program.app.show_throttle_dialog);
+        assert_eq!(program.app.throttle_dialog.download_input, "");
+    }
+    #[test]
+    fn backends_modal_routes_navigation_apply_and_dismissal() {
+        let mut program = application();
+        let mut info = backend();
+        info.available_upload = vec![
+            ("a".into(), crate::backends::BackendPriority::Good, true),
+            ("b".into(), crate::backends::BackendPriority::Fallback, true),
+        ];
+        info.active_upload = Some("a".into());
+        program.backend = Some(info);
+        program.update(key(KeyCode::Char('b'))).unwrap();
+        assert!(program.app.show_backend_info);
+        let first = program.app.backend_selected_index;
+        program.update(key(KeyCode::Down)).unwrap();
+        assert_ne!(program.app.backend_selected_index, first);
+        assert_eq!(
+            program.app.get_selected_backend(),
+            Some(("b", ui::BackendGroup::Upload))
+        );
+        program.update(key(KeyCode::Space)).unwrap();
+        // The disconnected test service rejects the queued SelectBackend effect.
+        assert!(program.app.status_message.starts_with("Failed to queue"));
+        // Clicking a row selects it; clicking outside the panel closes it.
+        paint_commit(&mut program);
+        let (area, line) = program
+            .committed_regions
+            .iter()
+            .find_map(|r| match &r.region_type {
+                ui::ClickableRegionType::BackendModal { line_to_item } => line_to_item
+                    .iter()
+                    .find(|(_, item)| **item == first)
+                    .map(|(line, _)| (r.area, *line)),
+                _ => None,
+            })
             .unwrap();
-        assert_eq!(program.app.detail_tab, ui::ProcessDetailTab::Overview);
+        let y = area.y + 1 + (line - program.app.backend_info_scroll_offset) as u16;
+        program.update(left_click(area.x + 5, y)).unwrap();
+        assert_eq!(program.app.backend_selected_index, first);
+        assert!(program.app.show_backend_info);
+        program.update(left_click(0, 0)).unwrap();
+        assert!(!program.app.show_backend_info);
+        assert_eq!(program.app.top_layer(), None);
+    }
+    #[test]
+    fn graph_routes_close_keys_and_clicks_without_quitting() {
+        let mut program = application();
+        program.app.update_processes([(10, on_en0(10))].into());
+        program.app.selected_index = Some(0);
+        for close in [
+            key(KeyCode::Char('g')),
+            key(KeyCode::Char('q')),
+            key(KeyCode::Escape),
+        ] {
+            program.app.show_graph = true;
+            program.update(key(KeyCode::Char('i'))).unwrap();
+            assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+            assert_eq!(
+                program.update(close).unwrap().lifecycle,
+                Lifecycle::Continue
+            );
+            assert!(!program.app.show_graph);
+        }
+        program.app.show_graph = true;
+        paint_commit(&mut program);
+        let panel = region(&program, |r| {
+            matches!(r, ui::ClickableRegionType::Panel(ui::Layer::Graph))
+        });
+        program
+            .update(left_click(panel.x + 3, panel.y + 3))
+            .unwrap();
+        assert!(program.app.show_graph);
+        program.update(wheel(true)).unwrap();
+        assert!(program.app.show_graph);
+        program.update(left_click(0, 0)).unwrap();
+        assert!(!program.app.show_graph);
+    }
+    #[test]
+    fn interface_modal_mouse_selects_toggles_and_dismisses() {
+        let mut program = application();
+        with_interfaces(&mut program);
+        program.update(key(KeyCode::Char('i'))).unwrap();
+        paint_commit(&mut program);
+        let (area, header) = program
+            .committed_regions
+            .iter()
+            .find_map(|r| match r.region_type {
+                ui::ClickableRegionType::InterfaceModal { header_lines } => {
+                    Some((r.area, header_lines))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let lo0 = area.y + 1 + header as u16 + 1 - program.app.interface_modal_scroll_offset as u16;
+        program.update(left_click(area.x + 10, lo0)).unwrap();
+        assert_eq!(program.app.selected_interface_index, Some(1));
+        assert_eq!(program.app.active_interface_filters, None);
+        program.update(left_click(area.x + 4, lo0)).unwrap();
+        assert!(!program.app.is_interface_filtered("lo0"));
+        assert_eq!(
+            program.config.filtered_interfaces,
+            Some(vec!["en0".to_string()])
+        );
+        paint_commit(&mut program);
+        program.update(left_click(0, 0)).unwrap();
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+        assert_eq!(
+            program.app.active_interface_filters,
+            Some(vec!["en0".into()])
+        );
+    }
+    #[test]
+    fn interface_detail_scrolls_and_back_button_returns_to_the_list() {
+        let mut program = application();
+        with_interfaces(&mut program);
+        program
+            .app
+            .update_processes((1..=30).map(|pid| (pid, on_en0(pid))).collect());
+        program.update(key(KeyCode::Char('i'))).unwrap();
+        program.update(key(KeyCode::Enter)).unwrap();
+        assert_eq!(program.app.view_mode, ui::ViewMode::InterfaceDetail);
+        assert_eq!(program.app.selected_interface_name.as_deref(), Some("en0"));
+        program.update(key(KeyCode::Down)).unwrap();
+        assert_eq!(program.app.interface_detail_state.selected(), Some(0));
+        program.update(key(KeyCode::PageDown)).unwrap();
+        assert_eq!(program.app.interface_detail_state.selected(), Some(10));
+        program.update(wheel(true)).unwrap();
+        assert_eq!(program.app.interface_detail_state.selected(), Some(13));
+        for _ in 0..5 {
+            program.update(key(KeyCode::PageDown)).unwrap();
+        }
+        assert_eq!(program.app.interface_detail_state.selected(), Some(29));
+        paint_commit(&mut program);
+        let back = region(&program, |r| {
+            matches!(r, ui::ClickableRegionType::InterfaceBack)
+        });
+        program.update(left_click(back.x, back.y)).unwrap();
+        assert_eq!(program.app.view_mode, ui::ViewMode::InterfaceList);
+        program.update(key(KeyCode::Char('i'))).unwrap();
+        assert_eq!(program.app.view_mode, ui::ViewMode::ProcessView);
+    }
+    #[test]
+    fn traffic_mode_from_interface_view_keeps_the_explorer_in_sync() {
+        let mut program = application();
+        program.app.view_mode = ui::ViewMode::InterfaceList;
+        program.update(key(KeyCode::Char('l'))).unwrap();
+        assert_eq!(program.app.traffic_view_mode, ui::TrafficViewMode::Internet);
+        assert_eq!(
+            program.app.explorer.traffic,
+            crate::process::TrafficType::Internet
+        );
+        assert_eq!(
+            program.config.traffic_view_mode,
+            Some(crate::process::TrafficType::Internet)
+        );
+    }
+    #[test]
+    fn clicks_before_the_first_commit_never_dismiss() {
+        let mut program = application();
+        program.app.show_help = true;
+        program.update(left_click(0, 0)).unwrap();
+        assert!(program.app.show_help);
+        paint_commit(&mut program);
+        program.update(left_click(0, 0)).unwrap();
+        assert!(!program.app.show_help);
     }
     #[test]
     fn committed_throttle_tab_syncs_field_focus_without_invalidating_pending_receipt() {
@@ -1617,61 +1586,6 @@ mod tests {
         assert_eq!(receipts.pop(), None);
     }
     #[test]
-    #[ignore = "legacy process view replaced by explorer; pending migration"]
-    fn modal_escape_closes_top_scope_before_quitting() {
-        let mut program = application();
-        program.app.show_help = true;
-        assert_eq!(
-            program.update(key(KeyCode::Escape)).unwrap().lifecycle,
-            Lifecycle::Continue
-        );
-        assert!(!program.app.show_help);
-        assert_eq!(
-            program.update(key(KeyCode::Escape)).unwrap().lifecycle,
-            Lifecycle::Exit
-        );
-    }
-    #[test]
-    #[ignore = "legacy process view replaced by explorer; pending migration"]
-    fn shift_tab_precedes_tab_and_ctrl_c_precedes_modals() {
-        let mut program = application();
-        program.app.view_mode = ui::ViewMode::ProcessDetail;
-        program.app.detail_tab = ui::ProcessDetailTab::Overview;
-        let mut modifiers = bmux_keyboard::Modifiers::NONE;
-        modifiers.shift = true;
-        program
-            .update(RuntimeEvent::Terminal(Event::Key(
-                bmux_keyboard::KeyStroke::with_modifiers(KeyCode::Tab, modifiers),
-            )))
-            .unwrap();
-        assert_eq!(program.app.detail_tab, ui::ProcessDetailTab::System);
-        program.app.show_help = true;
-        modifiers.shift = false;
-        modifiers.ctrl = true;
-        let update = program
-            .update(RuntimeEvent::Terminal(Event::Key(
-                bmux_keyboard::KeyStroke::with_modifiers(KeyCode::Char('c'), modifiers),
-            )))
-            .unwrap();
-        assert_eq!(update.lifecycle, Lifecycle::Exit);
-    }
-    #[test]
-    fn stale_process_details_cannot_replace_new_selection() {
-        let mut program = application();
-        program.detail_generation = 2;
-        program.app.selected_process_detail_pid = Some(20);
-        let details = crate::process::ProcessDetails::from_pid(-1);
-        let update = program
-            .update(RuntimeEvent::Message(Message::Details {
-                generation: 1,
-                pid: 10,
-                details,
-            }))
-            .unwrap();
-        assert_eq!(update.invalidation, bmux_tui_runtime::Invalidation::None);
-        assert!(program.app.cached_process_details.is_none());
-    }
-    #[test]
     fn old_throttle_receipt_does_not_touch_reopened_dialog() {
         let mut program = application();
         program.app.show_throttle_dialog = true;
@@ -1703,21 +1617,6 @@ mod tests {
         assert_eq!(program.app.throttle_dialog.target_pid, Some(20));
         assert!(!program.app.show_backend_compatibility_dialog);
         assert_eq!(program.app.status_message, "Failed old action");
-    }
-    #[test]
-    fn same_pid_refresh_keeps_cached_details_until_receipt() {
-        let mut program = application();
-        program.detail_pid = Some(10);
-        program.app.selected_process_detail_pid = Some(10);
-        let mut details = crate::process::ProcessDetails::from_pid(-1);
-        details.pid = 10;
-        program.app.update_process_details(Some(details));
-        let mut update = Update::none();
-        program.refresh_details(&mut update, true);
-        assert_eq!(program.app.cached_process_details.as_ref().unwrap().pid, 10);
-        program.app.selected_process_detail_pid = Some(20);
-        program.refresh_details(&mut update, false);
-        assert!(program.app.cached_process_details.is_none());
     }
     #[test]
     fn queued_monitor_samples_keep_acquisition_timestamps_and_all_history_updates() {

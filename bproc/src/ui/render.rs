@@ -37,9 +37,6 @@ impl ListState {
     pub fn selected(&self) -> Option<usize> {
         self.selected
     }
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
     pub fn offset_mut(&mut self) -> &mut usize {
         &mut self.offset
     }
@@ -119,22 +116,6 @@ pub fn root_area(cx: &PaintCx<'_, '_>) -> Rect {
         area.width,
         area.height,
     )
-}
-
-pub fn split_vertical(area: Rect, top: u16, bottom: u16) -> [Rect; 3] {
-    let top = top.min(area.height);
-    let bottom = bottom.min(area.height.saturating_sub(top));
-    let middle = area.height.saturating_sub(top).saturating_sub(bottom);
-    [
-        Rect::new(area.x, area.y, area.width, top),
-        Rect::new(area.x, area.y.saturating_add(top), area.width, middle),
-        Rect::new(
-            area.x,
-            area.y.saturating_add(top).saturating_add(middle),
-            area.width,
-            bottom,
-        ),
-    ]
 }
 
 fn paint_component(
@@ -221,8 +202,7 @@ pub fn paint_text(
     state.set(scroll);
     let mut policy = TextViewPolicy::bare();
     policy.alignment = presentation.alignment;
-    policy.keyboard = matches!(id, "help" | "backend" | "interfaces" | "compatibility")
-        || id.starts_with("detail.");
+    policy.keyboard = matches!(id, "help" | "backend" | "interfaces" | "compatibility");
     policy.mouse_wheel = policy.keyboard;
     let view = TextViewComponent::new(id.to_owned(), &lines, &state)
         .policy(policy)
@@ -438,70 +418,6 @@ pub fn paint_bandwidth_graph(
             Style::new().fg(Color::Yellow),
         );
     }
-}
-
-/// Draw the detail selector through BMUX while keeping the controller's legacy
-/// absolute tab hit ranges. Brackets are unstyled, as in the original header.
-pub fn paint_detail_tabs(
-    scene: &RefCell<ComponentScene>,
-    id: &str,
-    cx: &mut PaintCx<'_, '_>,
-    area: Rect,
-    selected: usize,
-) {
-    use bmux_tui_components::tab_bar::{
-        TabBarComponent, TabBarPolicy, TabBarState, TabBarStyles, TabItem,
-    };
-    let names = ["Overview", "Connections", "Traffic", "System"];
-    let items: Vec<_> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            let style = if index == selected {
-                Style::new()
-                    .fg(Color::Yellow)
-                    .bg(Color::BrightBlack)
-                    .add_modifier(bmux_tui::style::Modifier::BOLD)
-            } else {
-                Style::new().fg(Color::White)
-            };
-            TabItem::rich(
-                name,
-                Line::from_spans(vec![
-                    Span::raw("["),
-                    Span::styled(*name, style),
-                    Span::raw("]"),
-                ]),
-            )
-        })
-        .collect();
-    let state = scene
-        .borrow_mut()
-        .tabs
-        .entry(id.to_owned())
-        .or_insert_with(|| Rc::new(RefCell::new(TabBarState::new(Some(selected)))))
-        .clone();
-    state.borrow_mut().set_selected(Some(selected));
-    let styles = TabBarStyles {
-        normal: Style::new(),
-        selected: Style::new(),
-        focused: Style::new(),
-        separator: Style::new(),
-        ..Default::default()
-    };
-    let layout = paint_component(
-        cx,
-        area,
-        TabBarComponent::new(id.to_owned(), &items, &state)
-            .policy(TabBarPolicy::interactive().padding("", ""))
-            .styles(styles),
-    );
-    scene.borrow_mut().staged.push(Control {
-        id: id.to_owned(),
-        area,
-        layout,
-        kind: ControlKind::Tabs { state, items },
-    });
 }
 
 pub fn paint_input(

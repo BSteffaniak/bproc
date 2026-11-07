@@ -1,5 +1,7 @@
-/// Centralized keybinding definitions for bproc
-/// This ensures the help menu, status bar, and actual key handlers stay in sync
+//! Keys of the legacy interface views (interface filter modal and interface
+//! detail). The process explorer has its own registry in
+//! `ui::explorer::actions`; these rows only describe what `tui_runtime::input`
+//! handles while an interface view owns input.
 
 #[derive(Debug, Clone)]
 pub struct KeyBinding {
@@ -7,89 +9,39 @@ pub struct KeyBinding {
     pub description: &'static str,
 }
 
-/// Get all keybindings
+const fn bind(key: &'static str, description: &'static str) -> KeyBinding {
+    KeyBinding { key, description }
+}
+
+/// Every binding available in the interface views, for the help overlay.
 pub fn get_all_keybindings() -> Vec<KeyBinding> {
     vec![
-        // Navigation
-        KeyBinding {
-            key: "↑/k",
-            description: "Move selection up",
-        },
-        KeyBinding {
-            key: "↓/j",
-            description: "Move selection down",
-        },
-        KeyBinding {
-            key: "i",
-            description: "Toggle interface view",
-        },
-        KeyBinding {
-            key: "l",
-            description: "Cycle traffic view (All/Internet/Local)",
-        },
-        KeyBinding {
-            key: "Enter",
-            description: "View details (process or interface)",
-        },
-        KeyBinding {
-            key: "Tab",
-            description: "Switch tabs (in detail view)",
-        },
-        KeyBinding {
-            key: "Space",
-            description: "Toggle interface filter (in interface list)",
-        },
-        KeyBinding {
-            key: "A",
-            description: "Toggle All/None interfaces (in interface list)",
-        },
-        // Actions
-        KeyBinding {
-            key: "t",
-            description: "Throttle selected process",
-        },
-        KeyBinding {
-            key: "r",
-            description: "Remove throttle",
-        },
-        KeyBinding {
-            key: "g",
-            description: "Toggle bandwidth graph",
-        },
-        KeyBinding {
-            key: "f",
-            description: "Freeze/unfreeze sort order",
-        },
-        // System
-        KeyBinding {
-            key: "b",
-            description: "View/switch backends",
-        },
-        KeyBinding {
-            key: "h/?",
-            description: "Toggle this help",
-        },
-        KeyBinding {
-            key: "q/Esc",
-            description: "Quit (or close modal if open)",
-        },
-        KeyBinding {
-            key: "Ctrl+C",
-            description: "Force quit (always exits)",
-        },
+        bind("↑/k ↓/j", "Move the interface cursor / scroll processes"),
+        bind("PgUp PgDn", "Scroll by a page"),
+        bind("Space", "Toggle the interface filter (or click its box)"),
+        bind("A", "Toggle all / no interfaces"),
+        bind("Enter", "Show processes on the interface"),
+        bind("Esc q", "Back (detail → list → process explorer)"),
+        bind("i", "Close the interface views"),
+        bind("l", "Cycle traffic view (All/Internet/Local)"),
+        bind("b", "Throttle backends"),
+        bind("h ?", "Toggle this help"),
+        bind("Click", "Select; click outside a panel to close it"),
+        bind("Ctrl+C", "Quit bproc"),
     ]
 }
 
-/// Get keybindings for the status bar (most common ones)
-pub fn get_status_bar_keybindings() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("↑↓", "Navigate"),
-        ("i", "Interfaces"),
-        ("l", "Traffic"),
-        ("t", "Throttle"),
-        ("f", "Freeze"),
-        ("b", "Backends"),
-        ("h", "Help"),
-        ("q/Ctrl+C", "Quit"),
-    ]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bindings_are_unique_and_described() {
+        let all = get_all_keybindings();
+        let mut keys = std::collections::HashSet::new();
+        for binding in &all {
+            assert!(!binding.description.is_empty());
+            assert!(keys.insert(binding.key), "duplicate {}", binding.key);
+        }
+    }
 }

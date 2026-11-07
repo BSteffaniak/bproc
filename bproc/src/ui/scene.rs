@@ -12,7 +12,6 @@ use bmux_tui_components::{
         SelectableListHighlightPolicy, SelectableListItem, SelectableListPolicy,
         SelectableListState,
     },
-    tab_bar::{TabBarComponent, TabBarPolicy, TabBarState, TabItem},
     text_input::{TextInputPolicy, TextInputState},
     text_input_box::{TextInputBoxComponent, TextInputBoxPolicy},
     text_view::{TextViewComponent, TextViewPolicy},
@@ -27,7 +26,6 @@ use std::{
 pub struct ComponentScene {
     pub texts: HashMap<String, Rc<Cell<ScrollViewState>>>,
     pub inputs: HashMap<String, Rc<RefCell<TextInputState>>>,
-    pub tabs: HashMap<String, Rc<RefCell<TabBarState>>>,
     pub lists: HashMap<String, Rc<Cell<SelectableListState>>>,
     pub staged: Vec<Control>,
     pub committed: Vec<Control>,
@@ -49,10 +47,6 @@ pub enum ControlKind {
     Input {
         state: Rc<RefCell<TextInputState>>,
     },
-    Tabs {
-        state: Rc<RefCell<TabBarState>>,
-        items: Vec<TabItem<'static>>,
-    },
     List {
         items: Vec<SelectableListItem>,
         state: Rc<Cell<SelectableListState>>,
@@ -61,8 +55,7 @@ pub enum ControlKind {
 pub enum Change {
     Scroll(String, usize),
     Input(String, String),
-    Tab(usize),
-    List(String, Option<usize>, usize),
+    List(Option<usize>, usize),
     Consumed,
 }
 impl ComponentScene {
@@ -94,8 +87,7 @@ impl ComponentScene {
                 if pointer {
                     targeted
                         && (c.id == active
-                            || (active == "throttle" && c.id.starts_with("throttle."))
-                            || (active.starts_with("detail.") && c.id == "detail.tabs"))
+                            || (active == "throttle" && c.id.starts_with("throttle.")))
                 } else {
                     match &c.kind {
                         ControlKind::Input { .. } => {
@@ -109,7 +101,6 @@ impl ComponentScene {
                         ControlKind::Text { policy, .. } => {
                             policy.keyboard && c.id == active && targeted
                         }
-                        ControlKind::Tabs { .. } => targeted && active.starts_with("detail."),
                         ControlKind::List { .. } => c.id == active && targeted,
                     }
                 }
@@ -189,27 +180,6 @@ impl ComponentScene {
                     None
                 }
             }
-            ControlKind::Tabs { state, items } => {
-                let view = TabBarComponent::new(control.id, &items, &state)
-                    .policy(TabBarPolicy::interactive().padding("", ""));
-                let before = state.borrow().selected();
-                let outcome = cx.with_transform(
-                    0,
-                    0,
-                    i32::from(control.area.x),
-                    i64::from(control.area.y),
-                    control.area,
-                    |cx| view.event(&route.event, &control.layout, cx),
-                );
-                let after = state.borrow().selected();
-                if before != after {
-                    after.map(Change::Tab)
-                } else if !matches!(outcome, EventOutcome::Ignored) {
-                    Some(Change::Consumed)
-                } else {
-                    None
-                }
-            }
             ControlKind::List { items, state } => {
                 use bmux_keyboard::{KeyCode, KeyStroke};
                 if let Event::Key(key) = &route.event
@@ -229,11 +199,7 @@ impl ComponentScene {
                     initial.set_selected(Some(0));
                     initial.set_focused(Some(0));
                     state.set(initial);
-                    return Some(Change::List(
-                        control.id,
-                        Some(0),
-                        initial.vertical_scroll() as usize,
-                    ));
+                    return Some(Change::List(Some(0), initial.vertical_scroll() as usize));
                 }
                 initial.set_focused(initial.selected());
                 state.set(initial);
@@ -265,13 +231,8 @@ impl ComponentScene {
                 let mut after = state.get();
                 after.set_selected(after.focused());
                 state.set(after);
-                (after != before).then(|| {
-                    Change::List(
-                        control.id,
-                        after.selected(),
-                        after.vertical_scroll() as usize,
-                    )
-                })
+                (after != before)
+                    .then(|| Change::List(after.selected(), after.vertical_scroll() as usize))
             }
         }
     }
@@ -284,6 +245,6 @@ pub fn list_policy() -> SelectableListPolicy {
     policy.keyboard.wrap = true;
     policy.keyboard.enter_selects = false;
     policy.keyboard.space_selects = false;
-    policy.mouse.enabled = false; // process list wheel intentionally disabled
+    policy.mouse.enabled = false; // wheel is routed by the runtime
     policy
 }

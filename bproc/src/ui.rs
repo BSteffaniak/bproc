@@ -6,7 +6,7 @@ pub use bmux_tui::geometry::Rect;
 use bmux_tui::{
     paint::PaintCx,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Span,
 };
 mod events;
 pub mod explorer;
@@ -14,21 +14,18 @@ mod render;
 mod scene;
 use bmux_tui::text_width::display_width;
 pub use render::ListState;
-use render::{
-    PanelChrome, TextPresentation, clear, line, paint_border, paint_list, paint_text, root_area,
-    split_vertical,
-};
+use render::{PanelChrome, TextPresentation, clear, line, paint_list, paint_text, root_area};
 use std::collections::HashMap;
-use std::net::IpAddr;
 
 pub struct AppState {
     /// Process explorer (main screen) state.
     pub explorer: explorer::ExplorerState,
     component_scene: std::cell::RefCell<scene::ComponentScene>,
-    /// Runtime-owned process metadata; rendering never performs process I/O.
-    pub cached_process_details: Option<crate::process::ProcessDetails>,
+    /// Network view of processes after the interface filter, in stable order.
     pub process_list: Vec<ProcessInfo>,
-    pub unfiltered_process_list: Vec<ProcessInfo>, // Full list before interface filtering
+    /// Full network list before interface filtering (interface detail view).
+    pub unfiltered_process_list: Vec<ProcessInfo>,
+    /// Index into `process_list` of the process shown by the bandwidth graph.
     pub selected_index: Option<usize>,
     pub list_state: ListState,
     pub show_help: bool,
@@ -38,15 +35,14 @@ pub struct AppState {
     pub status_message: String,
     pub history: HistoryTracker,
     pub show_graph: bool,
-    pub sort_frozen: bool,
-    frozen_order: HashMap<i32, usize>, // PID -> position index
-    frozen_process_snapshot: Vec<ProcessInfo>, // Frozen snapshot of process list
     // Interface view state
     pub view_mode: ViewMode,
     pub interface_list: Vec<InterfaceInfo>,
     pub interface_list_state: ListState,
     pub selected_interface_index: Option<usize>,
     pub selected_interface_name: Option<String>,
+    /// Selection/scroll of the process list in the interface detail view.
+    pub interface_detail_state: ListState,
     // Interface filter state
     pub active_interface_filters: Option<Vec<String>>, // None = show all, Some([]) = show nothing, Some([...]) = filter
     // Traffic categorization view state
@@ -57,34 +53,35 @@ pub struct AppState {
     // Backend selection state (for interactive backend modal)
     pub backend_items: Vec<BackendSelectorItem>,
     pub backend_selected_index: usize,
-    // Process detail view state
-    pub selected_process_detail_pid: Option<i32>, // PID of process being detailed
-    pub detail_scroll_offset: usize,              // For scrolling long content
-    pub detail_tab: ProcessDetailTab,             // Which tab is active
     // Modal scroll offsets
     pub help_scroll_offset: usize,         // For help overlay scrolling
     pub backend_info_scroll_offset: usize, // For backend info modal scrolling
     pub interface_modal_scroll_offset: usize, // For interface filter modal scrolling
     pub backend_compat_scroll_offset: usize, // For backend compatibility dialog scrolling
-    // Auto-scroll optimization - track last selection to avoid redundant scrolling
-    // Mouse click selection - track clickable regions for each frame
+    /// Mouse targets painted this frame (promoted by the presenter commit).
     pub clickable_regions: Vec<ClickableRegion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ViewMode {
-    ProcessView,     // Show all processes
-    InterfaceList,   // Show list of interfaces
-    InterfaceDetail, // Show processes on selected interface
-    ProcessDetail,   // Show detailed info about a single process
+    /// The process explorer owns the screen.
+    ProcessView,
+    /// Interface filter modal over the explorer.
+    InterfaceList,
+    /// Processes on the selected interface.
+    InterfaceDetail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ProcessDetailTab {
-    Overview,    // General info + bandwidth stats
-    Connections, // Active network connections
-    Traffic,     // Detailed traffic breakdown
-    System,      // System/proc info
+/// Legacy (network) surfaces that can own input, topmost first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    Compatibility,
+    Backends,
+    Graph,
+    Throttle,
+    Help,
+    InterfaceList,
+    InterfaceDetail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,13 +99,6 @@ pub struct ClickableRegion {
 
 #[derive(Debug, Clone)]
 pub enum ClickableRegionType {
-    ProcessList {
-        first_visible_index: usize, // Index of first visible item in list
-    },
-    ProcessDetailTabs {
-        // Column ranges for each tab: (start_col, end_col, tab)
-        tab_ranges: Vec<(u16, u16, ProcessDetailTab)>,
-    },
     InterfaceModal {
         header_lines: usize, // Number of header lines before interface list starts
     },
@@ -116,6 +106,34 @@ pub enum ClickableRegionType {
         // Maps visual line (accounting for scroll) to backend item index
         line_to_item: HashMap<usize, usize>,
     },
+    /// Body of a legacy modal: swallows clicks; clicks outside the topmost
+    /// panel dismiss it (see `Layer::dismissible`).
+    Panel(Layer),
+    /// "Back" button of the interface detail view.
+    InterfaceBack,
+    /// Traffic type row of the throttle dialog (click cycles it).
+    ThrottleTraffic,
+}
+
+impl ClickableRegionType {
+    /// The surface this region belongs to.
+    pub fn layer(&self) -> Layer {
+        match self {
+            Self::InterfaceModal { .. } => Layer::InterfaceList,
+            Self::BackendModal { .. } => Layer::Backends,
+            Self::Panel(layer) => *layer,
+            Self::InterfaceBack => Layer::InterfaceDetail,
+            Self::ThrottleTraffic => Layer::Throttle,
+        }
+    }
+}
+
+impl Layer {
+    /// Whether a click outside the panel closes it. Dialogs holding typed
+    /// input or a pending decision are never dismissed by a stray click.
+    pub fn dismissible(self) -> bool {
+        !matches!(self, Layer::Throttle | Layer::Compatibility)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,33 +332,6 @@ impl ThrottleDialog {
 }
 
 impl AppState {
-    /// Supply details collected by the runtime refresh service (or clear stale details).
-    pub fn update_process_details(&mut self, details: Option<crate::process::ProcessDetails>) {
-        self.cached_process_details = details;
-    }
-
-    fn details_for(&self, process: &ProcessInfo) -> crate::process::ProcessDetails {
-        self.cached_process_details
-            .as_ref()
-            .filter(|d| d.pid == process.pid)
-            .cloned()
-            .unwrap_or_else(|| crate::process::ProcessDetails {
-                pid: process.pid,
-                name: process.name.clone(),
-                cmdline: None,
-                exe_path: None,
-                cwd: None,
-                state: None,
-                ppid: None,
-                threads: None,
-                memory_rss: None,
-                memory_vms: None,
-                uid: None,
-                gid: None,
-                connections: Vec::new(),
-            })
-    }
-
     pub fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(None); // Nothing selected initially
@@ -351,7 +342,6 @@ impl AppState {
         Self {
             explorer: explorer::ExplorerState::default(),
             component_scene: Default::default(),
-            cached_process_details: None,
             process_list: Vec::new(),
             unfiltered_process_list: Vec::new(),
             selected_index: None, // Nothing selected initially
@@ -362,24 +352,19 @@ impl AppState {
             show_throttle_dialog: false,
             show_backend_info: false,
             throttle_dialog: ThrottleDialog::new(),
-            status_message: String::from("bproc started. Press 'h' for help."),
-            sort_frozen: false,
-            frozen_order: HashMap::new(),
-            frozen_process_snapshot: Vec::new(),
+            status_message: String::from("bproc started. Press F1 or ? for help."),
             view_mode: ViewMode::ProcessView,
             interface_list: Vec::new(),
             interface_list_state,
             selected_interface_index: None,
             selected_interface_name: None,
+            interface_detail_state: ListState::default(),
             active_interface_filters: None, // Show all by default
             traffic_view_mode: TrafficViewMode::All, // Show all traffic by default
             show_backend_compatibility_dialog: false,
             backend_compatibility_dialog: None,
             backend_items: Vec::new(),
             backend_selected_index: 0,
-            selected_process_detail_pid: None,
-            detail_scroll_offset: 0,
-            detail_tab: ProcessDetailTab::Overview,
             help_scroll_offset: 0,
             backend_info_scroll_offset: 0,
             interface_modal_scroll_offset: 0,
@@ -418,10 +403,7 @@ impl AppState {
                 self.reset_interface_modal_scroll();
                 ViewMode::InterfaceList
             }
-            ViewMode::InterfaceList | ViewMode::InterfaceDetail | ViewMode::ProcessDetail => {
-                // Switch back to process view
-                ViewMode::ProcessView
-            }
+            ViewMode::InterfaceList | ViewMode::InterfaceDetail => ViewMode::ProcessView,
         };
     }
 
@@ -478,7 +460,73 @@ impl AppState {
     pub fn enter_interface_detail(&mut self) {
         if let Some(interface) = self.get_selected_interface() {
             self.selected_interface_name = Some(interface.name.clone());
+            self.interface_detail_state = ListState::default();
             self.view_mode = ViewMode::InterfaceDetail;
+        }
+    }
+
+    /// Keep the interface cursor on a real row whenever interfaces exist
+    /// (the modal may be opened before the first interface snapshot).
+    pub fn ensure_interface_cursor(&mut self) {
+        let len = self.interface_list.len();
+        let index = match self.selected_interface_index {
+            _ if len == 0 => None,
+            Some(index) => Some(index.min(len - 1)),
+            None => Some(0),
+        };
+        self.selected_interface_index = index;
+        self.interface_list_state.select(index);
+    }
+
+    /// The legacy surface that currently owns input, if any.
+    pub fn top_layer(&self) -> Option<Layer> {
+        if self.show_backend_compatibility_dialog {
+            Some(Layer::Compatibility)
+        } else if self.show_backend_info {
+            Some(Layer::Backends)
+        } else if self.show_graph {
+            Some(Layer::Graph)
+        } else if self.show_throttle_dialog {
+            Some(Layer::Throttle)
+        } else if self.show_help {
+            Some(Layer::Help)
+        } else {
+            match self.view_mode {
+                ViewMode::InterfaceList => Some(Layer::InterfaceList),
+                ViewMode::InterfaceDetail => Some(Layer::InterfaceDetail),
+                ViewMode::ProcessView => None,
+            }
+        }
+    }
+
+    /// Close `layer` as Esc would (used for clicks outside its panel).
+    pub fn dismiss(&mut self, layer: Layer) {
+        match layer {
+            Layer::Backends => {
+                self.show_backend_info = false;
+                self.reset_backend_info_scroll();
+            }
+            Layer::Graph => self.show_graph = false,
+            Layer::Help => {
+                self.show_help = false;
+                self.reset_help_scroll();
+            }
+            Layer::InterfaceList => {
+                self.view_mode = ViewMode::ProcessView;
+                self.status_message = "Closed interface filter - filter still active".into();
+            }
+            Layer::InterfaceDetail => {
+                self.exit_interface_detail();
+                self.status_message = "Back to interface list".into();
+            }
+            Layer::Throttle => {
+                self.show_throttle_dialog = false;
+                self.throttle_dialog.reset();
+            }
+            Layer::Compatibility => {
+                self.show_backend_compatibility_dialog = false;
+                self.backend_compatibility_dialog = None;
+            }
         }
     }
 
@@ -595,201 +643,36 @@ impl AppState {
     }
 
     pub fn update_processes(&mut self, process_map: ProcessMap) {
-        let mut processes: Vec<ProcessInfo>;
+        let mut processes: Vec<ProcessInfo> = process_map.into_values().collect();
+        // Deterministic multi-level order so the interface views never jump:
+        // terminated last, then DL rate, total DL, UL rate, total UL,
+        // throttled first, name, PID.
+        processes.sort_by(|a, b| {
+            let (a_dl_rate, a_dl_total, a_ul_rate, a_ul_total) = self.get_sort_rates(a);
+            let (b_dl_rate, b_dl_total, b_ul_rate, b_ul_total) = self.get_sort_rates(b);
+            a.is_terminated
+                .cmp(&b.is_terminated)
+                .then(b_dl_rate.cmp(&a_dl_rate))
+                .then(b_dl_total.cmp(&a_dl_total))
+                .then(b_ul_rate.cmp(&a_ul_rate))
+                .then(b_ul_total.cmp(&a_ul_total))
+                .then(b.is_throttled().cmp(&a.is_throttled()))
+                .then_with(|| a.name.cmp(&b.name))
+                .then(a.pid.cmp(&b.pid))
+        });
 
-        // Sort first (applies to both filtered and unfiltered lists)
-        if self.sort_frozen {
-            // FREEZE MODE: Use frozen snapshot, only update stats
-
-            // Start with the frozen snapshot
-            let mut frozen_processes = self.frozen_process_snapshot.clone();
-
-            // Update existing processes with new data from process_map
-            for frozen_proc in &mut frozen_processes {
-                if let Some(updated_proc) = process_map.get(&frozen_proc.pid) {
-                    // Process still exists - update its stats
-                    frozen_proc.download_rate = updated_proc.download_rate;
-                    frozen_proc.upload_rate = updated_proc.upload_rate;
-                    frozen_proc.total_download = updated_proc.total_download;
-                    frozen_proc.total_upload = updated_proc.total_upload;
-                    frozen_proc.internet_download_rate = updated_proc.internet_download_rate;
-                    frozen_proc.internet_upload_rate = updated_proc.internet_upload_rate;
-                    frozen_proc.internet_total_download = updated_proc.internet_total_download;
-                    frozen_proc.internet_total_upload = updated_proc.internet_total_upload;
-                    frozen_proc.local_download_rate = updated_proc.local_download_rate;
-                    frozen_proc.local_upload_rate = updated_proc.local_upload_rate;
-                    frozen_proc.local_total_download = updated_proc.local_total_download;
-                    frozen_proc.local_total_upload = updated_proc.local_total_upload;
-                    frozen_proc.throttle_limit = updated_proc.throttle_limit.clone();
-                    frozen_proc.interface_stats = updated_proc.interface_stats.clone();
-                    frozen_proc.connections = updated_proc.connections.clone();
-                    frozen_proc.is_terminated = false; // Still running
-                } else {
-                    // Process no longer exists - mark as terminated but keep in list
-                    frozen_proc.is_terminated = true;
-                    frozen_proc.download_rate = 0;
-                    frozen_proc.upload_rate = 0;
-                    frozen_proc.internet_download_rate = 0;
-                    frozen_proc.internet_upload_rate = 0;
-                    frozen_proc.local_download_rate = 0;
-                    frozen_proc.local_upload_rate = 0;
-                }
-            }
-
-            // Find and add any NEW processes (not in snapshot) to the end
-            use std::collections::HashSet;
-            let frozen_pids: HashSet<i32> = frozen_processes.iter().map(|p| p.pid).collect();
-            let mut new_processes: Vec<ProcessInfo> = process_map
-                .into_values()
-                .filter(|p| !frozen_pids.contains(&p.pid))
-                .collect();
-
-            // Add new processes to frozen_order map
-            let current_max = self.frozen_order.values().max().copied().unwrap_or(0);
-            let mut next_pos = current_max + 1;
-            for process in &new_processes {
-                self.frozen_order.insert(process.pid, next_pos);
-                next_pos += 1;
-            }
-
-            // Append new processes to the end
-            frozen_processes.append(&mut new_processes);
-
-            // Update the frozen snapshot
-            self.frozen_process_snapshot = frozen_processes.clone();
-
-            processes = frozen_processes;
-        } else {
-            // NORMAL MODE: Use fresh data from process_map
-            processes = process_map.into_values().collect();
-            // NORMAL MODE: Deterministic multi-level sort to prevent UI jumping
-            // Priority: terminated status -> DL rate -> total DL -> UL rate -> total UL -> throttle status -> name -> PID
-            processes.sort_by(|a, b| {
-                use std::cmp::Ordering;
-
-                // 1. Terminated processes always go to bottom
-                match (a.is_terminated, b.is_terminated) {
-                    (true, false) => return Ordering::Greater, // a terminated, b active -> a goes after b
-                    (false, true) => return Ordering::Less, // a active, b terminated -> a goes before b
-                    _ => {} // Both same state, continue to next criteria
-                }
-
-                // Get rates based on current traffic view mode
-                let (a_dl_rate, a_dl_total, a_ul_rate, a_ul_total) = self.get_sort_rates(a);
-                let (b_dl_rate, b_dl_total, b_ul_rate, b_ul_total) = self.get_sort_rates(b);
-
-                // 2. Download rate (descending - higher rates first)
-                match b_dl_rate.cmp(&a_dl_rate) {
-                    Ordering::Equal => {} // Continue to next criteria
-                    other => return other,
-                }
-
-                // 3. Total download (descending - higher totals first)
-                match b_dl_total.cmp(&a_dl_total) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-
-                // 4. Upload rate (descending - higher rates first)
-                match b_ul_rate.cmp(&a_ul_rate) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-
-                // 5. Total upload (descending - higher totals first)
-                match b_ul_total.cmp(&a_ul_total) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-
-                // 6. Throttle status (throttled processes first for visibility)
-                match (a.is_throttled(), b.is_throttled()) {
-                    (true, false) => return Ordering::Less, // a throttled, b not -> a goes first
-                    (false, true) => return Ordering::Greater, // a not throttled, b is -> b goes first
-                    _ => {}                                    // Both same throttle state, continue
-                }
-
-                // 7. Process name (alphabetical)
-                match a.name.cmp(&b.name) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-
-                // 8. PID (ascending - smaller PIDs first for determinism)
-                a.pid.cmp(&b.pid)
-            });
-        }
-
-        // Store sorted unfiltered list (for InterfaceDetail view)
+        // Keep following the same process (the graph) across re-sorts.
+        let selected_pid = self.get_selected_process().map(|p| p.pid);
         self.unfiltered_process_list = processes.clone();
-
-        // Apply interface filter for ProcessView/InterfaceList views
-        processes = self.apply_process_filter(processes);
-
-        self.process_list = processes;
-
-        // Adjust selection if out of bounds
-        if let Some(index) = self.selected_index
-            && index >= self.process_list.len()
-            && !self.process_list.is_empty()
-        {
-            self.selected_index = Some(self.process_list.len() - 1);
-            self.list_state.select(Some(self.process_list.len() - 1));
-        }
-    }
-
-    pub fn select_next(&mut self) {
-        if self.process_list.is_empty() {
-            return;
-        }
-
-        let new_index = match self.selected_index {
-            None => 0, // If nothing selected, select first item
-            Some(idx) => (idx + 1) % self.process_list.len(),
-        };
-
-        self.selected_index = Some(new_index);
-        self.list_state.select(Some(new_index));
-    }
-
-    pub fn select_previous(&mut self) {
-        if self.process_list.is_empty() {
-            return;
-        }
-
-        let new_index = match self.selected_index {
-            None => 0, // If nothing selected, select first item
-            Some(0) => self.process_list.len() - 1,
-            Some(idx) => idx - 1,
-        };
-
-        self.selected_index = Some(new_index);
-        self.list_state.select(Some(new_index));
+        self.process_list = self.apply_process_filter(processes);
+        self.selected_index =
+            selected_pid.and_then(|pid| self.process_list.iter().position(|p| p.pid == pid));
+        self.list_state.select(self.selected_index);
     }
 
     pub fn get_selected_process(&self) -> Option<&ProcessInfo> {
         self.selected_index
             .and_then(|idx| self.process_list.get(idx))
-    }
-
-    /// Toggle sort freeze mode
-    pub fn toggle_sort_freeze(&mut self) {
-        self.sort_frozen = !self.sort_frozen;
-
-        if self.sort_frozen {
-            // Entering freeze mode - capture current process list as snapshot
-            self.frozen_order.clear();
-            for (index, process) in self.process_list.iter().enumerate() {
-                self.frozen_order.insert(process.pid, index);
-            }
-
-            // Store complete snapshot of current process list
-            self.frozen_process_snapshot = self.process_list.clone();
-        } else {
-            // Exiting freeze mode - clear frozen data
-            self.frozen_order.clear();
-            self.frozen_process_snapshot.clear();
-        }
     }
 
     /// Apply interface filter to process list
@@ -971,66 +854,6 @@ impl AppState {
         None
     }
 
-    // Process detail view navigation methods
-
-    /// Enter process detail view for the selected process
-    pub fn enter_process_detail(&mut self) {
-        if let Some(process) = self.get_selected_process() {
-            self.selected_process_detail_pid = Some(process.pid);
-            self.detail_scroll_offset = 0;
-            self.detail_tab = ProcessDetailTab::Overview;
-            self.view_mode = ViewMode::ProcessDetail;
-        }
-    }
-
-    /// Exit process detail view and return to process list
-    pub fn exit_process_detail(&mut self) {
-        self.view_mode = ViewMode::ProcessView;
-        self.selected_process_detail_pid = None;
-        self.detail_scroll_offset = 0;
-    }
-
-    /// Move to the next detail tab
-    pub fn next_detail_tab(&mut self) {
-        self.detail_tab = match self.detail_tab {
-            ProcessDetailTab::Overview => ProcessDetailTab::Connections,
-            ProcessDetailTab::Connections => ProcessDetailTab::Traffic,
-            ProcessDetailTab::Traffic => ProcessDetailTab::System,
-            ProcessDetailTab::System => ProcessDetailTab::Overview,
-        };
-        self.detail_scroll_offset = 0; // Reset scroll when changing tabs
-    }
-
-    /// Move to the previous detail tab
-    pub fn previous_detail_tab(&mut self) {
-        self.detail_tab = match self.detail_tab {
-            ProcessDetailTab::Overview => ProcessDetailTab::System,
-            ProcessDetailTab::Connections => ProcessDetailTab::Overview,
-            ProcessDetailTab::Traffic => ProcessDetailTab::Connections,
-            ProcessDetailTab::System => ProcessDetailTab::Traffic,
-        };
-        self.detail_scroll_offset = 0; // Reset scroll when changing tabs
-    }
-
-    /// Scroll detail view up
-    pub fn scroll_detail_up(&mut self) {
-        self.detail_scroll_offset = self.detail_scroll_offset.saturating_sub(1);
-    }
-
-    /// Scroll detail view down
-    pub fn scroll_detail_down(&mut self) {
-        self.detail_scroll_offset = self.detail_scroll_offset.saturating_add(1);
-    }
-
-    /// Get the process being detailed (if still exists in process list)
-    pub fn get_detail_process(&self) -> Option<&ProcessInfo> {
-        if let Some(pid) = self.selected_process_detail_pid {
-            self.process_list.iter().find(|p| p.pid == pid)
-        } else {
-            None
-        }
-    }
-
     // Modal scroll methods
 
     /// Reset help overlay scroll when opened
@@ -1130,56 +953,43 @@ pub fn draw_ui_with_backend_info(
     backend_info: Option<&BackendInfo>,
 ) {
     app.component_scene.borrow_mut().begin();
-    // Clear clickable regions from previous frame
     app.clickable_regions.clear();
 
     let root = root_area(f);
-    let chunks = split_vertical(root, 3, 5);
-
+    // The explorer always stays live underneath the legacy network surfaces.
+    draw_explorer(f, root, app, backend_info);
     match app.view_mode {
-        ViewMode::ProcessView | ViewMode::ProcessDetail => {
-            draw_explorer(f, root, app, backend_info);
-        }
-        ViewMode::InterfaceList => {
-            // Keep the live process explorer visible behind the modal.
-            draw_explorer(f, root, app, backend_info);
-            draw_interface_modal(f, root, app);
-        }
-        ViewMode::InterfaceDetail => {
-            draw_header(f, chunks[0], app);
-            draw_interface_detail(f, chunks[1], app);
-            draw_status_bar(f, chunks[2], app);
-        }
+        ViewMode::ProcessView => {}
+        ViewMode::InterfaceList => draw_interface_modal(f, root, app),
+        ViewMode::InterfaceDetail => draw_interface_detail(f, root, app),
     }
-
-    // Help overlay
     if app.show_help {
-        draw_help_overlay(f, root_area(f), app);
+        draw_help_overlay(f, root, app);
     }
-
-    // Throttle dialog
     if app.show_throttle_dialog {
-        draw_throttle_dialog(f, root_area(f), app);
+        draw_throttle_dialog(f, root, app);
     }
-
-    // Bandwidth graph overlay
     if app.show_graph {
-        draw_bandwidth_graph(f, root_area(f), app);
+        draw_bandwidth_graph(f, root, app);
     }
-
-    // Backend info modal (highest priority, renders on top)
     if app.show_backend_info
         && let Some(info) = backend_info
     {
-        draw_backend_info(f, root_area(f), app, info);
+        draw_backend_info(f, root, app, info);
     }
-
-    // Backend compatibility dialog (highest priority - renders on top of everything)
     if app.show_backend_compatibility_dialog
         && let Some(dialog) = app.backend_compatibility_dialog.clone()
     {
-        draw_backend_compatibility_dialog(f, root_area(f), app, &dialog);
+        draw_backend_compatibility_dialog(f, root, app, &dialog);
     }
+}
+
+/// Record a legacy modal body for click routing.
+fn push_panel(app: &mut AppState, area: Rect, layer: Layer) {
+    app.clickable_regions.push(ClickableRegion {
+        area,
+        region_type: ClickableRegionType::Panel(layer),
+    });
 }
 
 fn draw_explorer(
@@ -1204,412 +1014,39 @@ fn draw_explorer(
     app.explorer.draw(f, area, &env);
 }
 
-fn draw_header(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
-    let header = (
-        render::lines("🔥 bproc v0.1.0 - Network Monitor & Throttler 🔥"),
-        TextPresentation {
-            style: Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            chrome: Some(PanelChrome::default()),
-            ..TextPresentation::default()
-        },
-    );
-
-    paint_text(&app.component_scene, "draw_header", f, area, header);
-}
-
-fn draw_process_list(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    // Select which rates to display based on traffic view mode
-    let get_rates = |proc: &ProcessInfo| -> (u64, u64, u64, u64) {
-        match app.traffic_view_mode {
-            TrafficViewMode::All => (
-                proc.download_rate,
-                proc.upload_rate,
-                proc.total_download,
-                proc.total_upload,
-            ),
-            TrafficViewMode::Internet => (
-                proc.internet_download_rate,
-                proc.internet_upload_rate,
-                proc.internet_total_download,
-                proc.internet_total_upload,
-            ),
-            TrafficViewMode::Local => (
-                proc.local_download_rate,
-                proc.local_upload_rate,
-                proc.local_total_download,
-                proc.local_total_upload,
-            ),
-        }
-    };
-
-    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = app
-        .process_list
-        .iter()
-        .enumerate()
-        .map(|(index, proc)| {
-            // Determine status indicator: throttled (⚡), terminated (💀), or nothing
-            let status_indicator = if proc.is_throttled() {
-                "⚡"
-            } else if proc.is_terminated {
-                "💀"
-            } else {
-                " "
-            };
-
-            // Manual selection indicator - always present for consistent alignment
-            let selection_indicator = if Some(index) == app.list_state.selected() {
-                "▶ "
-            } else {
-                "  "
-            };
-
-            // Use gray colors for terminated processes
-            let terminated_color = Color::White;
-
-            let name_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::BrightWhite
-            };
-            let dl_rate_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Green
-            };
-            let ul_rate_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Yellow
-            };
-            let dl_total_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Cyan
-            };
-            let ul_total_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Magenta
-            };
-            let status_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Red
-            };
-
-            // Get the appropriate rates based on traffic view mode
-            let (download_rate, upload_rate, total_download, total_upload) = get_rates(proc);
-
-            let content = line(vec![
-                Span::styled(selection_indicator, Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{:7} ", proc.pid)),
-                Span::styled(
-                    format!(
-                        "{:20} ",
-                        if display_width(&proc.name) > 20 {
-                            format!(
-                                "{}...",
-                                &bmux_tui_components::compact::truncate_width(&proc.name, 17)
-                            )
-                        } else {
-                            proc.name.clone()
-                        }
-                    ),
-                    Style::default().fg(name_color),
-                ),
-                Span::styled(
-                    format!("↓{:>10} ", ProcessInfo::format_rate(download_rate)),
-                    Style::default().fg(dl_rate_color),
-                ),
-                Span::styled(
-                    format!("↑{:>10} ", ProcessInfo::format_rate(upload_rate)),
-                    Style::default().fg(ul_rate_color),
-                ),
-                Span::styled(
-                    format!("{:>10} ", ProcessInfo::format_bytes(total_download)),
-                    Style::default().fg(dl_total_color),
-                ),
-                Span::styled(
-                    format!("{:>10} ", ProcessInfo::format_bytes(total_upload)),
-                    Style::default().fg(ul_total_color),
-                ),
-                Span::styled(
-                    status_indicator,
-                    Style::default()
-                        .fg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-
-            bmux_tui_components::selectable_list::SelectableListItem::rich(
-                content.plain_text(),
-                content,
-            )
-        })
-        .collect();
-
-    let header = line(vec![
-        Span::styled("PID     ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "Process              ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("DL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("UL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Total DL   ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Total UL   ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Status", Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    // Split the area: header takes first row inside border, list gets the rest
-    let header_area = Rect {
-        x: area.x + 4, // +2 for border, +2 for manual selection indicator
-        y: area.y + 1,
-        width: area.width.saturating_sub(5),
-        height: 1,
-    };
-
-    let list_area = Rect {
-        x: area.x,
-        y: area.y + 2, // Start below the header
-        width: area.width,
-        height: area.height.saturating_sub(2),
-    };
-
-    // Render the border and title separately
-    let title = if app.sort_frozen {
-        "Network Activity [FROZEN ❄️]"
-    } else {
-        "Network Activity"
-    };
-
-    let border = PanelChrome {
-        title: Some(line(title)),
-        ..PanelChrome::default()
-    };
-    paint_border(f, area, border);
-
-    // Render header
-    paint_text(
-        &app.component_scene,
-        "draw_process_list.header",
-        f,
-        header_area,
-        (render::lines(header), TextPresentation::default()),
-    );
-
-    // Render list without its own border (since we drew it above)
-    let list = (
-        items,
-        Style::default()
-            .bg(Color::BrightBlack)
-            .add_modifier(Modifier::BOLD),
-    );
-
-    // Adjust list_state rendering to account for the inner area (inside borders)
-    let inner_list_area = Rect {
-        x: list_area.x + 1,
-        y: list_area.y,
-        width: list_area.width.saturating_sub(2),
-        height: list_area.height.saturating_sub(1),
-    };
-
-    paint_list(
-        &app.component_scene,
-        "draw_process_list",
-        f,
-        inner_list_area,
-        &list.0,
-        list.1,
-        &mut app.list_state,
-    );
-
-    // Store clickable region for mouse selection
-    let first_visible = app.list_state.offset();
-    app.clickable_regions.push(ClickableRegion {
-        area: inner_list_area,
-        region_type: ClickableRegionType::ProcessList {
-            first_visible_index: first_visible,
-        },
-    });
-}
-
-/// Wrap spans into multiple lines based on available width
-/// This ensures the status bar doesn't get truncated on narrow terminals
-/// Uses lookahead to keep related spans (like [key] description) together
-fn wrap_spans_to_lines(spans: Vec<Span>, max_width: u16) -> Vec<Line> {
-    let mut lines = vec![];
-    let mut current_line = vec![];
-    let mut current_width = 0;
-    let mut i = 0;
-
-    while i < spans.len() {
-        let span = &spans[i];
-        let span_width = display_width(&span.content) as u16;
-
-        // LOOKAHEAD: Check if this is a styled span (yellow key like "[b]")
-        // If so, calculate combined width with the next span (description)
-        let lookahead_width = if span.style.fg == Some(Color::Yellow) && i + 1 < spans.len() {
-            // This is a yellow key span, check next span (likely the description)
-            let next_span = &spans[i + 1];
-            span_width + display_width(&next_span.content) as u16
-        } else {
-            // Not a key, just use this span's width
-            span_width
-        };
-
-        // If adding this span (and its paired span if applicable) would overflow, wrap
-        if current_width + lookahead_width > max_width && !current_line.is_empty() {
-            lines.push(line(std::mem::take(&mut current_line)));
-            current_width = 0;
-        }
-
-        // Add the current span
-        current_width += span_width;
-        current_line.push(span.clone());
-        i += 1;
-    }
-
-    // Add remaining spans as the last line
-    if !current_line.is_empty() {
-        lines.push(line(current_line));
-    }
-
-    // Return at least one empty line if no content
-    if lines.is_empty() {
-        lines.push(line(""));
-    }
-
-    lines
-}
-
-fn draw_status_bar(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
-    // Auto-generate status bar from centralized keybindings
-    let mut spans = vec![];
-
-    for (i, (key, description)) in crate::keybindings::get_status_bar_keybindings()
-        .iter()
-        .enumerate()
-    {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            format!("[{}]", key),
-            Style::default().fg(Color::Yellow),
-        ));
-        spans.push(Span::raw(format!(" {}  ", description)));
-    }
-
-    spans.push(Span::raw("|  "));
-
-    // Show traffic view mode
-    let traffic_mode_text = match app.traffic_view_mode {
-        TrafficViewMode::All => "All",
-        TrafficViewMode::Internet => "Internet",
-        TrafficViewMode::Local => "Local",
-    };
-    let traffic_mode_icon = match app.traffic_view_mode {
-        TrafficViewMode::All => "🌐",
-        TrafficViewMode::Internet => "🌐",
-        TrafficViewMode::Local => "🏠",
-    };
-    spans.push(Span::styled(
-        format!("{} {} ", traffic_mode_icon, traffic_mode_text),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw("| "));
-
-    // Show filter status
-    match &app.active_interface_filters {
-        None => {
-            // No filter - show normal message
-            spans.push(Span::styled(
-                &app.status_message,
-                Style::default().fg(Color::White),
-            ));
-        }
-        Some(filters) if filters.is_empty() => {
-            // Empty filter
-            spans.push(Span::styled(
-                "FILTER: None (showing 0 processes) | ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                &app.status_message,
-                Style::default().fg(Color::White),
-            ));
-        }
-        Some(filters) => {
-            // Active filter
-            let filter_text = if filters.len() <= 3 {
-                format!("FILTER: {} | ", filters.join(", "))
-            } else {
-                format!(
-                    "FILTER: {} +{} more | ",
-                    filters[..2].join(", "),
-                    filters.len() - 2
-                )
-            };
-            spans.push(Span::styled(
-                filter_text,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                &app.status_message,
-                Style::default().fg(Color::White),
-            ));
-        }
-    }
-
-    // Wrap spans to multiple lines if they exceed terminal width
-    let available_width = area.width.saturating_sub(2); // minus left/right borders
-    let wrapped_lines = wrap_spans_to_lines(spans, available_width);
-    let status = (
-        render::lines(wrapped_lines),
-        TextPresentation {
-            chrome: Some(PanelChrome::default()),
-            ..TextPresentation::default()
-        },
-    );
-
-    paint_text(&app.component_scene, "draw_status_bar", f, area, status);
-}
-
+/// Help for the interface views (the explorer has its own F1 help).
 fn draw_help_overlay(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    // Auto-generate help text from centralized keybindings
     let mut help_text = vec![
         line(""),
         line(Span::styled(
-            "bproc - Keyboard Shortcuts",
+            "Interfaces - keyboard & mouse",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         line(""),
     ];
-
-    // Get all keybindings and generate help lines
     for binding in crate::keybindings::get_all_keybindings() {
-        help_text.push(line(format!(
-            "  {:12} - {}",
-            binding.key, binding.description
-        )));
+        help_text.push(line(vec![
+            Span::styled(
+                format!("  {:12}", binding.key),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(format!(" {}", binding.description)),
+        ]));
     }
-
     help_text.push(line(""));
-    help_text.push(line("Use ↑↓ to scroll, any other key to close"));
+    help_text.push(line(Span::styled(
+        "Process keys live in the main help: close this view, then F1 or ?",
+        Style::default().fg(Color::BrightBlack),
+    )));
+    help_text.push(line(Span::styled(
+        "↑↓ scroll · any other key or a click outside closes",
+        Style::default().fg(Color::BrightBlack),
+    )));
 
-    let help_area = centered_rect(60, 50, area);
-
-    // Clamp scroll offset to content bounds
-    let content_lines = help_text.len();
+    // Larger than the interface modal so it fully covers it.
+    let help_area = centered_rect(80, 70, area);
     let clamped_scroll =
-        AppState::clamp_scroll(app.help_scroll_offset, content_lines, help_area.height);
+        AppState::clamp_scroll(app.help_scroll_offset, help_text.len(), help_area.height);
     app.help_scroll_offset = clamped_scroll;
 
     let help = (
@@ -1627,6 +1064,7 @@ fn draw_help_overlay(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
 
     clear(f, help_area);
     paint_text(&app.component_scene, "help", f, help_area, help);
+    push_panel(app, help_area, Layer::Help);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -1643,7 +1081,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     Rect::new(r.x.saturating_add(x), r.y.saturating_add(y), width, height)
 }
 
-fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
+/// A `width` x `height` rectangle centred in `r`, shrunk to fit.
+fn sized_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let width = width.min(r.width);
+    let height = height.min(r.height);
+    Rect::new(
+        r.x + (r.width - width) / 2,
+        r.y + (r.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
     let dialog = &app.throttle_dialog;
 
     let title = if let (Some(pid), Some(name)) = (dialog.target_pid, &dialog.target_name) {
@@ -1712,14 +1162,19 @@ fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                "  (click to change)",
+                Style::default().fg(Color::BrightBlack),
+            ),
         ]),
         line(""),
         line(Span::styled(
-            "[Tab] Switch field  [t] Cycle traffic type  [Enter] Apply  [Esc] Cancel",
+            "Tab field · t traffic type · Enter apply · Esc cancel",
             Style::default().fg(Color::BrightBlack),
         )),
     ];
 
+    let dialog_rows = dialog_text.len() as u16;
     let dialog_widget = (
         render::lines(dialog_text),
         TextPresentation {
@@ -1732,7 +1187,16 @@ fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
         },
     );
 
-    let dialog_area = centered_rect(60, 30, area);
+    // Tall enough for every row and hint; at least 62 columns wide when possible.
+    let dialog_area = sized_rect(
+        centered_rect(60, 30, area).width.max(62),
+        dialog_rows + 2,
+        area,
+    );
+    app.clickable_regions.push(ClickableRegion {
+        area: dialog_area,
+        region_type: ClickableRegionType::Panel(Layer::Throttle),
+    });
     clear(f, dialog_area);
     paint_text(
         &app.component_scene,
@@ -1741,6 +1205,18 @@ fn draw_throttle_dialog(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
         dialog_area,
         dialog_widget,
     );
+    if dialog_area.height > 7 && dialog_area.width > 2 {
+        app.clickable_regions.push(ClickableRegion {
+            area: Rect::new(
+                dialog_area.x + 1,
+                dialog_area.y + 6,
+                dialog_area.width - 2,
+                1,
+            ),
+            region_type: ClickableRegionType::ThrottleTraffic,
+        });
+    }
+    let dialog = &app.throttle_dialog;
     let field_x = dialog_area.x.saturating_add(24);
     let field_width = dialog_area.width.saturating_sub(25);
     for (row, value, selected, style) in [
@@ -1877,6 +1353,7 @@ fn draw_backend_compatibility_dialog(
     );
 
     clear(f, dialog_area);
+    push_panel(app, dialog_area, Layer::Compatibility);
     paint_text(
         &app.component_scene,
         "compatibility",
@@ -1886,33 +1363,45 @@ fn draw_backend_compatibility_dialog(
     );
 }
 
-fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
-    // Get selected process
-    let selected_proc = app.get_selected_process();
-    if selected_proc.is_none() {
-        return;
-    }
-
-    let proc = selected_proc.unwrap();
-    let history = app.history.get_history(proc.pid);
-
-    if history.is_none() || history.unwrap().samples.is_empty() {
-        // No history data available
+fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
+    let selected = app.get_selected_process().map(|p| {
+        (
+            p.pid,
+            p.name.clone(),
+            app.history.get_history(p.pid).cloned(),
+        )
+    });
+    let Some((pid, name, Some(history))) =
+        selected.filter(|(_, _, h)| h.as_ref().is_some_and(|h| !h.samples.is_empty()))
+    else {
+        let (title, message) = match app.get_selected_process() {
+            Some(p) => (
+                format!("Bandwidth Graph: {} (PID {})", p.name, p.pid),
+                "No historical data available yet...",
+            ),
+            None => (
+                "Bandwidth Graph".to_string(),
+                "The process is no longer reporting network activity.",
+            ),
+        };
         let no_data = (
-            render::lines("No historical data available yet..."),
+            render::lines(vec![
+                line(message),
+                line(""),
+                line(Span::styled(
+                    "Press 'g', 'q' or Esc (or click outside) to close",
+                    Style::default().fg(Color::BrightBlack),
+                )),
+            ]),
             TextPresentation {
                 style: Style::default().bg(Color::Black).fg(Color::Yellow),
                 chrome: Some(PanelChrome {
-                    title: Some(line(format!(
-                        "Bandwidth Graph: {} (PID {})",
-                        proc.name, proc.pid
-                    ))),
+                    title: Some(line(title)),
                     style: Style::default().fg(Color::Cyan),
                 }),
                 ..TextPresentation::default()
             },
         );
-
         let graph_area = centered_rect(80, 60, area);
         clear(f, graph_area);
         paint_text(
@@ -1922,10 +1411,10 @@ fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
             graph_area,
             no_data,
         );
+        push_panel(app, graph_area, Layer::Graph);
         return;
-    }
-
-    let history = history.unwrap();
+    };
+    let proc_name = name;
     let (download_data, upload_data) = history.get_graph_data();
 
     // Find max values for scaling
@@ -1943,8 +1432,8 @@ fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
         max_value * 1.1,
         format!(
             "Bandwidth Graph: {} (PID {}) | Max: ↓{} ↑{} | Avg: ↓{} ↑{}",
-            proc.name,
-            proc.pid,
+            proc_name,
+            pid,
             ProcessInfo::format_rate(history.max_download_rate()),
             ProcessInfo::format_rate(history.max_upload_rate()),
             ProcessInfo::format_rate(history.avg_download_rate()),
@@ -1952,17 +1441,21 @@ fn draw_bandwidth_graph(f: &mut PaintCx<'_, '_>, area: Rect, app: &AppState) {
         ),
     );
 
-    // Draw instructions at bottom
+    push_panel(app, graph_area, Layer::Graph);
+    // Instructions on the last plot row, left of the "Time (samples)" axis title.
     let inst_area = Rect {
-        x: graph_area.x,
+        x: graph_area.x.saturating_add(1),
         y: graph_area.y + graph_area.height.saturating_sub(2),
-        width: graph_area.width,
+        width: graph_area.width.saturating_sub(2 + 15),
         height: 1,
     };
-    let message = "Press 'g', 'q', or 'Esc' to close graph";
-    let width = u16::try_from(display_width(message))
-        .unwrap_or(u16::MAX)
-        .min(inst_area.width);
+    let Some(message) = ["g/q/Esc or click outside to close", "Esc closes"]
+        .into_iter()
+        .find(|m| display_width(m) <= usize::from(inst_area.width))
+    else {
+        return;
+    };
+    let width = display_width(message) as u16;
     render::paint_label(
         f,
         Rect::new(
@@ -2574,140 +2067,90 @@ fn draw_backend_info(
     });
 }
 
-fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    // Get the selected interface name
-    let interface_name = match &app.selected_interface_name {
-        Some(name) => name.clone(),
-        None => {
-            // No interface selected, show error
-            let error = (
-                render::lines("No interface selected"),
-                TextPresentation {
-                    chrome: Some(PanelChrome {
-                        title: Some(line("Error")),
-                        style: Style::default(),
-                    }),
-                    ..TextPresentation::default()
-                },
-            );
-            paint_text(
-                &app.component_scene,
-                "draw_interface_detail",
-                f,
-                area,
-                error,
-            );
-            return;
-        }
+/// Rates for one interface in the active traffic view.
+fn interface_rates(app: &AppState, process: &ProcessInfo, interface: &str) -> (u64, u64, u64, u64) {
+    let Some(stats) = process.interface_stats.get(interface) else {
+        return (0, 0, 0, 0);
     };
+    let (dl, ul) = match app.traffic_view_mode {
+        TrafficViewMode::All => (stats.download_rate, stats.upload_rate),
+        TrafficViewMode::Internet => (stats.internet_download_rate, stats.internet_upload_rate),
+        TrafficViewMode::Local => (stats.local_download_rate, stats.local_upload_rate),
+    };
+    (dl, ul, stats.total_download, stats.total_upload)
+}
 
-    // Filter processes to only show those using this interface
-    // Use unfiltered_process_list to show ALL processes for this interface
-    let filtered_processes: Vec<&ProcessInfo> = app
+fn traffic_label(mode: TrafficViewMode) -> &'static str {
+    match mode {
+        TrafficViewMode::All => "All",
+        TrafficViewMode::Internet => "Internet",
+        TrafficViewMode::Local => "Local",
+    }
+}
+
+/// Processes on the selected interface, as a large panel over the explorer.
+fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
+    let panel = centered_rect(90, 80, area);
+    let name = app.selected_interface_name.clone().unwrap_or_default();
+    let processes: Vec<&ProcessInfo> = app
         .unfiltered_process_list
         .iter()
-        .filter(|p| p.interface_stats.contains_key(&interface_name))
+        .filter(|p| p.interface_stats.contains_key(&name))
         .collect();
-
-    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = filtered_processes
+    let title = format!(
+        "Interface: {} · {} process{} · {} traffic",
+        if name.is_empty() { "?" } else { &name },
+        processes.len(),
+        if processes.len() == 1 { "" } else { "es" },
+        traffic_label(app.traffic_view_mode),
+    );
+    // Totals are dropped (upload first) when the panel is too narrow.
+    let inner_width = panel.width.saturating_sub(2);
+    let columns = usize::from(inner_width >= 66) + usize::from(inner_width >= 77);
+    let items: Vec<bmux_tui_components::selectable_list::SelectableListItem> = processes
         .iter()
         .map(|proc| {
-            // Get interface-specific stats
-            let iface_stats = proc.interface_stats.get(&interface_name);
-
-            let (dl_rate, ul_rate, dl_total, ul_total) = if let Some(stats) = iface_stats {
-                (
-                    stats.download_rate,
-                    stats.upload_rate,
-                    stats.total_download,
-                    stats.total_upload,
-                )
-            } else {
-                (0, 0, 0, 0)
-            };
-
-            // Status indicator
-            let status_indicator = if proc.is_throttled() {
-                "⚡"
+            let (dl_rate, ul_rate, dl_total, ul_total) = interface_rates(app, proc, &name);
+            let (status, dim) = if proc.is_throttled() {
+                ("⚡", false)
             } else if proc.is_terminated {
-                "💀"
+                ("✝", true)
             } else {
-                " "
+                (" ", false)
             };
-
-            let terminated_color = Color::White;
-            let name_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::BrightWhite
-            };
-            let dl_rate_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Green
-            };
-            let ul_rate_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Yellow
-            };
-            let dl_total_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Cyan
-            };
-            let ul_total_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Magenta
-            };
-            let status_color = if proc.is_terminated {
-                terminated_color
-            } else {
-                Color::Red
-            };
-
-            let content = line(vec![
-                Span::raw("  "),
-                Span::raw(format!("{:7} ", proc.pid)),
+            let color = |c: Color| Style::default().fg(if dim { Color::White } else { c });
+            let mut spans = vec![
                 Span::styled(
-                    format!(
-                        "{:20} ",
-                        if display_width(&proc.name) > 20 {
-                            format!(
-                                "{}...",
-                                &bmux_tui_components::compact::truncate_width(&proc.name, 17)
-                            )
-                        } else {
-                            proc.name.clone()
-                        }
-                    ),
-                    Style::default().fg(name_color),
+                    explorer::paint::fit(status, 2, false),
+                    color(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{:>7} ", proc.pid)),
+                Span::styled(
+                    format!("{} ", explorer::paint::fit(&proc.name, 20, false)),
+                    color(Color::BrightWhite),
                 ),
                 Span::styled(
                     format!("↓{:>10} ", ProcessInfo::format_rate(dl_rate)),
-                    Style::default().fg(dl_rate_color),
+                    color(Color::Green),
                 ),
                 Span::styled(
                     format!("↑{:>10} ", ProcessInfo::format_rate(ul_rate)),
-                    Style::default().fg(ul_rate_color),
+                    color(Color::Yellow),
                 ),
-                Span::styled(
+            ];
+            if columns > 0 {
+                spans.push(Span::styled(
                     format!("{:>10} ", ProcessInfo::format_bytes(dl_total)),
-                    Style::default().fg(dl_total_color),
-                ),
-                Span::styled(
+                    color(Color::Cyan),
+                ));
+            }
+            if columns > 1 {
+                spans.push(Span::styled(
                     format!("{:>10} ", ProcessInfo::format_bytes(ul_total)),
-                    Style::default().fg(ul_total_color),
-                ),
-                Span::styled(
-                    status_indicator,
-                    Style::default()
-                        .fg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-
+                    color(Color::Magenta),
+                ));
+            }
+            let content = line(spans);
             bmux_tui_components::selectable_list::SelectableListItem::rich(
                 content.plain_text(),
                 content,
@@ -2715,72 +2158,116 @@ fn draw_interface_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState
         })
         .collect();
 
-    let header = line(vec![
-        Span::styled("PID     ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "Process              ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("DL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("UL Rate    ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Total DL   ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Total UL   ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("Status", Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    // Split the area
-    let header_area = Rect {
-        x: area.x + 4,
-        y: area.y + 1,
-        width: area.width.saturating_sub(5),
-        height: 1,
-    };
-
-    let list_area = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: area.height.saturating_sub(2),
-    };
-
-    // Render border and title
-    let title = format!("Interface: {} [Press Esc to go back]", interface_name);
-    let border = PanelChrome {
-        title: Some(line(title)),
-        ..PanelChrome::default()
-    };
-    paint_border(f, area, border);
-
-    // Render header
+    clear(f, panel);
     paint_text(
         &app.component_scene,
-        "draw_interface_detail.2",
+        "draw_interface_detail.panel",
         f,
-        header_area,
-        (render::lines(header), TextPresentation::default()),
+        panel,
+        (
+            Vec::new(),
+            TextPresentation {
+                style: Style::default().bg(Color::Black).fg(Color::BrightWhite),
+                chrome: Some(PanelChrome {
+                    title: Some(line(title)),
+                    style: Style::default().fg(Color::Cyan),
+                }),
+                ..TextPresentation::default()
+            },
+        ),
     );
-
-    // Render list
-    let list = (items, Style::default());
-    let inner_list_area = Rect {
-        x: list_area.x + 1,
-        y: list_area.y,
-        width: list_area.width.saturating_sub(2),
-        height: list_area.height.saturating_sub(1),
-    };
-
-    paint_list(
-        &app.component_scene,
-        "draw_interface_detail",
+    push_panel(app, panel, Layer::InterfaceDetail);
+    let inner = Rect::new(
+        panel.x.saturating_add(1),
+        panel.y.saturating_add(1),
+        panel.width.saturating_sub(2),
+        panel.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let base = Style::default().bg(Color::Black);
+    let bold = base.fg(Color::BrightWhite).add_modifier(Modifier::BOLD);
+    let header = [
+        "      PID ",
+        "Process              ",
+        "    DL Rate ",
+        "    UL Rate ",
+    ]
+    .into_iter()
+    .chain(["  Total DL ", "  Total UL "].into_iter().take(columns))
+    .map(|title| Span::styled(title, bold))
+    .collect::<Vec<_>>();
+    render::paint_label(
         f,
-        inner_list_area,
-        &list.0,
-        list.1,
-        &mut ListState::default(),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        line(header),
+        base,
+    );
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    if items.is_empty() {
+        if list_area.height > 0 {
+            render::paint_label(
+                f,
+                Rect::new(list_area.x, list_area.y, list_area.width, 1),
+                line(" No processes have used this interface yet."),
+                base.fg(Color::BrightBlack),
+            );
+        }
+    } else if list_area.height > 0 {
+        let mut state = std::mem::take(&mut app.interface_detail_state);
+        paint_list(
+            &app.component_scene,
+            "draw_interface_detail",
+            f,
+            list_area,
+            &items,
+            Style::default()
+                .bg(Color::BrightBlack)
+                .add_modifier(Modifier::BOLD),
+            &mut state,
+        );
+        app.interface_detail_state = state;
+    }
+    if inner.height < 2 {
+        return;
+    }
+    let footer_y = inner.y + inner.height - 1;
+    let back = "[◀ Back]";
+    let back_width = u16::try_from(display_width(back))
+        .unwrap_or(u16::MAX)
+        .min(inner.width);
+    let back_area = Rect::new(inner.x, footer_y, back_width, 1);
+    render::paint_label(
+        f,
+        back_area,
+        line(back),
+        base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    );
+    app.clickable_regions.push(ClickableRegion {
+        area: back_area,
+        region_type: ClickableRegionType::InterfaceBack,
+    });
+    render::paint_label(
+        f,
+        Rect::new(inner.x + back_width, footer_y, inner.width - back_width, 1),
+        line(" Esc back · ↑↓ scroll · i close · l traffic · b backends · h help"),
+        base.fg(Color::BrightBlack),
     );
 }
 
+/// Rows above the first interface in the filter modal (inside the border).
+pub const INTERFACE_HEADER_LINES: usize = 7;
+/// Checkbox columns relative to the modal's left border (after "▶ ").
+const INTERFACE_CHECKBOX_COLUMNS: std::ops::Range<u16> = 3..6;
+
 fn draw_interface_modal(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
+    app.ensure_interface_cursor();
     let mut text = vec![line("")];
 
     // Title
@@ -2861,27 +2348,30 @@ fn draw_interface_modal(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState)
             ),
         ]));
     }
+    if app.interface_list.is_empty() {
+        text.push(line(Span::styled(
+            "  No interfaces detected yet (requires network monitoring).",
+            Style::default().fg(Color::BrightBlack),
+        )));
+    }
 
     text.push(line(""));
     text.push(line(""));
 
-    // Instructions
     text.push(line(Span::styled(
-        "[↑↓] Navigate  [Space] Toggle (applies live)  [A] Toggle All/None",
+        "↑↓ select · Space/click box toggle · A all/none",
         Style::default().fg(Color::BrightBlack),
     )));
     text.push(line(Span::styled(
-        "[Enter] View details  [Esc/i] Close and return to process view",
+        "Enter processes · Esc/i/click outside close · h help",
         Style::default().fg(Color::BrightBlack),
     )));
 
     let modal_area = centered_rect(70, 60, area);
 
-    // Auto-scroll to keep selected interface visible
-    // Header lines: blank + title + blank + filter state + blank + "Select interfaces..." + blank = 7 lines
-    let header_lines = 7;
+    // Auto-scroll to keep the selected interface visible.
     if let Some(selected_idx) = app.selected_interface_index {
-        let selected_line = header_lines + selected_idx;
+        let selected_line = INTERFACE_HEADER_LINES + selected_idx;
         app.interface_modal_scroll_offset = AppState::scroll_to_line(
             app.interface_modal_scroll_offset,
             selected_line,
@@ -2915,961 +2405,36 @@ fn draw_interface_modal(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState)
     paint_text(&app.component_scene, "interfaces", f, modal_area, widget);
     // Checked indicators are part of the rich BMUX text composition above.
     // Do not overlay another control: that changes glyphs and duplicates hit IDs.
-
-    // Store clickable region for mouse selection
     app.clickable_regions.push(ClickableRegion {
         area: modal_area,
         region_type: ClickableRegionType::InterfaceModal {
-            header_lines: 7, // Same as used in auto-scroll calculation
+            header_lines: INTERFACE_HEADER_LINES,
         },
     });
 }
-// Process Detail View Rendering
 
-fn draw_process_detail(f: &mut PaintCx<'_, '_>, area: Rect, app: &mut AppState) {
-    // Get the process being detailed (still alive in process list?)
-    // Clone it to avoid borrow checker issues
-    let process = match app.get_detail_process() {
-        Some(p) => p.clone(),
-        None => {
-            // Process no longer exists - show message and return to process list
-            let message = (
-                render::lines("Process no longer exists (press Esc to return)"),
-                TextPresentation {
-                    style: Style::default().fg(Color::Red),
-                    chrome: Some(PanelChrome {
-                        title: Some(line("Process Not Found")),
-                        style: Style::default(),
-                    }),
-                    ..TextPresentation::default()
-                },
-            );
-            paint_text(
-                &app.component_scene,
-                "draw_process_detail",
-                f,
-                area,
-                message,
-            );
-            return;
-        }
-    };
-
-    // Split into combined header and content areas (saves 6 lines!)
-    let chunks = split_vertical(area, 3, 0);
-
-    // Draw combined title with tabs
-    draw_detail_header_with_tabs(f, chunks[0], &process, app.detail_tab, app);
-
-    // Draw content based on active tab
-    match app.detail_tab {
-        ProcessDetailTab::Overview => draw_detail_overview(f, chunks[1], &process, app),
-        ProcessDetailTab::Connections => draw_detail_connections(f, chunks[1], &process, app),
-        ProcessDetailTab::Traffic => draw_detail_traffic(f, chunks[1], &process, app),
-        ProcessDetailTab::System => draw_detail_system(f, chunks[1], &process, app),
-    }
-}
-
-fn draw_detail_header_with_tabs(
-    f: &mut PaintCx<'_, '_>,
+/// What a click at (`x`, `y`) inside the interface modal `area` targets:
+/// the interface index and whether it landed on the checkbox.
+pub fn interface_click(
     area: Rect,
-    process: &ProcessInfo,
-    current_tab: ProcessDetailTab,
-    app: &mut AppState,
-) {
-    let prefix = line(vec![
-        Span::styled(
-            process.name.clone(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" (PID {})  ", process.pid)),
-    ]);
-    let prefix_width = prefix.width().min(u16::MAX as usize) as u16;
-    paint_border(
-        f,
-        area,
-        PanelChrome {
-            title: Some(line("Process Details")),
-            ..Default::default()
-        },
-    );
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(2),
-        area.height.saturating_sub(2),
-    );
-    paint_text(
-        &app.component_scene,
-        "draw_detail_header_with_tabs",
-        f,
-        inner,
-        (vec![prefix], TextPresentation::default()),
-    );
-    let tab_area = Rect::new(
-        inner.x.saturating_add(prefix_width),
-        inner.y,
-        inner.width.saturating_sub(prefix_width),
-        1.min(inner.height),
-    );
-    render::paint_detail_tabs(
-        &app.component_scene,
-        "detail.tabs",
-        f,
-        tab_area,
-        match current_tab {
-            ProcessDetailTab::Overview => 0,
-            ProcessDetailTab::Connections => 1,
-            ProcessDetailTab::Traffic => 2,
-            ProcessDetailTab::System => 3,
-        },
-    );
-    let mut col = tab_area.x;
-    let tab_ranges = [
-        ("Overview", ProcessDetailTab::Overview),
-        ("Connections", ProcessDetailTab::Connections),
-        ("Traffic", ProcessDetailTab::Traffic),
-        ("System", ProcessDetailTab::System),
-    ]
-    .into_iter()
-    .map(|(name, tab)| {
-        let start = col;
-        let end = start
-            .saturating_add(display_width(name) as u16)
-            .saturating_add(2);
-        col = end.saturating_add(1);
-        (start, end, tab)
-    })
-    .collect();
-
-    // Store clickable region for mouse selection
-    app.clickable_regions.push(ClickableRegion {
-        area,
-        region_type: ClickableRegionType::ProcessDetailTabs { tab_ranges },
-    });
-}
-
-fn draw_detail_overview(
-    f: &mut PaintCx<'_, '_>,
-    area: Rect,
-    process: &ProcessInfo,
-    app: &mut AppState,
-) {
-    let history = &app.history;
-    let mut text = vec![];
-
-    // Basic Information
-    text.push(line(vec![Span::styled(
-        "Basic Information:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-    text.push(line(format!("  PID:              {}", process.pid)));
-    text.push(line(format!("  Name:             {}", process.name)));
-
-    // Get process details
-    let details = app.details_for(process);
-
-    if let Some(ref cmdline) = details.cmdline {
-        let cmd_str = cmdline.join(" ");
-        let cmd_display = if display_width(&cmd_str) > 80 {
-            format!(
-                "{}...",
-                &bmux_tui_components::compact::truncate_width(&cmd_str, 77)
-            )
-        } else {
-            cmd_str
-        };
-        text.push(line(format!("  Command:          {}", cmd_display)));
+    header_lines: usize,
+    scroll: usize,
+    rows: usize,
+    x: u16,
+    y: u16,
+) -> Option<(usize, bool)> {
+    let inner_bottom = area.y.saturating_add(area.height).saturating_sub(1);
+    if y <= area.y || y >= inner_bottom {
+        return None;
     }
-
-    if let Some(ref exe) = details.exe_path {
-        text.push(line(format!("  Executable:       {}", exe)));
-    }
-
-    if let Some(ref cwd) = details.cwd {
-        text.push(line(format!("  Working Dir:      {}", cwd)));
-    }
-
-    text.push(line(format!(
-        "  State:            {}",
-        details.state_description()
-    )));
-
-    if let Some(ppid) = details.ppid {
-        text.push(line(format!("  Parent PID:       {}", ppid)));
-    }
-
-    text.push(line(""));
-
-    // Network Statistics
-    text.push(line(vec![Span::styled(
-        "Network Statistics:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-    text.push(line(vec![
-        Span::raw("  Current Download: "),
-        Span::styled(
-            format!("↓ {:>10}", ProcessInfo::format_rate(process.download_rate)),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("    Upload: "),
-        Span::styled(
-            format!("↑ {:>10}", ProcessInfo::format_rate(process.upload_rate)),
-            Style::default().fg(Color::Yellow),
-        ),
-    ]));
-
-    text.push(line(vec![
-        Span::raw("  Total Download:   "),
-        Span::styled(
-            format!("{:>10}", ProcessInfo::format_bytes(process.total_download)),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw("      Upload: "),
-        Span::styled(
-            format!("{:>10}", ProcessInfo::format_bytes(process.total_upload)),
-            Style::default().fg(Color::Magenta),
-        ),
-    ]));
-
-    // Get history stats
-    if let Some(hist) = history.get_history(process.pid) {
-        text.push(line(vec![
-            Span::raw("  Peak Download:    "),
-            Span::styled(
-                format!("{:>10}", ProcessInfo::format_rate(hist.max_download_rate())),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("      Upload: "),
-            Span::styled(
-                format!("{:>10}", ProcessInfo::format_rate(hist.max_upload_rate())),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-
-        text.push(line(vec![
-            Span::raw("  Avg Download:     "),
-            Span::styled(
-                format!("{:>10}", ProcessInfo::format_rate(hist.avg_download_rate())),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("      Upload: "),
-            Span::styled(
-                format!("{:>10}", ProcessInfo::format_rate(hist.avg_upload_rate())),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    }
-
-    text.push(line(""));
-
-    // Internet/Local breakdown
-    text.push(line(vec![Span::styled(
-        "Internet Traffic:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    let internet_pct = if process.download_rate > 0 {
-        (process.internet_download_rate as f64 / process.download_rate as f64 * 100.0) as u32
-    } else {
-        0
-    };
-
-    text.push(line(vec![
-        Span::raw("  Download:         "),
-        Span::styled(
-            format!(
-                "↓ {:>10}",
-                ProcessInfo::format_rate(process.internet_download_rate)
-            ),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(format!(" ({}%)  Total: ", internet_pct)),
-        Span::styled(
-            ProcessInfo::format_bytes(process.internet_total_download),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]));
-
-    let upload_pct = if process.upload_rate > 0 {
-        (process.internet_upload_rate as f64 / process.upload_rate as f64 * 100.0) as u32
-    } else {
-        0
-    };
-
-    text.push(line(vec![
-        Span::raw("  Upload:           "),
-        Span::styled(
-            format!(
-                "↑ {:>10}",
-                ProcessInfo::format_rate(process.internet_upload_rate)
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw(format!(" ({}%)  Total: ", upload_pct)),
-        Span::styled(
-            ProcessInfo::format_bytes(process.internet_total_upload),
-            Style::default().fg(Color::Magenta),
-        ),
-    ]));
-
-    text.push(line(""));
-
-    // Local traffic
-    text.push(line(vec![Span::styled(
-        "Local Traffic:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    let local_dl_pct = if process.download_rate > 0 {
-        (process.local_download_rate as f64 / process.download_rate as f64 * 100.0) as u32
-    } else {
-        0
-    };
-
-    text.push(line(vec![
-        Span::raw("  Download:         "),
-        Span::styled(
-            format!(
-                "↓ {:>10}",
-                ProcessInfo::format_rate(process.local_download_rate)
-            ),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(format!(" ({}%)   Total: ", local_dl_pct)),
-        Span::styled(
-            ProcessInfo::format_bytes(process.local_total_download),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]));
-
-    let local_ul_pct = if process.upload_rate > 0 {
-        (process.local_upload_rate as f64 / process.upload_rate as f64 * 100.0) as u32
-    } else {
-        0
-    };
-
-    text.push(line(vec![
-        Span::raw("  Upload:           "),
-        Span::styled(
-            format!(
-                "↑ {:>10}",
-                ProcessInfo::format_rate(process.local_upload_rate)
-            ),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw(format!(" ({}%)   Total: ", local_ul_pct)),
-        Span::styled(
-            ProcessInfo::format_bytes(process.local_total_upload),
-            Style::default().fg(Color::Magenta),
-        ),
-    ]));
-
-    text.push(line(""));
-
-    // Throttle status
-    text.push(line(vec![Span::styled(
-        "Throttle Status:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    if let Some(ref throttle) = process.throttle_limit {
-        let dl_text = if let Some(limit) = throttle.download_limit {
-            ProcessInfo::format_rate(limit)
-        } else {
-            "Unlimited".to_string()
-        };
-
-        let ul_text = if let Some(limit) = throttle.upload_limit {
-            ProcessInfo::format_rate(limit)
-        } else {
-            "Unlimited".to_string()
-        };
-
-        let traffic_type_text = match throttle.traffic_type {
-            crate::process::TrafficType::All => "All Traffic",
-            crate::process::TrafficType::Internet => "Internet Only",
-            crate::process::TrafficType::Local => "Local Only",
-        };
-
-        text.push(line(vec![
-            Span::raw("  Download Limit:   "),
-            Span::styled(
-                dl_text,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" ({})", traffic_type_text)),
-            Span::styled(" ⚡", Style::default().fg(Color::Yellow)),
-        ]));
-
-        text.push(line(vec![
-            Span::raw("  Upload Limit:     "),
-            Span::styled(
-                ul_text,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    } else {
-        text.push(line("  Not throttled"));
-    }
-
-    text.push(line(""));
-
-    // System resources
-    if details.memory_rss.is_some() || details.threads.is_some() {
-        text.push(line(vec![Span::styled(
-            "System Resources:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        text.push(line(""));
-
-        if let Some(rss) = details.memory_rss {
-            text.push(line(format!(
-                "  Memory (RSS):     {}",
-                crate::process::ProcessDetails::format_memory(rss)
-            )));
-        }
-
-        if let Some(vms) = details.memory_vms {
-            text.push(line(format!(
-                "  Memory (VMS):     {}",
-                crate::process::ProcessDetails::format_memory(vms)
-            )));
-        }
-
-        if let Some(threads) = details.threads {
-            text.push(line(format!("  Threads:          {}", threads)));
-        }
-    }
-
-    text.push(line(""));
-    text.push(line(Span::styled(
-        "[↑↓] Scroll  [Tab] Switch tab  [t] Throttle  [g] Graph  [Esc] Back",
-        Style::default().fg(Color::BrightBlack),
-    )));
-
-    // Clamp scroll offset to content bounds
-    let content_lines = text.len();
-    let clamped_scroll =
-        AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
-    app.detail_scroll_offset = clamped_scroll;
-
-    let paragraph = (
-        render::lines(text),
-        TextPresentation {
-            scroll: (clamped_scroll as u16, 0),
-            chrome: Some(PanelChrome {
-                title: Some(line("Overview")),
-                style: Style::default(),
-            }),
-            ..TextPresentation::default()
-        },
-    );
-    paint_text(&app.component_scene, "detail.overview", f, area, paragraph);
-}
-
-fn draw_detail_connections(
-    f: &mut PaintCx<'_, '_>,
-    area: Rect,
-    process: &ProcessInfo,
-    app: &mut AppState,
-) {
-    let mut text = vec![];
-
-    text.push(line(""));
-    text.push(line(vec![Span::styled(
-        format!("Active Network Connections ({})", process.connections.len()),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    if process.connections.is_empty() {
-        text.push(line("  No active connections"));
-    } else {
-        // Header
-        text.push(line(vec![
-            Span::styled(
-                "  Protocol  ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Local Address            ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Remote Address           ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("State     ", Style::default().add_modifier(Modifier::BOLD)),
-        ]));
-        text.push(line(
-            "  ──────────────────────────────────────────────────────────────────────",
-        ));
-
-        // Sort connections: ESTABLISHED first, then LISTEN, then others
-        let mut sorted_conns = process.connections.clone();
-        sorted_conns.sort_by(|a, b| {
-            let order_a = match a.state.as_str() {
-                "Established" => 0,
-                "Listen" => 1,
-                _ => 2,
-            };
-            let order_b = match b.state.as_str() {
-                "Established" => 0,
-                "Listen" => 1,
-                _ => 2,
-            };
-            order_a.cmp(&order_b)
-        });
-
-        // Render all connections (scrolling handled by Paragraph widget)
-        for conn in &sorted_conns {
-            let local = format!("{}:{}", format_ip_addr(&conn.local_addr), conn.local_port);
-            let remote = if conn.remote_port == 0 {
-                "*:*".to_string()
-            } else {
-                format!("{}:{}", format_ip_addr(&conn.remote_addr), conn.remote_port)
-            };
-
-            let state_display = match conn.state.as_str() {
-                "Established" => "ESTAB",
-                "Listen" => "LISTEN",
-                "TimeWait" => "TIMEWT",
-                "CloseWait" => "CLOSWT",
-                "FinWait1" => "FIN1",
-                "FinWait2" => "FIN2",
-                "Closing" => "CLOSNG",
-                "SynSent" => "SYNSNT",
-                "SynRecv" => "SYNRCV",
-                s => s,
-            };
-
-            let proto_style = match conn.protocol.as_str() {
-                "TCP" | "TCP6" => Style::default().fg(Color::Green),
-                "UDP" | "UDP6" => Style::default().fg(Color::Yellow),
-                _ => Style::default(),
-            };
-
-            let state_style = match conn.state.as_str() {
-                "Established" => Style::default().fg(Color::Green),
-                "Listen" => Style::default().fg(Color::Cyan),
-                _ => Style::default().fg(Color::BrightWhite),
-            };
-
-            text.push(line(vec![
-                Span::raw("  "),
-                Span::styled(format!("{:8}  ", conn.protocol), proto_style),
-                Span::raw(format!("{:24} ", local)),
-                Span::raw(format!("{:24} ", remote)),
-                Span::styled(format!("{:8}", state_display), state_style),
-            ]));
-        }
-    }
-
-    text.push(line(""));
-    text.push(line(""));
-    text.push(line(Span::styled(
-        "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::BrightBlack),
-    )));
-
-    // Clamp scroll offset to content bounds
-    let content_lines = text.len();
-    let clamped_scroll =
-        AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
-    app.detail_scroll_offset = clamped_scroll;
-
-    let paragraph = (
-        render::lines(text),
-        TextPresentation {
-            scroll: (clamped_scroll as u16, 0),
-            chrome: Some(PanelChrome {
-                title: Some(line("Connections")),
-                style: Style::default(),
-            }),
-            ..TextPresentation::default()
-        },
-    );
-    paint_text(
-        &app.component_scene,
-        "detail.connections",
-        f,
-        area,
-        paragraph,
-    );
-}
-
-fn format_ip_addr(addr: &IpAddr) -> String {
-    match addr {
-        IpAddr::V4(ipv4) if ipv4.is_unspecified() => "0.0.0.0".to_string(),
-        IpAddr::V6(ipv6) if ipv6.is_unspecified() => "::".to_string(),
-        _ => addr.to_string(),
-    }
-}
-
-fn draw_detail_traffic(
-    f: &mut PaintCx<'_, '_>,
-    area: Rect,
-    process: &ProcessInfo,
-    app: &mut AppState,
-) {
-    let mut text = vec![];
-
-    text.push(line(""));
-    text.push(line(vec![Span::styled(
-        "Traffic Breakdown by Interface:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    if process.interface_stats.is_empty() {
-        text.push(line("  No interface data available"));
-    } else {
-        // Header
-        text.push(line(vec![
-            Span::styled(
-                "  Interface    ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Download Rate    ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Upload Rate    ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Total DL     ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Total UL", Style::default().add_modifier(Modifier::BOLD)),
-        ]));
-
-        text.push(line(
-            "  ─────────────────────────────────────────────────────────────────────",
-        ));
-
-        // Sort interfaces by download rate
-        let mut ifaces: Vec<_> = process.interface_stats.iter().collect();
-        ifaces.sort_by(|a, b| b.1.download_rate.cmp(&a.1.download_rate));
-
-        for (iface_name, stats) in ifaces.iter().take(10) {
-            // Show top 10
-            text.push(line(vec![
-                Span::raw(format!("  {:12} ", iface_name)),
-                Span::styled(
-                    format!(
-                        "↓ {:>10}     ",
-                        ProcessInfo::format_rate(stats.download_rate)
-                    ),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::styled(
-                    format!("↑ {:>10}   ", ProcessInfo::format_rate(stats.upload_rate)),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{:>10}   ", ProcessInfo::format_bytes(stats.total_download)),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("{:>10}", ProcessInfo::format_bytes(stats.total_upload)),
-                    Style::default().fg(Color::Magenta),
-                ),
-            ]));
-        }
-    }
-
-    text.push(line(""));
-    text.push(line(""));
-
-    // Traffic by type
-    text.push(line(vec![Span::styled(
-        "Traffic by Type:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    let total_dl = process.download_rate;
-    let total_ul = process.upload_rate;
-
-    if total_dl > 0 || total_ul > 0 {
-        let internet_pct = if total_dl > 0 {
-            (process.internet_download_rate as f64 / total_dl as f64 * 100.0) as u32
-        } else {
-            0
-        };
-
-        text.push(line(vec![
-            Span::raw("  🌐 Internet:  "),
-            Span::styled(
-                format!("{}%", internet_pct),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ("),
-            Span::styled(
-                format!(
-                    "↓ {}",
-                    ProcessInfo::format_rate(process.internet_download_rate)
-                ),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw(", "),
-            Span::styled(
-                format!(
-                    "↑ {})",
-                    ProcessInfo::format_rate(process.internet_upload_rate)
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-
-        let local_pct = if total_dl > 0 {
-            (process.local_download_rate as f64 / total_dl as f64 * 100.0) as u32
-        } else {
-            0
-        };
-
-        text.push(line(vec![
-            Span::raw("  🏠 Local:     "),
-            Span::styled(
-                format!("{}%", local_pct),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  ("),
-            Span::styled(
-                format!(
-                    "↓ {}",
-                    ProcessInfo::format_rate(process.local_download_rate)
-                ),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw(", "),
-            Span::styled(
-                format!("↑ {})", ProcessInfo::format_rate(process.local_upload_rate)),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    } else {
-        text.push(line("  No traffic"));
-    }
-
-    text.push(line(""));
-    text.push(line(""));
-    text.push(line(Span::styled(
-        "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::BrightBlack),
-    )));
-
-    // Clamp scroll offset to content bounds
-    let content_lines = text.len();
-    let clamped_scroll =
-        AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
-    app.detail_scroll_offset = clamped_scroll;
-
-    let paragraph = (
-        render::lines(text),
-        TextPresentation {
-            scroll: (clamped_scroll as u16, 0),
-            chrome: Some(PanelChrome {
-                title: Some(line("Traffic Details")),
-                style: Style::default(),
-            }),
-            ..TextPresentation::default()
-        },
-    );
-    paint_text(&app.component_scene, "detail.traffic", f, area, paragraph);
-}
-
-fn draw_detail_system(
-    f: &mut PaintCx<'_, '_>,
-    area: Rect,
-    process: &ProcessInfo,
-    app: &mut AppState,
-) {
-    let details = app.details_for(process);
-
-    let mut text = vec![];
-
-    text.push(line(""));
-    text.push(line(vec![Span::styled(
-        "Process Information:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    text.push(line(format!("  PID:                {}", details.pid)));
-    if let Some(ppid) = details.ppid {
-        text.push(line(format!("  Parent PID:         {}", ppid)));
-    }
-    text.push(line(format!(
-        "  State:              {}",
-        details.state_description()
-    )));
-
-    text.push(line(""));
-
-    // User/Group
-    if details.uid.is_some() || details.gid.is_some() {
-        text.push(line(vec![Span::styled(
-            "User/Group:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        text.push(line(""));
-
-        if let Some(uid) = details.uid {
-            text.push(line(format!("  UID:                {}", uid)));
-        }
-        if let Some(gid) = details.gid {
-            text.push(line(format!("  GID:                {}", gid)));
-        }
-
-        text.push(line(""));
-    }
-
-    // Memory
-    if details.memory_rss.is_some() || details.memory_vms.is_some() {
-        text.push(line(vec![Span::styled(
-            "Memory:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        text.push(line(""));
-
-        if let Some(vms) = details.memory_vms {
-            text.push(line(format!(
-                "  Virtual Memory:     {}",
-                crate::process::ProcessDetails::format_memory(vms)
-            )));
-        }
-        if let Some(rss) = details.memory_rss {
-            text.push(line(format!(
-                "  Resident Memory:    {}",
-                crate::process::ProcessDetails::format_memory(rss)
-            )));
-        }
-
-        text.push(line(""));
-    }
-
-    // Threads
-    if let Some(threads) = details.threads {
-        text.push(line(vec![Span::styled(
-            "Threads:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        text.push(line(""));
-        text.push(line(format!("  Thread Count:       {}", threads)));
-        text.push(line(""));
-    }
-
-    // Executable
-    text.push(line(vec![Span::styled(
-        "Executable:",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    text.push(line(""));
-
-    if let Some(ref exe) = details.exe_path {
-        text.push(line(format!("  Path:               {}", exe)));
-    } else {
-        text.push(line("  Path:               (not available)"));
-    }
-
-    if let Some(ref cwd) = details.cwd {
-        text.push(line(format!("  Working Directory:  {}", cwd)));
-    }
-
-    text.push(line(""));
-
-    // Command line
-    if let Some(ref cmdline) = details.cmdline {
-        text.push(line(vec![Span::styled(
-            "Command Line:",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        text.push(line(""));
-
-        let cmd_str = cmdline.join(" ");
-        // Wrap long command lines at word/path boundaries
-        // Calculate available width: area width - borders (2) - indentation (2)
-        let max_width = usize::from(area.width.saturating_sub(4)).max(1);
-        for row in Line::raw(cmd_str).wrap_word(max_width) {
-            text.push(line(format!("  {}", row.plain_text())));
-        }
-    }
-
-    text.push(line(""));
-    text.push(line(""));
-    text.push(line(Span::styled(
-        "[↑↓] Scroll  [Tab] Switch tab  [Esc] Back",
-        Style::default().fg(Color::BrightBlack),
-    )));
-
-    // Clamp scroll offset to content bounds
-    let content_lines = text.len();
-    let clamped_scroll =
-        AppState::clamp_scroll(app.detail_scroll_offset, content_lines, area.height);
-    app.detail_scroll_offset = clamped_scroll;
-
-    let paragraph = (
-        render::lines(text),
-        TextPresentation {
-            scroll: (clamped_scroll as u16, 0),
-            chrome: Some(PanelChrome {
-                title: Some(line("System Information")),
-                style: Style::default(),
-            }),
-            ..TextPresentation::default()
-        },
-    );
-    paint_text(&app.component_scene, "detail.system", f, area, paragraph);
+    let line = usize::from(y - area.y - 1) + scroll;
+    let index = line.checked_sub(header_lines).filter(|i| *i < rows)?;
+    let column = x.saturating_sub(area.x);
+    Some((index, INTERFACE_CHECKBOX_COLUMNS.contains(&column)))
 }
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod parity;
 
 #[cfg(test)]
 mod regressions;

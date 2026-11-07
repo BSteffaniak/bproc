@@ -1,36 +1,63 @@
+//! Deterministic render tests for the legacy network surfaces drawn over the
+//! process explorer, plus their pure state helpers.
 use super::*;
+use crate::process::InterfaceStats;
 use bmux_tui::{buffer::Buffer, frame::Frame};
 
-fn fixture() -> AppState {
-    let mut app = AppState::new();
-    let mut process = ProcessInfo::new(4242, "界面🦀 café e\u{301} worker 界面🦀 café".into());
-    process.download_rate = 4096;
-    process.upload_rate = 2048;
-    app.process_list = vec![process.clone()];
-    app.unfiltered_process_list = vec![process];
-    app.list_state.select(Some(0));
-    app.selected_index = Some(0);
-    app.selected_process_detail_pid = Some(4242);
-    app.interface_list.push(InterfaceInfo {
-        name: "en0界".into(),
+const SIZES: [(u16, u16); 5] = [(120, 40), (80, 24), (40, 12), (1, 1), (0, 0)];
+
+fn worker(pid: i32, name: &str, rate: u64) -> ProcessInfo {
+    let mut process = ProcessInfo::new(pid, name.into());
+    process.download_rate = rate;
+    process.upload_rate = rate / 2;
+    process.interface_stats.insert(
+        "en0".into(),
+        InterfaceStats {
+            download_rate: rate,
+            upload_rate: rate / 2,
+            total_download: rate * 10,
+            total_upload: rate * 5,
+            internet_download_rate: rate,
+            internet_upload_rate: 0,
+            local_download_rate: 0,
+            local_upload_rate: rate / 2,
+        },
+    );
+    process
+}
+
+fn interface(name: &str) -> InterfaceInfo {
+    InterfaceInfo {
+        name: name.into(),
         mac_address: Some("00:11:22:33:44:55".into()),
         ip_addresses: vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
         is_up: true,
-        is_loopback: false,
+        is_loopback: name == "lo0",
         total_download_rate: 4096,
         total_upload_rate: 2048,
         process_count: 1,
-    });
+    }
+}
+
+fn fixture() -> AppState {
+    let mut app = AppState::new();
+    app.update_processes(
+        [
+            (4242, worker(4242, "worker", 4096)),
+            (7, worker(7, "界面🦀 café e\u{301} long process name", 1024)),
+        ]
+        .into(),
+    );
+    app.update_interfaces(
+        ["en0", "lo0"]
+            .into_iter()
+            .map(|n| (n.to_string(), interface(n)))
+            .collect(),
+    );
+    app.selected_index = Some(0);
+    app.list_state.select(Some(0));
     app.selected_interface_index = Some(0);
-    app.selected_interface_name = Some("en0界".into());
-    app.interface_list_state.select(Some(0));
-    let mut details = app.details_for(&app.process_list[0]);
-    details.cmdline = Some(vec!["界🦀/".repeat(40), "--test".into()]);
-    details.exe_path = Some("/tmp/界🦀".into());
-    details.cwd = Some("/tmp/café".into());
-    details.memory_rss = Some(1024);
-    details.threads = Some(3);
-    app.update_process_details(Some(details));
+    app.selected_interface_name = Some("en0".into());
     app
 }
 
@@ -39,10 +66,13 @@ fn backend() -> BackendInfo {
         active_upload: Some("userspace".into()),
         active_download: Some("userspace".into()),
         active_monitoring: Some("pnet".into()),
-        active_socket_mapper: None,
-        available_upload: vec![],
-        available_download: vec![],
-        available_socket_mappers: vec![],
+        active_socket_mapper: Some("libproc".into()),
+        available_upload: vec![("userspace".into(), BackendPriority::Good, true)],
+        available_download: vec![
+            ("userspace".into(), BackendPriority::Good, true),
+            ("tc".into(), BackendPriority::Best, false),
+        ],
+        available_socket_mappers: vec![("libproc".into(), BackendPriority::Best, true)],
         preferred_upload: None,
         preferred_download: None,
         preferred_socket_mapper: None,
@@ -53,147 +83,390 @@ fn backend() -> BackendInfo {
     }
 }
 
+/// Every legacy surface that can sit on top of the explorer.
+#[derive(Debug, Clone, Copy)]
+enum Surface {
+    Interfaces,
+    InterfacesEmpty,
+    InterfaceDetail,
+    InterfaceDetailEmpty,
+    Help,
+    Throttle,
+    Backends,
+    Graph,
+    GraphNoHistory,
+    GraphNoProcess,
+    Compatibility,
+}
+
+const SURFACES: [Surface; 11] = [
+    Surface::Interfaces,
+    Surface::InterfacesEmpty,
+    Surface::InterfaceDetail,
+    Surface::InterfaceDetailEmpty,
+    Surface::Help,
+    Surface::Throttle,
+    Surface::Backends,
+    Surface::Graph,
+    Surface::GraphNoHistory,
+    Surface::GraphNoProcess,
+    Surface::Compatibility,
+];
+
+impl Surface {
+    fn open(self, app: &mut AppState) {
+        match self {
+            Surface::Interfaces => app.view_mode = ViewMode::InterfaceList,
+            Surface::InterfacesEmpty => {
+                app.interface_list.clear();
+                app.view_mode = ViewMode::InterfaceList;
+            }
+            Surface::InterfaceDetail => app.view_mode = ViewMode::InterfaceDetail,
+            Surface::InterfaceDetailEmpty => {
+                app.selected_interface_name = Some("lo0".into());
+                app.view_mode = ViewMode::InterfaceDetail;
+            }
+            Surface::Help => {
+                app.view_mode = ViewMode::InterfaceList;
+                app.show_help = true;
+            }
+            Surface::Throttle => {
+                app.show_throttle_dialog = true;
+                app.throttle_dialog.target_pid = Some(4242);
+                app.throttle_dialog.target_name = Some("worker".into());
+                app.throttle_dialog.download_input = "1024".into();
+            }
+            Surface::Backends => {
+                app.build_backend_items(&backend());
+                app.show_backend_info = true;
+            }
+            Surface::Graph => {
+                app.show_graph = true;
+                app.history.update_at(1, 4242, "worker".into(), 4096, 2048);
+                app.history.update_at(2, 4242, "worker".into(), 8192, 1024);
+            }
+            Surface::GraphNoHistory => app.show_graph = true,
+            Surface::GraphNoProcess => {
+                app.show_graph = true;
+                app.selected_index = None;
+            }
+            Surface::Compatibility => {
+                app.show_throttle_dialog = true;
+                app.throttle_dialog.target_pid = Some(4242);
+                app.show_backend_compatibility_dialog = true;
+                app.backend_compatibility_dialog = Some(BackendCompatibilityDialog::new(
+                    "userspace".into(),
+                    crate::process::TrafficType::Internet,
+                    vec!["界backend".into()],
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn layer(self) -> Layer {
+        match self {
+            Surface::Interfaces | Surface::InterfacesEmpty => Layer::InterfaceList,
+            Surface::InterfaceDetail | Surface::InterfaceDetailEmpty => Layer::InterfaceDetail,
+            Surface::Help => Layer::Help,
+            Surface::Throttle => Layer::Throttle,
+            Surface::Backends => Layer::Backends,
+            Surface::Graph | Surface::GraphNoHistory | Surface::GraphNoProcess => Layer::Graph,
+            Surface::Compatibility => Layer::Compatibility,
+        }
+    }
+
+    /// Text that must be visible at 120x40 (the first entry also at 80x24).
+    fn expected(self) -> &'static [&'static str] {
+        match self {
+            Surface::Interfaces => &["Interface Filter", "[✓]", "en0", "lo0", "click box"],
+            Surface::InterfacesEmpty => &["Interface Filter", "No interfaces detected"],
+            Surface::InterfaceDetail => &[
+                "Interface: en0",
+                "2 processes",
+                "worker",
+                "[◀ Back]",
+                "Esc back",
+                "DL Rate",
+            ],
+            Surface::InterfaceDetailEmpty => &["Interface: lo0", "No processes have used"],
+            Surface::Help => &["Help", "Interfaces - keyboard & mouse", "Toggle all / no"],
+            Surface::Throttle => &[
+                "Throttle: worker (PID 4242)",
+                "Download Limit",
+                "click to change",
+            ],
+            Surface::Backends => &["Backends", "Socket Mapper Backends:", "libproc"],
+            Surface::Graph => &["Bandwidth Graph: worker (PID 4242)", "Download", "close"],
+            Surface::GraphNoHistory => &["Bandwidth Graph: worker", "No historical data"],
+            Surface::GraphNoProcess => &["Bandwidth Graph", "no longer reporting"],
+            Surface::Compatibility => &["Backend Incompatibility", "Cancel - don't apply"],
+        }
+    }
+}
+
 fn render(app: &mut AppState, width: u16, height: u16) -> Buffer {
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
     let mut frame = Frame::new(&mut buffer);
     draw_ui_with_backend_info(&mut PaintCx::new(&mut frame), app, Some(&backend()));
     buffer
 }
-fn text(buffer: &Buffer) -> String {
+
+fn rows(buffer: &Buffer, width: u16) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
     buffer
         .cells()
-        .iter()
-        .map(|cell| cell.symbol.as_str())
-        .collect::<Vec<_>>()
-        .join("")
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol.as_str()).collect())
+        .collect()
 }
 
 #[test]
-#[ignore = "legacy process view replaced by explorer; pending migration"]
-fn all_views_and_detail_tabs_render_deterministically() {
-    for view in [
-        ViewMode::ProcessView,
-        ViewMode::InterfaceList,
-        ViewMode::InterfaceDetail,
-        ViewMode::ProcessDetail,
-    ] {
-        for tab in [
-            ProcessDetailTab::Overview,
-            ProcessDetailTab::Connections,
-            ProcessDetailTab::Traffic,
-            ProcessDetailTab::System,
-        ] {
-            for (width, height) in [(120, 45), (80, 24), (20, 10), (4, 4), (1, 1), (0, 0)] {
-                let mut app = fixture();
-                app.view_mode = view;
-                app.detail_tab = tab;
-                let first = render(&mut app, width, height);
-                let second = render(&mut app, width, height);
-                assert_eq!(first, second, "{view:?}/{tab:?} at {width}x{height}");
-                if width == 120 && height == 45 {
-                    assert!(
-                        text(&first).contains("bproc") || text(&first).contains("Process Details")
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn every_overlay_and_empty_state_renders_at_tiny_sizes() {
-    for overlay in 0..7 {
-        for (width, height) in [(140, 50), (80, 24), (16, 8), (3, 2), (0, 0)] {
+fn every_legacy_surface_renders_over_the_explorer_at_every_size() {
+    for surface in SURFACES {
+        for (width, height) in SIZES {
             let mut app = fixture();
-            match overlay {
-                0 => app.show_help = true,
-                1 => {
-                    app.show_throttle_dialog = true;
-                    app.throttle_dialog.target_pid = Some(4242);
-                    app.throttle_dialog.target_name = Some("界🦀".into());
-                    app.throttle_dialog.download_input = "1024".into();
-                }
-                2 => app.show_backend_info = true,
-                3 => {
-                    app.show_backend_compatibility_dialog = true;
-                    app.backend_compatibility_dialog = Some(BackendCompatibilityDialog::new(
-                        "userspace".into(),
-                        crate::process::TrafficType::Internet,
-                        vec!["界backend".into()],
-                        true,
-                    ));
-                }
-                4 => app.show_graph = true,
-                5 => {
-                    app.show_graph = true;
-                    app.history
-                        .update_at(1, 4242, "界worker".into(), 4096, 2048);
-                    app.history
-                        .update_at(2, 4242, "界worker".into(), 8192, 1024);
-                }
-                _ => {
-                    app.process_list.clear();
-                    app.unfiltered_process_list.clear();
-                    app.view_mode = ViewMode::ProcessDetail;
-                }
-            }
+            surface.open(&mut app);
             let first = render(&mut app, width, height);
-            assert_eq!(
-                first,
-                render(&mut app, width, height),
-                "overlay {overlay} {width}x{height}"
-            );
+            let second = render(&mut app, width, height);
+            assert_eq!(first, second, "{surface:?} at {width}x{height}");
+            let screen = rows(&first, width).join("\n");
+            let expected = surface.expected();
+            let checked = match (width, height) {
+                (120, 40) => expected.len(),
+                (80, 24) => 1,
+                _ => 0,
+            };
+            for text in &expected[..checked] {
+                assert!(
+                    screen.contains(text),
+                    "{surface:?} at {width}x{height} lacks {text:?}:\n{screen}"
+                );
+            }
         }
     }
 }
 
 #[test]
-#[ignore = "legacy process view replaced by explorer; pending migration"]
-fn selection_scroll_and_legacy_hit_regions_remain_stable() {
-    let mut app = fixture();
-    for pid in 1..60 {
-        app.process_list
-            .push(ProcessInfo::new(pid, format!("worker {pid}")));
+fn legacy_click_regions_stay_on_screen_and_belong_to_the_open_surface() {
+    for surface in SURFACES {
+        for (width, height) in SIZES {
+            let mut app = fixture();
+            surface.open(&mut app);
+            render(&mut app, width, height);
+            for region in &app.clickable_regions {
+                let area = region.area;
+                assert!(
+                    u32::from(area.x) + u32::from(area.width) <= u32::from(width)
+                        && u32::from(area.y) + u32::from(area.height) <= u32::from(height),
+                    "{surface:?} {width}x{height}: {region:?} off screen"
+                );
+            }
+            if width >= 40 {
+                let layer = surface.layer();
+                assert!(
+                    app.clickable_regions
+                        .iter()
+                        .any(|r| r.region_type.layer() == layer),
+                    "{surface:?} {width}x{height} registered no {layer:?} panel"
+                );
+            }
+        }
     }
-    app.list_state.select(Some(45));
-    render(&mut app, 100, 24);
-    assert!(app.list_state.offset() > 0);
-    assert!(
-        app.clickable_regions
-            .iter()
-            .any(|region| matches!(region.region_type, ClickableRegionType::ProcessList { .. }))
-    );
-    app.view_mode = ViewMode::ProcessDetail;
-    render(&mut app, 120, 40);
-    assert!(app.clickable_regions.iter().any(|region| matches!(&region.region_type, ClickableRegionType::ProcessDetailTabs { tab_ranges } if tab_ranges.len() == 4)));
 }
 
 #[test]
-fn footer_wrap_preserves_every_hint_and_unicode_width() {
-    let spans = vec![
-        Span::raw("[a] "),
-        Span::raw("界面"),
-        Span::raw("  "),
-        Span::raw("[b] "),
-        Span::raw("other"),
-    ];
-    let rows = wrap_spans_to_lines(spans, 12);
-    assert!(rows.len() >= 2);
-    let combined = rows.iter().map(Line::plain_text).collect::<String>();
-    assert!(combined.contains("[a] 界面"));
-    assert!(combined.contains("[b] other"));
-}
-
-#[test]
-fn process_details_are_supplied_by_runtime_and_pid_checked() {
+fn process_view_paints_only_the_explorer() {
     let mut app = fixture();
-    assert_eq!(
-        app.cached_process_details.as_ref().unwrap().threads,
-        Some(3)
+    for (width, height) in SIZES {
+        render(&mut app, width, height);
+        assert!(app.clickable_regions.is_empty(), "{width}x{height}");
+        assert_eq!(app.top_layer(), None);
+    }
+}
+
+#[test]
+fn interface_detail_lists_only_processes_on_that_interface() {
+    let mut app = fixture();
+    let mut offline = ProcessInfo::new(99, "offline-daemon".into());
+    offline.download_rate = 1 << 20;
+    app.update_processes([(4242, worker(4242, "worker", 4096)), (99, offline)].into());
+    app.view_mode = ViewMode::InterfaceDetail;
+    let screen = rows(&render(&mut app, 120, 40), 120).join("\n");
+    assert!(screen.contains("worker"));
+    assert!(screen.contains("1 process ·"));
+    assert!(!screen.contains("offline-daemon"));
+}
+
+#[test]
+fn interface_detail_selection_scrolls_long_lists() {
+    let mut app = fixture();
+    app.update_processes(
+        (1..=80)
+            .map(|pid| {
+                (
+                    pid,
+                    worker(pid, &format!("proc-{pid:02}"), pid as u64 * 100),
+                )
+            })
+            .collect(),
     );
-    let other = ProcessInfo::new(9999, "other".into());
-    assert!(app.details_for(&other).threads.is_none());
-    app.update_process_details(None);
-    let buffer = render(&mut app, 80, 24);
-    assert!(!text(&buffer).is_empty());
+    app.enter_interface_detail();
+    app.interface_detail_state.select(Some(79));
+    let screen = rows(&render(&mut app, 80, 24), 80).join("\n");
+    // Highest rate sorts first, so the last row is the slowest process.
+    assert!(screen.contains("proc-01"), "{screen}");
+    assert!(!screen.contains("proc-80"));
+    assert!(*app.interface_detail_state.offset_mut() > 0);
+}
+
+#[test]
+fn interface_click_maps_rows_through_scroll_and_detects_the_checkbox() {
+    let area = Rect::new(10, 5, 50, 20);
+    let header = INTERFACE_HEADER_LINES;
+    let first_row_y = 5 + 1 + header as u16;
+    assert_eq!(
+        interface_click(area, header, 0, 3, 20, first_row_y),
+        Some((0, false))
+    );
+    assert_eq!(
+        interface_click(area, header, 0, 3, 13, first_row_y + 2),
+        Some((2, true))
+    );
+    assert_eq!(
+        interface_click(area, header, 0, 3, 15, first_row_y),
+        Some((0, true))
+    );
+    assert_eq!(
+        interface_click(area, header, 0, 3, 16, first_row_y),
+        Some((0, false))
+    );
+    // Scrolled by two lines: the same screen row now shows interface 2.
+    assert_eq!(
+        interface_click(area, header, 2, 3, 20, first_row_y),
+        Some((2, false))
+    );
+    // Header, rows past the end, borders and degenerate areas miss.
+    assert_eq!(
+        interface_click(area, header, 0, 3, 20, first_row_y - 1),
+        None
+    );
+    assert_eq!(
+        interface_click(area, header, 0, 3, 20, first_row_y + 3),
+        None
+    );
+    assert_eq!(interface_click(area, header, 0, 3, 20, 5), None);
+    assert_eq!(interface_click(area, header, 0, 3, 20, 24), None);
+    assert_eq!(
+        interface_click(Rect::new(0, 0, 1, 1), header, 0, 3, 0, 0),
+        None
+    );
+    assert_eq!(interface_click(Rect::default(), header, 0, 3, 0, 0), None);
+}
+
+#[test]
+fn interface_cursor_is_normalized_for_the_modal() {
+    let mut app = fixture();
+    app.selected_interface_index = None;
+    app.ensure_interface_cursor();
+    assert_eq!(app.selected_interface_index, Some(0));
+    app.selected_interface_index = Some(9);
+    app.ensure_interface_cursor();
+    assert_eq!(app.selected_interface_index, Some(1));
+    app.interface_list.clear();
+    app.ensure_interface_cursor();
+    assert_eq!(app.selected_interface_index, None);
+}
+
+#[test]
+fn top_layer_follows_input_priority_and_dismiss_closes_it() {
+    let mut app = fixture();
+    app.view_mode = ViewMode::InterfaceDetail;
+    app.show_help = true;
+    app.show_throttle_dialog = true;
+    app.show_graph = true;
+    app.show_backend_info = true;
+    app.show_backend_compatibility_dialog = true;
+    let mut order = Vec::new();
+    while let Some(layer) = app.top_layer() {
+        order.push(layer);
+        app.dismiss(layer);
+    }
+    assert_eq!(
+        order,
+        [
+            Layer::Compatibility,
+            Layer::Backends,
+            Layer::Graph,
+            Layer::Throttle,
+            Layer::Help,
+            Layer::InterfaceDetail,
+            Layer::InterfaceList,
+        ]
+    );
+    assert_eq!(app.view_mode, ViewMode::ProcessView);
+    assert!(!Layer::Throttle.dismissible() && !Layer::Compatibility.dismissible());
+    assert!(Layer::Graph.dismissible() && Layer::InterfaceList.dismissible());
+}
+
+#[test]
+fn graph_keeps_following_its_process_across_resorts() {
+    let mut app = fixture();
+    let pid = app.get_selected_process().unwrap().pid;
+    assert_eq!(pid, 4242);
+    // A burst on the other process re-sorts the list underneath the graph.
+    app.update_processes(
+        [
+            (4242, worker(4242, "worker", 10)),
+            (7, worker(7, "busy", 1 << 30)),
+        ]
+        .into(),
+    );
+    assert_eq!(app.process_list[0].pid, 7);
+    assert_eq!(app.get_selected_process().unwrap().pid, 4242);
+    assert_eq!(app.list_state.selected(), app.selected_index);
+    app.update_processes([(7, worker(7, "busy", 1))].into());
+    assert_eq!(app.selected_index, None);
+}
+
+#[test]
+fn network_order_is_deterministic() {
+    let mut app = AppState::new();
+    let mut throttled = worker(3, "b", 0);
+    throttled.throttle_limit = Some(crate::process::ThrottleLimit {
+        download_limit: Some(1),
+        upload_limit: None,
+        traffic_type: crate::process::TrafficType::All,
+    });
+    let mut dead = worker(1, "z", 1 << 20);
+    dead.is_terminated = true;
+    app.update_processes(
+        [
+            (1, dead),
+            (2, worker(2, "a", 0)),
+            (3, throttled),
+            (4, worker(4, "fast", 9000)),
+            (5, worker(5, "a", 0)),
+        ]
+        .into(),
+    );
+    let order: Vec<i32> = app.process_list.iter().map(|p| p.pid).collect();
+    assert_eq!(order, [4, 3, 2, 5, 1]);
+}
+
+#[test]
+fn interface_filter_hides_processes_from_the_network_list() {
+    let mut app = fixture();
+    app.toggle_interface_filter("en0".into());
+    assert_eq!(app.active_interface_filters, Some(vec!["lo0".to_string()]));
+    app.update_processes([(4242, worker(4242, "worker", 1))].into());
+    assert!(app.process_list.is_empty());
+    assert_eq!(app.unfiltered_process_list.len(), 1);
+    // A partial filter selects everything first, then nothing.
+    app.toggle_all_interface_filters();
+    assert_eq!(app.active_interface_filters, None);
+    app.toggle_all_interface_filters();
+    assert_eq!(app.active_interface_filters, Some(vec![]));
 }
