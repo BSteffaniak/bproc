@@ -18,7 +18,53 @@ use std::time::Duration;
 /// Refresh interval choices in milliseconds.
 pub const REFRESH_STEPS: [u64; 9] = [250, 500, 750, 1000, 1500, 2000, 3000, 5000, 10_000];
 pub const ESCALATE_RANGE: (u64, u64) = (1, 60);
+/// Fallback `dock_size` bounds used before the first frame has a size.
 pub const DOCK_SIZE_RANGE: (u16, u16) = (6, 40);
+/// Smallest bottom dock in rows; the table keeps at least 5 rows.
+pub const DOCK_MIN_ROWS: u16 = 6;
+/// Smallest right dock in `dock_size` units (×4 cells = 32 columns, above
+/// the 30-column floor layout enforces); the table keeps 40 columns.
+pub const DOCK_MIN_UNITS: u16 = 8;
+
+/// `dock_size` bounds for `dock` inside a main area of `main_w`×`main_h`:
+/// the range in which every step visibly changes the panel. Shared by the
+/// Settings stepper and the splitter drag so they never disagree.
+pub fn dock_size_bounds(dock: DockPosition, main_w: u16, main_h: u16) -> (u16, u16) {
+    match dock {
+        DockPosition::Bottom => (DOCK_MIN_ROWS, main_h.saturating_sub(5).max(DOCK_MIN_ROWS)),
+        DockPosition::Right => (
+            DOCK_MIN_UNITS,
+            (main_w.saturating_sub(40) / 4).max(DOCK_MIN_UNITS),
+        ),
+    }
+}
+
+/// `dock_size` bounds for the current dock and terminal size.
+pub fn current_dock_bounds(state: &ExplorerState) -> (u16, u16) {
+    let main = state.layout(state.last_area).main;
+    if main.width == 0 || main.height == 0 {
+        let lo = match state.settings.dock {
+            DockPosition::Bottom => DOCK_MIN_ROWS,
+            DockPosition::Right => DOCK_MIN_UNITS,
+        };
+        return (lo, DOCK_SIZE_RANGE.1.max(lo));
+    }
+    dock_size_bounds(state.settings.dock, main.width, main.height)
+}
+
+/// Step `current` by `delta` within `(lo, hi)`. A step never moves the
+/// value the wrong way: `+` leaves a size already above `hi` (e.g. dragged
+/// on a larger terminal) alone and `-` leaves one below `lo` alone; other
+/// steps start from the size actually shown.
+pub fn step_dock_size(current: u16, delta: i32, (lo, hi): (u16, u16)) -> u16 {
+    if delta == 0 || (delta > 0 && current >= hi) || (delta < 0 && current <= lo) {
+        return current;
+    }
+    let shown = current.clamp(lo, hi);
+    shown
+        .saturating_add_signed(delta.clamp(-100, 100) as i16)
+        .clamp(lo, hi)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item {
@@ -538,11 +584,9 @@ pub fn adjust(state: &mut ExplorerState, item: Item, delta: i32) {
             s.escalate_after_secs = next;
         }
         Item::DockSize => {
-            let (lo, hi) = DOCK_SIZE_RANGE;
-            let next = s
-                .dock_size
-                .saturating_add_signed(delta.clamp(-100, 100) as i16)
-                .clamp(lo, hi);
+            let bounds = current_dock_bounds(state);
+            let s = &mut state.settings;
+            let next = step_dock_size(s.dock_size, delta, bounds);
             if next == s.dock_size {
                 return;
             }
@@ -841,6 +885,79 @@ mod tests {
         state.settings.escalate_after_secs = 1;
         adjust(&mut state, Item::EscalateAfter, -5);
         assert_eq!(state.settings.escalate_after_secs, 1);
+    }
+
+    #[test]
+    fn dock_size_steps_use_layout_bounds() {
+        // Bottom dock on a tall terminal: a splitter drag may go past 40.
+        let mut state = ExplorerState::default();
+        open(&mut state);
+        render(&mut state, 120, 90);
+        let (lo, hi) = current_dock_bounds(&state);
+        assert_eq!(lo, DOCK_MIN_ROWS);
+        assert!(hi > 51, "tall terminal allows a big dock: {hi}");
+        state.settings.dock_size = 50;
+        adjust(&mut state, Item::DockSize, 1);
+        assert_eq!(state.settings.dock_size, 51, "+ grows, never snaps to 40");
+        state.settings.dock_size = hi;
+        adjust(&mut state, Item::DockSize, 1);
+        assert_eq!(state.settings.dock_size, hi);
+
+        // Above the current maximum (terminal shrank): + keeps, - steps down
+        // from the size actually shown.
+        state.settings.dock_size = 500;
+        adjust(&mut state, Item::DockSize, 1);
+        assert_eq!(state.settings.dock_size, 500);
+        adjust(&mut state, Item::DockSize, -1);
+        assert_eq!(state.settings.dock_size, hi - 1);
+
+        // Right dock: every step above the minimum changes the width.
+        state.settings.dock = DockPosition::Right;
+        render(&mut state, 200, 40);
+        let (lo, hi) = current_dock_bounds(&state);
+        assert_eq!(lo, DOCK_MIN_UNITS);
+        assert!(
+            lo * 4 >= 30,
+            "minimum is wider than layout's 30-column floor"
+        );
+        assert_eq!(hi, (200 - 40) / 4);
+        state.settings.dock_size = lo;
+        adjust(&mut state, Item::DockSize, -1);
+        assert_eq!(state.settings.dock_size, lo);
+        state.settings.dock_size = 6;
+        adjust(&mut state, Item::DockSize, -1);
+        assert_eq!(state.settings.dock_size, 6, "- never grows a tiny size");
+        adjust(&mut state, Item::DockSize, 1);
+        assert_eq!(state.settings.dock_size, lo + 1);
+    }
+
+    #[test]
+    fn dock_size_bounds_match_layout() {
+        for (w, h) in [(200u16, 90u16), (120, 40), (80, 24), (60, 12), (20, 8)] {
+            for dock in [DockPosition::Bottom, DockPosition::Right] {
+                let mut state = ExplorerState::default();
+                state.settings.dock = dock;
+                state.last_area = Rect::new(0, 0, w, h);
+                state.detail.open(key_of(1), false);
+                let main = state.layout(state.last_area).main;
+                let (lo, hi) = dock_size_bounds(dock, main.width, main.height);
+                assert!(lo <= hi);
+                // Within the bounds, distinct sizes give distinct panels
+                // whenever the area is big enough to honour them.
+                let mut extent = |size: u16| {
+                    state.settings.dock_size = size;
+                    let dock_rect = state.layout(state.last_area).dock;
+                    match dock {
+                        DockPosition::Bottom => dock_rect.height,
+                        DockPosition::Right => dock_rect.width,
+                    }
+                };
+                if hi > lo && main.height > 11 && main.width > 72 {
+                    assert!(extent(lo + 1) > extent(lo), "{w}x{h} {dock:?}");
+                    assert!(extent(hi) > extent(hi - 1), "{w}x{h} {dock:?}");
+                }
+            }
+        }
     }
 
     #[test]

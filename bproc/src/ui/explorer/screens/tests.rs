@@ -3,7 +3,7 @@ use super::test_support::*;
 use super::*;
 use crate::procs::actions::Signal;
 use crate::procs::model::{ExitedProcess, ProcSnapshot};
-use crate::procs::watch::{Comparison, WatchAction, WatchMetric};
+use crate::procs::watch::{Comparison, WatchAction, WatchMetric, glob_match};
 
 fn events_state() -> ExplorerState {
     let mut state = state_with_processes();
@@ -368,6 +368,28 @@ fn enter_on_live_event_jumps() {
 }
 
 #[test]
+fn jump_clears_a_search_that_would_hide_the_target() {
+    let mut state = state_with_processes();
+    state.search.set_text("postgres");
+    render(&mut state, 120, 30);
+    assert!(jump_to_process(&mut state, key_of(100)));
+    assert!(
+        state.search.text.is_empty(),
+        "filter hid node, so it is cleared"
+    );
+    let text = render(&mut state, 120, 30);
+    assert!(text.contains("node"), "{text}");
+    assert_eq!(state.table.selected(), Some(key_of(100)));
+
+    // A search that already shows the target is left alone.
+    let mut state = state_with_processes();
+    state.search.set_text("node");
+    render(&mut state, 120, 30);
+    assert!(jump_to_process(&mut state, key_of(100)));
+    assert_eq!(state.search.text, "node");
+}
+
+#[test]
 fn right_click_on_live_event_opens_process_menu() {
     let mut state = events_state();
     render(&mut state, 120, 30);
@@ -411,7 +433,15 @@ fn glob_and_target_matching() {
         &k,
         row
     ));
-    assert!(target_matches(&WatchTarget::User("Alice".into()), &k, row));
+    assert!(target_matches(&WatchTarget::User("alice".into()), &k, row));
+    // Same (case-sensitive) user rule as the alert evaluator.
+    assert!(!target_matches(&WatchTarget::User("Alice".into()), &k, row));
+    assert!(target_matches(
+        &WatchTarget::Command(String::new()),
+        &k,
+        row
+    ));
+    assert!(!target_matches(&WatchTarget::Command("x".into()), &k, None));
     assert!(!target_matches(&WatchTarget::User("bob".into()), &k, row));
     assert!(target_matches(&WatchTarget::Any, &k, None));
     assert!(target_matches(

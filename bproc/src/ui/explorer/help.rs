@@ -6,6 +6,7 @@ use super::hits::{Hit, contains};
 use super::overlays::OverlayOutcome;
 use super::paint::{Frame, centered, fit, theme, truncate};
 use super::screens::input::{TextInput, typed_char};
+use crate::procs::actions::Signal;
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -21,12 +22,14 @@ pub struct HelpState {
     pub selected: usize,
 }
 
-/// Mouse gestures listed in the help's "Mouse" section.
+/// Mouse gestures listed in the help's "Mouse" section. Only gestures a
+/// terminal can actually report: mouse reports never carry Cmd/⌘.
 pub const MOUSE: &[(&str, &str)] = &[
     ("Click", "Select a row"),
     ("Double-click", "Open details"),
     ("Right-click", "Actions menu"),
-    ("Ctrl/⌘-click", "Mark / unmark"),
+    ("Ctrl/Alt-click", "Mark / unmark"),
+    ("Middle-click", "Mark / unmark"),
     ("Shift-click", "Mark a range"),
     ("Wheel", "Scroll without moving selection"),
     ("Drag header edge", "Resize a column"),
@@ -35,13 +38,59 @@ pub const MOUSE: &[(&str, &str)] = &[
     ("Click meters/tabs", "Meters, tabs, chips, F-keys"),
 ];
 
+/// Keys of the details panel ("inspector"), listed in their own section.
+pub const INSPECTOR: &[(&str, &str)] = &[
+    ("{ }", "Previous / next tab"),
+    (FULL_DETAILS_KEYS, "Full screen"),
+    ("Tab ⇧Tab ← →", "Switch tabs (full screen)"),
+    ("↑↓ PgUp PgDn", "Scroll (full screen)"),
+    ("Esc", "Leave full screen / close"),
+    ("Drag splitter", "Resize the panel"),
+    ("Dbl-click splitter", "Toggle full screen"),
+];
+
+/// Shift+Enter only arrives as such with the kitty keyboard protocol; most
+/// terminals send a plain Enter, and Enter on an open panel goes full screen.
+const FULL_DETAILS_KEYS: &str = "Shift+Enter, Enter×2";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Heading(&'static str),
     /// Index into `BINDINGS`.
     Binding(usize),
     Mouse(usize),
+    /// Index into `INSPECTOR`.
+    Inspector(usize),
     Blank,
+}
+
+/// Signal-dialog shortcut for actions that have no key of their own.
+fn signal_shortcut(action: Action) -> Option<usize> {
+    let signal = match action {
+        Action::Terminate => Signal::Term,
+        Action::Kill => Signal::Kill,
+        Action::Suspend => Signal::Stop,
+        Action::Resume => Signal::Cont,
+        _ => return None,
+    };
+    Signal::ALL.iter().position(|s| *s == signal).map(|i| i + 1)
+}
+
+/// Key label shown in the help's key column: real keys only, never a
+/// placeholder word. Actions reached through the signal dialog show its
+/// shortcut (e.g. "x ▸ 1"); actions without any key show nothing.
+pub fn help_keys(action: Action) -> String {
+    if action == Action::FullDetails {
+        return FULL_DETAILS_KEYS.into();
+    }
+    let keys = action.keys();
+    if !keys.is_empty() {
+        return keys.into();
+    }
+    match signal_shortcut(action) {
+        Some(n) => format!("x ▸ {n}"),
+        None => String::new(),
+    }
 }
 
 fn matches(query: &str, haystacks: &[&str]) -> bool {
@@ -57,7 +106,7 @@ pub fn sections(query: &str) -> Vec<Vec<Entry>> {
             .iter()
             .enumerate()
             .filter(|(_, b)| b.group == group)
-            .filter(|(_, b)| matches(query, &[b.keys, b.label, group.label()]))
+            .filter(|(_, b)| matches(query, &[&help_keys(b.action), b.label, group.label()]))
             .map(|(i, _)| Entry::Binding(i))
             .collect();
         if !rows.is_empty() {
@@ -65,6 +114,17 @@ pub fn sections(query: &str) -> Vec<Vec<Entry>> {
             section.extend(rows);
             out.push(section);
         }
+    }
+    let inspector: Vec<Entry> = INSPECTOR
+        .iter()
+        .enumerate()
+        .filter(|(_, (keys, what))| matches(query, &[keys, what, "inspector", "details"]))
+        .map(|(i, _)| Entry::Inspector(i))
+        .collect();
+    if !inspector.is_empty() {
+        let mut section = vec![Entry::Heading("Inspector")];
+        section.extend(inspector);
+        out.push(section);
     }
     let mouse: Vec<Entry> = MOUSE
         .iter()
@@ -287,7 +347,7 @@ fn draw_entry(
     state: &ExplorerState,
     bg: Style,
 ) {
-    let keys_w = 14usize.min(rect.width as usize / 2);
+    let keys_w = KEYS_W.min(rect.width as usize / 2);
     match entry {
         Entry::Blank => {}
         Entry::Heading(title) => {
@@ -317,11 +377,7 @@ fn draw_entry(
                     row.patch(s)
                 }
             };
-            let keys = if binding.keys.is_empty() {
-                "menu"
-            } else {
-                binding.keys
-            };
+            let keys = help_keys(binding.action);
             let key_style = if binding.keys.is_empty() {
                 theme::dim()
             } else {
@@ -330,7 +386,7 @@ fn draw_entry(
             frame.line_bg(
                 rect,
                 &Line::from_spans(vec![
-                    Span::styled(format!("  {} ", fit(keys, keys_w, false)), keep(key_style)),
+                    Span::styled(format!("  {} ", fit(&keys, keys_w, false)), keep(key_style)),
                     Span::styled(binding.label, row),
                 ]),
                 row,
@@ -345,20 +401,45 @@ fn draw_entry(
         }
         Entry::Mouse(m) => {
             let (gesture, what) = MOUSE[m];
-            let w = keys_w.max(18.min(rect.width as usize / 2));
-            frame.line_bg(
+            draw_tip(
+                frame,
                 rect,
-                &Line::from_spans(vec![
-                    Span::styled(
-                        format!("  {} ", fit(gesture, w, false)),
-                        bg.patch(theme::bold()),
-                    ),
-                    Span::styled(what, bg.patch(theme::dim())),
-                ]),
+                keys_w,
+                gesture,
+                what,
+                bg.patch(theme::bold()),
                 bg,
             );
         }
+        Entry::Inspector(i) => {
+            let (keys, what) = INSPECTOR[i];
+            let style = bg.patch(theme::accent()).patch(theme::bold());
+            draw_tip(frame, rect, keys_w, keys, what, style, bg);
+        }
     }
+}
+
+/// Width of the key column (fits "Shift+Enter, Enter×2").
+const KEYS_W: usize = 20;
+
+/// Informational (non-runnable) row: key or gesture, then what it does.
+fn draw_tip(
+    frame: &mut Frame<'_, '_, '_>,
+    rect: Rect,
+    keys_w: usize,
+    keys: &str,
+    what: &str,
+    key_style: Style,
+    bg: Style,
+) {
+    frame.line_bg(
+        rect,
+        &Line::from_spans(vec![
+            Span::styled(format!("  {} ", fit(keys, keys_w, false)), key_style),
+            Span::styled(what.to_string(), bg.patch(theme::dim())),
+        ]),
+        bg,
+    );
 }
 
 /// Keep the selected row inside the viewport.
@@ -643,6 +724,57 @@ mod tests {
         wheel(&mut state, 10, 7, false);
         assert_eq!(help_state(&state).scroll, 3);
         assert_eq!(help_state(&state).selected, 0, "wheel keeps the selection");
+    }
+
+    #[test]
+    fn key_column_shows_only_real_keys() {
+        for b in BINDINGS {
+            let keys = help_keys(b.action);
+            assert_ne!(keys, "menu", "{:?}", b.action);
+            assert!(!keys.contains('⌘'), "{:?}", b.action);
+        }
+        assert_eq!(help_keys(Action::Terminate), "x ▸ 1");
+        assert_eq!(help_keys(Action::Kill), "x ▸ 2");
+        assert_eq!(help_keys(Action::Suspend), "x ▸ 6");
+        assert_eq!(help_keys(Action::Resume), "x ▸ 7");
+        assert_eq!(help_keys(Action::FullDetails), "Shift+Enter, Enter×2");
+        assert_eq!(help_keys(Action::Tree), "F5 T");
+        let mut state = ExplorerState::default();
+        open_help(&mut state);
+        let text = render(&mut state, 120, 40);
+        assert!(!text.contains("menu  Terminate"), "{text}");
+        assert!(text.contains("x ▸ 1"), "{text}");
+        assert!(
+            text.contains("Shift+Enter, Enter×2"),
+            "not truncated: {text}"
+        );
+    }
+
+    #[test]
+    fn mouse_tips_list_only_reportable_gestures() {
+        let gestures: Vec<&str> = MOUSE.iter().map(|(g, _)| *g).collect();
+        assert!(gestures.contains(&"Ctrl/Alt-click"));
+        assert!(gestures.contains(&"Middle-click"));
+        assert!(gestures.iter().all(|g| !g.contains('⌘')));
+    }
+
+    #[test]
+    fn inspector_section_lists_detail_panel_keys() {
+        let all: Vec<Entry> = sections("").into_iter().flatten().collect();
+        assert!(all.contains(&Entry::Heading("Inspector")));
+        assert_eq!(
+            all.iter()
+                .filter(|e| matches!(e, Entry::Inspector(_)))
+                .count(),
+            INSPECTOR.len()
+        );
+        let found: Vec<Entry> = sections("inspector").into_iter().flatten().collect();
+        assert!(found.contains(&Entry::Heading("Inspector")));
+        let mut state = ExplorerState::default();
+        open_help(&mut state);
+        let text = render(&mut state, 160, 60);
+        assert!(text.contains("Inspector"), "{text}");
+        assert!(text.contains("Previous / next tab"), "{text}");
     }
 
     #[test]

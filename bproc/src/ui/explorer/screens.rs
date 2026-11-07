@@ -525,11 +525,24 @@ pub fn jump_to_process(state: &mut ExplorerState, key: ProcessKey) -> bool {
         state.flash(format!("{name} (PID {}) is no longer running", key.pid));
         return false;
     }
+    if hidden_by_search(state, &key) {
+        state.search.clear();
+        state.table.mark_dirty();
+    }
     state.screen = Screen::Processes;
     state.table.select(key);
     state.detail.open(key, false);
     state.request(UiRequest::LoadDetail(key));
     true
+}
+
+/// Whether the active search filter would hide the process `key`.
+fn hidden_by_search(state: &ExplorerState, key: &ProcessKey) -> bool {
+    let (Some(filter), Some(row)) = (state.search.filter(), state.store.get(key)) else {
+        return false;
+    };
+    let ctx = state.table.column_ctx(&state.store, state.traffic);
+    filter.matches(row, &ctx).is_none()
 }
 
 fn handle_events_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
@@ -606,46 +619,14 @@ impl WatchButton {
     const ALL: [WatchButton; 4] = [Self::New, Self::Edit, Self::Delete, Self::Toggle];
 }
 
-/// Case-insensitive glob with `*` and `?`.
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-    let (mut pi, mut ti) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, ti));
-            pi += 1;
-        } else if let Some((sp, st)) = star {
-            pi = sp + 1;
-            ti = st + 1;
-            star = Some((sp, st + 1));
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|c| *c == '*')
-}
-
 /// Whether `target` covers the process `key` (with its store row, if any).
+/// Delegates to [`WatchTarget::matches`] so the Watches screen agrees with
+/// the alert evaluator; only a pinned process can match without a row.
 pub fn target_matches(target: &WatchTarget, key: &ProcessKey, row: Option<&Row>) -> bool {
     match target {
         WatchTarget::Process { key: k, .. } => k == key,
-        WatchTarget::Name(pattern) => row.is_some_and(|r| glob_match(pattern, r.name())),
-        WatchTarget::Command(needle) => row.is_some_and(|r| {
-            r.entry
-                .record
-                .command()
-                .to_lowercase()
-                .contains(&needle.to_lowercase())
-        }),
-        WatchTarget::User(user) => row
-            .and_then(|r| r.entry.record.user.as_deref())
-            .is_some_and(|u| u.eq_ignore_ascii_case(user)),
         WatchTarget::Any => true,
+        _ => row.is_some_and(|r| target.matches(&r.entry.record)),
     }
 }
 
