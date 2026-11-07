@@ -530,6 +530,126 @@ fn toolbar_hides_presets_off_the_processes_screen() {
     );
 }
 
+fn push_events(state: &mut ExplorerState, n: usize) {
+    for i in 0..n {
+        state.events.push(crate::procs::watch::ProcEvent {
+            at_ms: now_ms(),
+            kind: crate::procs::watch::EventKind::Info,
+            key: None,
+            name: format!("e{i}"),
+            message: String::new(),
+        });
+    }
+}
+
+fn hit_rect(hits: &[(Rect, Hit)], target: &Hit) -> Rect {
+    hits.iter()
+        .find(|(_, h)| h == target)
+        .unwrap_or_else(|| panic!("no {target:?}"))
+        .0
+}
+
+/// The toolbar width a 120-column terminal leaves next to the search box.
+const TOOLBAR_AT_120: u16 = 80;
+
+#[test]
+fn toolbar_keeps_readable_screen_tabs_at_120_columns() {
+    let mut state = fixture(8);
+    push_events(&mut state, 18);
+    let (buffer, hits) = render(&state, TOOLBAR_AT_120, 1, draw_toolbar);
+    let text = row_text(&buffer, 0, TOOLBAR_AT_120);
+    assert!(text.contains("Events •18"), "{text}");
+    assert!(text.contains("│ Watch"), "{text}");
+    assert!(!text.contains("│ Wa "), "{text}");
+    for preset in Preset::ALL {
+        assert!(has(&hits, &Hit::Preset(preset)), "{preset:?} in {text}");
+    }
+}
+
+#[test]
+fn toolbar_tabs_stay_put_as_the_event_badge_grows() {
+    for width in [40, 60, TOOLBAR_AT_120, 100, 120] {
+        let mut previous: Option<(Rect, Rect)> = None;
+        let mut presets = None;
+        for count in [0, 1, 9, 10, 99, 100, 5000] {
+            let mut state = fixture(8);
+            state.paused = true;
+            state.table.toggle_mark(ProcessKey::new(200, 1000));
+            push_events(&mut state, count);
+            let (_, hits) = render(&state, width, 1, draw_toolbar);
+            let watches = hit_rect(&hits, &Hit::Screen(Screen::Watches));
+            let processes = hit_rect(&hits, &Hit::Screen(Screen::Processes));
+            // Tabs keep their label form: only the badge digits change.
+            if let Some((p, w)) = previous {
+                assert_eq!(p, processes, "width {width} count {count}");
+                assert_eq!(watches.width, w.width, "width {width} count {count}");
+            }
+            previous = Some((processes, watches));
+            let shown: Vec<_> = hits
+                .iter()
+                .filter(|(_, h)| matches!(h, Hit::Preset(_)))
+                .map(|(_, h)| h.clone())
+                .collect();
+            assert_eq!(
+                *presets.get_or_insert_with(|| shown.clone()),
+                shown,
+                "width {width} count {count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn toolbar_tabs_do_not_move_between_screens() {
+    let mut state = fixture(8);
+    push_events(&mut state, 18);
+    for width in [60, TOOLBAR_AT_120, 100] {
+        state.screen = Screen::Processes;
+        let (_, on_procs) = render(&state, width, 1, draw_toolbar);
+        state.screen = Screen::Events;
+        let (_, on_events) = render(&state, width, 1, draw_toolbar);
+        for screen in Screen::ALL {
+            assert_eq!(
+                hit_rect(&on_procs, &Hit::Screen(screen)).width,
+                hit_rect(&on_events, &Hit::Screen(screen)).width,
+                "{screen:?} at {width}"
+            );
+        }
+    }
+}
+
+#[test]
+fn net_active_chip_is_not_labelled_like_the_net_preset() {
+    let state = fixture(8);
+    for width in 30..=170u16 {
+        let (buffer, hits) = render(&state, width, 1, draw_toolbar);
+        if let Some((r, _)) = hits.iter().find(|(_, h)| *h == Hit::Chip(Chip::NetActive)) {
+            let label: String = (r.x..r.x + r.width)
+                .filter_map(|x| buffer.get(Point::new(x, 0)))
+                .map(|c| c.symbol.as_str())
+                .collect();
+            assert_ne!(label.trim(), preset_short(Preset::Network), "{width}");
+            assert_ne!(label.trim(), Preset::Network.label(), "{width}");
+        }
+    }
+}
+
+#[test]
+fn toolbar_leaves_a_gap_before_the_search_box() {
+    let mut state = fixture(8);
+    state.paused = true;
+    state.table.toggle_mark(ProcessKey::new(200, 1000));
+    for width in 20..=170u16 {
+        let (buffer, hits) = render(&state, width, 1, draw_toolbar);
+        let last = buffer.get(Point::new(width - 1, 0)).unwrap();
+        assert_eq!(last.symbol, " ", "width {width}");
+        assert!(
+            hits.iter().all(|(r, _)| r.x + r.width < width),
+            "a hit touches the right edge at {width}"
+        );
+    }
+}
+
 // ---- F-key bar --------------------------------------------------------------------
 
 fn action_label(action: Action) -> &'static str {
@@ -563,11 +683,45 @@ fn fkeys_fill_width_and_hit_every_visible_key() {
     assert!(row_text(&buffer, 0, 160).contains("F2Setup"));
     let (buffer, _) = render(&state, 40, 1, draw_fkeys);
     let text = row_text(&buffer, 0, 40);
-    assert!(text.contains("F10Quit") && text.contains("F2Set"), "{text}");
+    assert!(
+        text.contains("F10Quit") && text.contains("F9Kill") && text.contains("F3Find"),
+        "{text}"
+    );
 }
 
 #[test]
-fn fkeys_drop_from_the_right_but_keep_quit() {
+fn fkeys_drop_nice_before_kill() {
+    let state = fixture(8);
+    let (buffer, hits) = render(&state, 60, 1, draw_fkeys);
+    let text = row_text(&buffer, 0, 60);
+    assert!(
+        text.contains("F9Kill") && text.contains("F10Quit"),
+        "{text}"
+    );
+    assert!(!has(&hits, &Hit::FKey(Action::NiceDown)), "{text}");
+    assert!(!has(&hits, &Hit::FKey(Action::NiceUp)), "{text}");
+    // F9 sits right next to F10.
+    let f9 = hit_rect(&hits, &Hit::FKey(Action::Signal));
+    let f10 = hit_rect(&hits, &Hit::FKey(Action::Quit));
+    assert_eq!(f9.x + f9.width, f10.x);
+    // Kill outlives every other key except Quit.
+    let index = |action: Action| FKEYS.iter().position(|(_, a, _)| *a == action).unwrap();
+    for width in 0..=120 {
+        let (keys, _) = fkey_selection(width);
+        if keys.len() >= 2 {
+            assert!(keys.contains(&index(Action::Signal)), "{width}: {keys:?}");
+        }
+        // Nice- and Nice+ come and go together.
+        assert_eq!(
+            keys.contains(&index(Action::NiceDown)),
+            keys.contains(&index(Action::NiceUp)),
+            "{width}"
+        );
+    }
+}
+
+#[test]
+fn fkeys_drop_by_priority_but_keep_quit() {
     let (keys, short) = fkey_selection(40);
     assert!(short);
     assert_eq!(*keys.last().unwrap(), FKEYS.len() - 1);
@@ -647,6 +801,41 @@ fn status_shows_flash_counts_note_and_right_side() {
     let text = row_text(&buffer, 0, 160);
     assert!(text.contains("legacy") && !text.contains("old"), "{text}");
     assert!(text.contains("PAUSED"));
+}
+
+#[test]
+fn status_counts_exclude_and_mention_exited_rows() {
+    let mut state = fixture(8);
+    let gone = entry(300, "cargo", 80.0);
+    state.store.apply_snapshot(ProcSnapshot {
+        sequence: 2,
+        acquired_at_ms: now_ms(),
+        system: system(8),
+        processes: vec![entry(1, "launchd", 1.0), entry(200, "bproc", 12.0)],
+        exited: vec![crate::procs::model::ExitedProcess {
+            record: gone.record.clone(),
+            last_sample: gone.sample.clone(),
+        }],
+        ..Default::default()
+    });
+    draw_full(&mut state, 160, 40);
+    assert!(state.table.rows().iter().any(|r| r.ghost));
+    let env = DrawEnv::default();
+    let (buffer, _) = render_with(&state, 160, 1, |f, a, s| draw_status(f, a, s, &env));
+    let text = row_text(&buffer, 0, 160);
+    assert!(
+        text.contains("2 processes · showing 2 · 1 exited"),
+        "{text}"
+    );
+    let x = text.find("1 exited").unwrap();
+    let x = cells(display_width(&text[..x]));
+    let style = buffer.get(Point::new(x, 0)).unwrap().style;
+    assert_eq!(style.fg, theme::dim().fg);
+
+    // Without ghosts there is no exited note at all.
+    let state = fixture(8);
+    let (buffer, _) = render_with(&state, 160, 1, |f, a, s| draw_status(f, a, s, &env));
+    assert!(!row_text(&buffer, 0, 160).contains("exited"));
 }
 
 #[test]

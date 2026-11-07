@@ -702,12 +702,32 @@ fn badge(count: u64) -> String {
     }
 }
 
-fn screen_tabs(state: &ExplorerState, opts: ToolbarOpts) -> Vec<Item> {
+/// Widest badge value, used to reserve room so the toolbar variant does not
+/// change every time a new event arrives.
+const WIDEST_BADGE: u64 = 100;
+
+/// What the toolbar items are built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Real labels and badges, for painting.
+    Paint,
+    /// Widest plausible badges, for choosing a variant that stays stable as
+    /// counts grow.
+    Measure,
+}
+
+fn screen_tabs(
+    state: &ExplorerState,
+    screen_now: Screen,
+    opts: ToolbarOpts,
+    pass: Pass,
+) -> Vec<Item> {
     let unseen = state.events_view.unseen(&state.events);
     let alerting = state.alerting.len() as u64;
+    let has_rules = !state.watch.rules.is_empty() || alerting > 0;
     let mut items = Vec::new();
     for screen in Screen::ALL {
-        let active = state.screen == screen;
+        let active = screen_now == screen;
         if opts.active_screen_only && !active {
             continue;
         }
@@ -727,10 +747,15 @@ fn screen_tabs(state: &ExplorerState, opts: ToolbarOpts) -> Vec<Item> {
             screen.label()
         };
         let mut item = Item::new(Hit::Screen(screen)).with(format!(" {label}"), style);
+        let reserve = |n: u64, keep: bool| match pass {
+            Pass::Paint => n,
+            Pass::Measure if keep => WIDEST_BADGE,
+            Pass::Measure => 0,
+        };
         let (count, mark, color) = match screen {
             Screen::Processes => (0, "", Style::new()),
-            Screen::Events => (unseen, " •", theme::accent()),
-            Screen::Watches => (alerting, " ⚠", theme::alert()),
+            Screen::Events => (reserve(unseen, true), " •", theme::accent()),
+            Screen::Watches => (reserve(alerting, has_rules), " ⚠", theme::alert()),
         };
         if count > 0 {
             let badge_style = if active { style } else { color };
@@ -748,7 +773,7 @@ struct ChipSpec {
     style: Style,
 }
 
-fn chip_specs(state: &ExplorerState) -> Vec<ChipSpec> {
+fn chip_specs(state: &ExplorerState, screen: Screen) -> Vec<ChipSpec> {
     let s = &state.settings;
     let toggle = |on: bool| {
         if on {
@@ -766,7 +791,7 @@ fn chip_specs(state: &ExplorerState) -> Vec<ChipSpec> {
             style,
         })
     };
-    let processes = state.screen == Screen::Processes;
+    let processes = screen == Screen::Processes;
     if processes {
         push(Chip::Tree, "Tree", "Tree", toggle(s.tree));
         push(Chip::Users, "Mine", "Mine", toggle(s.only_mine));
@@ -784,10 +809,11 @@ fn chip_specs(state: &ExplorerState) -> Vec<ChipSpec> {
                 toggle(!s.hide_kernel_threads),
             );
         }
+        // Never just "Net": that is the Network preset's short label.
         push(
             Chip::NetActive,
             "Net-active",
-            "Net",
+            "Net-act",
             toggle(s.net_active_only),
         );
         if state.table.is_frozen() {
@@ -826,9 +852,15 @@ fn chip_specs(state: &ExplorerState) -> Vec<ChipSpec> {
     out
 }
 
-fn toolbar_items(state: &ExplorerState, opts: ToolbarOpts) -> Vec<Item> {
-    let mut items = screen_tabs(state, opts);
-    if state.screen == Screen::Processes && opts.presets != PresetMode::Hidden {
+fn toolbar_items(
+    state: &ExplorerState,
+    screen: Screen,
+    chips: &[ChipSpec],
+    opts: ToolbarOpts,
+    pass: Pass,
+) -> Vec<Item> {
+    let mut items = screen_tabs(state, screen, opts, pass);
+    if screen == Screen::Processes && opts.presets != PresetMode::Hidden {
         items.push(Item::plain(" ", theme::base()));
         for preset in Preset::ALL {
             let active = preset == state.settings.preset;
@@ -849,10 +881,7 @@ fn toolbar_items(state: &ExplorerState, opts: ToolbarOpts) -> Vec<Item> {
         }
     }
     let dropped = &CHIP_DROP_ORDER[..opts.dropped_chips.min(CHIP_DROP_ORDER.len())];
-    for spec in chip_specs(state)
-        .into_iter()
-        .filter(|c| !dropped.contains(&c.chip))
-    {
+    for spec in chips.iter().filter(|c| !dropped.contains(&c.chip)) {
         let label = if opts.short_chips {
             &spec.short
         } else {
@@ -887,36 +916,45 @@ fn toolbar_variants() -> Vec<ToolbarOpts> {
             ..full
         },
     ];
-    out.push(ToolbarOpts {
-        short_screens: true,
-        short_presets: true,
-        short_chips: true,
-        ..full
-    });
     let compact = ToolbarOpts {
         short_screens: true,
-        tiny_screens: true,
         short_presets: true,
         short_chips: true,
         ..full
     };
-    for dropped in 0..=CHIP_DROP_ORDER.len() {
+    // Toggle chips go first, then presets collapse to the active one while
+    // the live-state chips (dock, freeze, pause, marks) hang on.
+    for dropped in 0..=TOGGLE_CHIPS {
         out.push(ToolbarOpts {
             dropped_chips: dropped,
             ..compact
         });
     }
+    for dropped in TOGGLE_CHIPS..=CHIP_DROP_ORDER.len() {
+        out.push(ToolbarOpts {
+            dropped_chips: dropped,
+            presets: PresetMode::Active,
+            ..compact
+        });
+    }
+    // Last resorts: two-letter inactive tabs, no presets, the active tab only.
     let bare = ToolbarOpts {
         dropped_chips: CHIP_DROP_ORDER.len(),
+        presets: PresetMode::Active,
         ..compact
     };
+    let tiny = ToolbarOpts {
+        tiny_screens: true,
+        ..bare
+    };
+    out.push(tiny);
     out.push(ToolbarOpts {
-        presets: PresetMode::Active,
+        presets: PresetMode::Hidden,
         ..bare
     });
     out.push(ToolbarOpts {
         presets: PresetMode::Hidden,
-        ..bare
+        ..tiny
     });
     out.push(ToolbarOpts {
         presets: PresetMode::Hidden,
@@ -926,17 +964,45 @@ fn toolbar_variants() -> Vec<ToolbarOpts> {
     out
 }
 
+/// Chips dropped first: toggles that are also reachable from F4/F5.
+const TOGGLE_CHIPS: usize = 4;
+
+/// The richest variant whose items fit `budget` cells. Fitting is judged
+/// with the widest badges, and on other screens against the Processes
+/// layout too, so screen tabs neither change form as events arrive nor move
+/// when switching screens.
+fn choose_toolbar(state: &ExplorerState, budget: usize) -> ToolbarOpts {
+    let variants = toolbar_variants();
+    let current = state.screen;
+    let chips = chip_specs(state, current);
+    let layout_chips = chip_specs(state, Screen::Processes);
+    let width = |screen: Screen, chips: &[ChipSpec], opts: ToolbarOpts, pass: Pass| {
+        items_width(&toolbar_items(state, screen, chips, opts, pass))
+    };
+    let stable = |opts: &ToolbarOpts| {
+        width(current, &chips, *opts, Pass::Measure) <= budget
+            && (current == Screen::Processes
+                || width(Screen::Processes, &layout_chips, *opts, Pass::Measure) <= budget)
+    };
+    let fits = |opts: &ToolbarOpts| width(current, &chips, *opts, Pass::Paint) <= budget;
+    let last = variants[variants.len() - 1];
+    variants
+        .iter()
+        .copied()
+        .find(stable)
+        .or_else(|| variants.iter().copied().find(fits))
+        .unwrap_or(last)
+}
+
 pub fn draw_toolbar(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &ExplorerState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let variants = toolbar_variants();
-    let width = usize::from(area.width);
-    let items = variants
-        .iter()
-        .map(|opts| toolbar_items(state, *opts))
-        .find(|items| items_width(items) <= width)
-        .unwrap_or_else(|| toolbar_items(state, variants[variants.len() - 1]));
+    // Keep a one-cell gap before whatever sits to the right (the search box).
+    let budget = usize::from(area.width).saturating_sub(1);
+    let opts = choose_toolbar(state, budget);
+    let chips = chip_specs(state, state.screen);
+    let items = toolbar_items(state, state.screen, &chips, opts, Pass::Paint);
     paint_items(frame, area, area.x, &items);
 }
 
@@ -979,15 +1045,32 @@ fn fkey_selection(width: usize) -> (Vec<usize>, bool) {
     if need(&keys, false) <= width {
         return (keys, false);
     }
-    let quit = FKEYS.len() - 1;
-    loop {
-        if need(&keys, true) <= width || keys.len() <= 1 {
-            return (keys, true);
+    let index = |action: Action| FKEYS.iter().position(|(_, a, _)| *a == action);
+    for group in FKEY_DROP_GROUPS {
+        if need(&keys, true) <= width {
+            break;
         }
-        let drop = keys.iter().rposition(|&i| i != quit).unwrap_or(0);
-        keys.remove(drop);
+        keys.retain(|i| !group.iter().any(|a| index(*a) == Some(*i)));
     }
+    if need(&keys, true) > width {
+        // Unlisted keys go last; Quit stays no matter what.
+        keys.retain(|&i| FKEYS[i].1 == Action::Quit);
+    }
+    (keys, true)
 }
+
+/// F-keys dropped, a group at a time, when the bar is too narrow. Nice-/Nice+
+/// go together and first; Kill stays longest beside Quit, which never goes.
+const FKEY_DROP_GROUPS: &[&[Action]] = &[
+    &[Action::NiceDown, Action::NiceUp],
+    &[Action::SortMenu],
+    &[Action::FilterMenu],
+    &[Action::Settings],
+    &[Action::Tree],
+    &[Action::Search],
+    &[Action::Help],
+    &[Action::Signal],
+];
 
 pub fn draw_fkeys(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &ExplorerState) {
     if area.width == 0 || area.height == 0 {
@@ -1140,7 +1223,15 @@ fn status_parts(
             }
             t
         };
-        left.push(Item::plain(text, theme::dim()));
+        // Exited (ghost) rows are visible but never counted as showing.
+        let exited = state.table.rows().iter().filter(|r| r.ghost).count();
+        let exited_text = match (exited, opts.short_counts) {
+            (0, _) => String::new(),
+            (n, true) => format!(" +{n}x"),
+            (n, false) => format!(" · {n} exited"),
+        };
+        let faint = theme::dim().add_modifier(Modifier::ITALIC);
+        left.push(Item::plain(text, theme::dim()).with(exited_text, faint));
     }
     if opts.note && state.network_note.is_some() {
         let text = if opts.short_note {
