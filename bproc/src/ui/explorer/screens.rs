@@ -10,6 +10,14 @@ use bmux_tui::geometry::Rect;
 #[derive(Debug, Default)]
 pub struct EventsView {}
 
+impl EventsView {
+    /// Events pushed since the Events screen was last viewed (toolbar badge).
+    pub fn unseen(&self, events: &crate::procs::watch::EventLog) -> u64 {
+        let _ = events;
+        0
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WatchesView {}
 
