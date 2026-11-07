@@ -78,7 +78,7 @@ fn layout_drops_highest_priority_numbers_first() {
         .iter()
         .find(|s| s.column == ColumnId::Command)
         .unwrap();
-    assert!(cmd.width >= FLEX_MIN);
+    assert!(cmd.width >= 40 * 3 / 10, "readable command: {slots:?}");
 
     let tiny = layout_columns(&cols, &settings, 0, 12);
     let kept: Vec<ColumnId> = tiny.iter().map(|s| s.column).collect();
@@ -443,6 +443,7 @@ fn dragging_a_header_edge_resizes_and_saves_on_release() {
     let mut state = state_with(many(5));
     render(&mut state, 100, 10);
     let edge = edge_rect(&state, ColumnId::User);
+    let start = header_rect(&state, ColumnId::User).width;
     state.take_requests();
     let none = MouseModifiers::NONE;
     state.handle_event(&mouse(
@@ -457,9 +458,9 @@ fn dragging_a_header_edge_resizes_and_saves_on_release() {
         0,
         none,
     ));
-    assert_eq!(state.settings.column_widths.get("user"), Some(&14));
+    assert_eq!(state.settings.column_widths.get("user"), Some(&(start + 3)));
     let out = render(&mut state, 100, 10);
-    assert_eq!(header_rect(&state, ColumnId::User).width, 14);
+    assert_eq!(header_rect(&state, ColumnId::User).width, start + 3);
     assert!(out.row(0).contains('┃'), "edge lit while dragging");
     state.handle_event(&mouse(
         MouseEventKind::Drag(MouseButton::Left),
@@ -467,7 +468,7 @@ fn dragging_a_header_edge_resizes_and_saves_on_release() {
         0,
         none,
     ));
-    assert_eq!(state.settings.column_widths.get("user"), Some(&16));
+    assert_eq!(state.settings.column_widths.get("user"), Some(&(start + 5)));
     assert!(!state.take_requests().contains(&UiRequest::SaveSettings));
     state.handle_event(&mouse(
         MouseEventKind::Up(MouseButton::Left),
@@ -758,4 +759,120 @@ fn fit_spans_truncates_with_ellipsis() {
     let wide = fit_spans(vec![("界界界".into(), s)], 4, s);
     let text: String = wide.iter().map(|s| s.content.as_str()).collect();
     assert_eq!(display_width(&text), 4);
+}
+
+fn kept(slots: &[ColumnSlot]) -> Vec<ColumnId> {
+    slots.iter().map(|s| s.column).collect()
+}
+
+fn command_width(slots: &[ColumnSlot]) -> u16 {
+    slots
+        .iter()
+        .find(|s| s.column == ColumnId::Command)
+        .map_or(0, |s| s.width)
+}
+
+#[test]
+fn classic_width_keeps_command_readable_and_drops_dead_net_columns() {
+    let settings = ExplorerSettings::default();
+    let cols = Preset::Overview.default_columns();
+    let off = LayoutHints {
+        net_available: false,
+        ..LayoutHints::default()
+    };
+    let slots = layout_columns_with(&cols, &settings, 0, 78, &off);
+    let ids = kept(&slots);
+    assert!(!ids.contains(&ColumnId::NetDown), "{ids:?}");
+    assert!(!ids.contains(&ColumnId::NetUp), "{ids:?}");
+    assert!(ids.contains(&ColumnId::Pid) && ids.contains(&ColumnId::Cpu));
+    assert!(command_width(&slots) >= 24, "{slots:?}");
+    assert!(slots.iter().all(|s| s.x + s.width <= 78));
+
+    // With capture on, NET survives longer than less useful columns but the
+    // command still gets its readable share.
+    let slots = layout_columns_with(&cols, &settings, 0, 78, &LayoutHints::default());
+    assert!(command_width(&slots) >= 78 * 3 / 10, "{slots:?}");
+    assert!(kept(&slots).contains(&ColumnId::NetDown), "{slots:?}");
+
+    // Small terminals too.
+    let slots = layout_columns_with(&cols, &settings, 0, 59, &off);
+    assert!(!kept(&slots).contains(&ColumnId::NetDown), "{slots:?}");
+    assert!(command_width(&slots) >= 59 * 3 / 10, "{slots:?}");
+
+    // Wide terminals keep every column.
+    let slots = layout_columns_with(&cols, &settings, 0, 160, &off);
+    assert_eq!(slots.len(), cols.len());
+}
+
+#[test]
+fn net_columns_drop_first_only_when_capture_is_off() {
+    let settings = ExplorerSettings::default();
+    let cols = vec![
+        ColumnId::Pid,
+        ColumnId::Connections,
+        ColumnId::NetDownTotal,
+        ColumnId::Started,
+        ColumnId::Command,
+    ];
+    let off = LayoutHints {
+        net_available: false,
+        ..LayoutHints::default()
+    };
+    let width = 7 + 1 + 8 + 1 + 8 + 1 + 24;
+    let ids = kept(&layout_columns_with(&cols, &settings, 0, width, &off));
+    assert!(ids.contains(&ColumnId::Started), "{ids:?}");
+    assert!(!ids.contains(&ColumnId::Connections), "{ids:?}");
+}
+
+#[test]
+fn net_column_hint_follows_capture_state() {
+    let mut state = state_with(many(3));
+    assert!(layout_hints(&state).net_available);
+    state.network_note = Some("capture off".into());
+    assert!(!layout_hints(&state).net_available);
+    let out = render(&mut state, 78, 6);
+    assert!(!out.row(0).contains("NET"), "{}", out.row(0));
+}
+
+#[test]
+fn auto_user_width_bounds() {
+    assert_eq!(auto_user_width([]), None);
+    assert_eq!(auto_user_width(["me"]), Some(4));
+    assert_eq!(auto_user_width(["root", "bsteffaniak"]), Some(11));
+    assert_eq!(auto_user_width(["a_very_long_service_account"]), Some(14));
+}
+
+#[test]
+fn user_column_fits_names_unless_resized() {
+    let mut state = state_with(many(3));
+    render(&mut state, 100, 6);
+    assert_eq!(header_rect(&state, ColumnId::User).width, 4, "fits \"me\"");
+
+    let mut entries = many(3);
+    let mut long = entry(9, "svc", "svc", 0.5, 1024);
+    std::sync::Arc::make_mut(&mut long.record).user = Some("_windowserver_daemon".into());
+    entries.push(long);
+    let mut state = state_with(entries);
+    render(&mut state, 100, 6);
+    assert_eq!(header_rect(&state, ColumnId::User).width, 14, "capped");
+
+    state.settings.column_widths.insert("user".into(), 9);
+    render(&mut state, 100, 6);
+    assert_eq!(header_rect(&state, ColumnId::User).width, 9, "override wins");
+}
+
+#[test]
+fn rows_are_dimmed_while_the_filter_does_not_parse() {
+    let mut state = state_with(many(3));
+    state.search.set_text("proc");
+    state.table.mark_dirty();
+    refresh(&mut state);
+    state.search.set_text("proc cpu>>5");
+    assert!(state.search.error.is_some());
+    let out = render(&mut state, 80, 6);
+    let y = row_y(&state, 2);
+    assert!(out.cell(30, y).style.modifiers.contains(Modifier::DIM));
+    state.search.set_text("proc");
+    let out = render(&mut state, 80, 6);
+    assert!(!out.cell(30, y).style.modifiers.contains(Modifier::DIM));
 }

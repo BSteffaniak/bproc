@@ -1,6 +1,6 @@
 //! Search / filter box in the toolbar. Typing filters the table live using
 //! the `procs::filter` language; parse errors are shown inline.
-use super::hits::Hit;
+use super::hits::{Hit, Screen};
 use super::paint::{Frame, theme, truncate};
 use super::{Click, ExplorerState, Outcome};
 use crate::procs::filter::Filter;
@@ -50,6 +50,28 @@ impl SearchBar {
     }
     pub fn clear(&mut self) {
         self.set_text("");
+    }
+    /// Status-line description of the filter actually applied. When the
+    /// typed text does not parse, the table keeps the last valid filter, so
+    /// this names that filter (not the invalid text) and includes the error.
+    /// `None` when the box is empty.
+    // Consumed by the status line (chrome.rs) once it switches over.
+    #[allow(dead_code)]
+    pub fn status_label(&self, max: usize) -> Option<String> {
+        let text = self.text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(match &self.error {
+            None => format!("filter: {}", truncate(text, max)),
+            Some(err) => {
+                let showing = match self.filter() {
+                    Some(f) => format!("showing \"{}\"", truncate(f.source().trim(), max)),
+                    None => "showing all".to_string(),
+                };
+                format!("filter error ({err}), {showing}")
+            }
+        })
     }
     fn len(&self) -> usize {
         self.text.chars().count()
@@ -354,6 +376,10 @@ pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
         }
         KeyCode::Enter => {
             search.focused = false;
+            // Keep a row picked with Up/Down while typing; only fall back to
+            // the first match when the refreshed rows no longer contain it
+            // (`refresh` would otherwise move it to a neighbouring row).
+            let picked = state.table.selected();
             state.table.refresh(
                 &state.store,
                 &state.settings,
@@ -362,7 +388,10 @@ pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
                 state.uid,
                 false,
             );
-            state.table.select_index(0);
+            match picked.filter(|k| state.table.rows().iter().any(|r| r.key == *k)) {
+                Some(key) => state.table.select(key),
+                None => state.table.select_index(0),
+            }
             return Outcome::Consumed;
         }
         KeyCode::Escape => {
@@ -385,6 +414,13 @@ pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
     Outcome::Consumed
 }
 
+/// Focus the box. The filter only applies to the process table, so (like
+/// `Action::Search`) focusing it from another screen shows the table.
+fn focus(state: &mut ExplorerState) {
+    state.screen = Screen::Processes;
+    state.search.focused = true;
+}
+
 pub fn handle_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
     match click.mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -396,11 +432,11 @@ pub fn handle_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
             } else {
                 state.search.cursor = state.search.cursor_for_column(click.mouse.position.x);
             }
-            state.search.focused = true;
+            focus(state);
             Outcome::Consumed
         }
         MouseEventKind::Down(_) => {
-            state.search.focused = true;
+            focus(state);
             Outcome::Consumed
         }
         _ => Outcome::Consumed,

@@ -258,3 +258,68 @@ fn right_click_focuses_without_moving_cursor() {
     assert!(state.search.focused);
     assert_eq!(state.search.cursor, 1);
 }
+
+#[test]
+fn enter_keeps_the_row_picked_with_arrows() {
+    let mut state = state_with(many(12));
+    state.search.focused = true;
+    type_text(&mut state, "proc1");
+    render_both(&mut state, 80, 10);
+    assert_eq!(pids(&state), vec![1, 10, 11, 12]);
+    press(&mut state, KeyCode::Down);
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.table.selected(), Some(key(11)));
+    press(&mut state, KeyCode::Enter);
+    assert!(!state.search.focused);
+    assert_eq!(state.table.selected(), Some(key(11)), "pick survives Enter");
+}
+
+#[test]
+fn enter_selects_first_match_when_pick_was_filtered_out() {
+    let mut state = state_with(many(12));
+    render_both(&mut state, 80, 10);
+    state.table.select(key(5));
+    state.search.focused = true;
+    type_text(&mut state, "proc1");
+    press(&mut state, KeyCode::Enter);
+    assert_eq!(state.table.selected(), Some(key(1)));
+}
+
+#[test]
+fn clicking_the_box_on_another_screen_shows_processes() {
+    for screen in [Screen::Events, Screen::Watches] {
+        let mut state = named();
+        state.screen = screen;
+        render_both(&mut state, 60, 8);
+        left(&mut state, 5, 0);
+        assert!(state.search.focused);
+        assert_eq!(state.screen, Screen::Processes, "{screen:?}");
+        type_text(&mut state, "node");
+        assert_eq!(state.search.text, "node");
+
+        let mut state = named();
+        state.screen = screen;
+        render_both(&mut state, 60, 8);
+        down(&mut state, MouseButton::Right, 5, 0);
+        assert!(state.search.focused);
+        assert_eq!(state.screen, Screen::Processes, "{screen:?}");
+    }
+}
+
+#[test]
+fn status_label_names_the_filter_actually_applied() {
+    let mut bar = SearchBar::default();
+    assert_eq!(bar.status_label(24), None);
+    bar.set_text("cpu");
+    assert_eq!(bar.status_label(24).as_deref(), Some("filter: cpu"));
+    bar.set_text("cpu>>5");
+    assert!(bar.error.is_some());
+    let label = bar.status_label(24).unwrap();
+    assert!(label.starts_with("filter error ("), "{label}");
+    assert!(label.ends_with("showing \"cpu\""), "{label}");
+    assert!(!label.contains("cpu>>5"), "{label}");
+
+    let mut bar = SearchBar::default();
+    bar.set_text("cpu>>5");
+    assert!(bar.status_label(24).unwrap().ends_with("showing all"));
+}

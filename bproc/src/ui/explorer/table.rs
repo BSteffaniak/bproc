@@ -28,6 +28,11 @@ mod tests;
 const FLEX_MIN: u16 = 8;
 /// Below this table width the flexible column may be dropped too.
 const FLEX_KEEP: u16 = 20;
+/// Upper bound of the comfortable flexible width other columns make room for.
+const FLEX_COMFORT: u16 = 24;
+/// Bounds for the auto-sized USER column.
+const USER_AUTO_MIN: u16 = 4;
+const USER_AUTO_MAX: u16 = 14;
 pub const MIN_COLUMN_WIDTH: u16 = 3;
 pub const MAX_COLUMN_WIDTH: u16 = 80;
 const GLYPH_COLLAPSED: &str = "▸ ";
@@ -63,6 +68,27 @@ pub struct TableView {
     resize: Option<(ColumnId, u16)>,
     /// Scrollbar track painted last frame.
     scrollbar: Option<Rect>,
+    /// USER width fitted to the names in `rows` (last frame).
+    auto_user_width: Option<u16>,
+}
+
+/// Facts about the data that steer [`layout_columns_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutHints {
+    /// False while network capture is off: NET columns only show `–`, so
+    /// they are the first to go when space is short.
+    pub net_available: bool,
+    /// Width for USER when the user has not resized it.
+    pub auto_user_width: Option<u16>,
+}
+
+impl Default for LayoutHints {
+    fn default() -> Self {
+        Self {
+            net_available: true,
+            auto_user_width: None,
+        }
+    }
 }
 
 impl TableView {
@@ -88,6 +114,7 @@ impl TableView {
             anchor: None,
             resize: None,
             scrollbar: None,
+            auto_user_width: None,
         }
     }
     /// Column context for the current store state.
@@ -333,15 +360,60 @@ pub fn column_width(settings: &ExplorerSettings, column: ColumnId) -> u16 {
         .clamp(1, MAX_COLUMN_WIDTH)
 }
 
-/// Place `columns` in `width` cells starting at `x`. Columns separated by one
-/// space; the flexible column absorbs slack; when too narrow the columns with
-/// the highest `priority()` are dropped first (PID and the flexible column are
-/// kept as long as possible).
+/// Width of a non-flexible column as laid out: a user override wins, then
+/// the auto-fitted USER width, then the column default.
+pub fn effective_width(settings: &ExplorerSettings, column: ColumnId, hints: &LayoutHints) -> u16 {
+    if column == ColumnId::User
+        && !settings.column_widths.contains_key(column.filter_key())
+        && let Some(w) = hints.auto_user_width
+    {
+        return w.clamp(1, MAX_COLUMN_WIDTH);
+    }
+    column_width(settings, column)
+}
+
+/// USER width that fits the longest name among `names` (clamped to
+/// `USER_AUTO_MIN..=USER_AUTO_MAX`); `None` when there are no names.
+pub fn auto_user_width<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u16> {
+    let longest = names.into_iter().map(display_width).max()?;
+    let w = u16::try_from(longest).unwrap_or(u16::MAX);
+    Some(w.clamp(USER_AUTO_MIN, USER_AUTO_MAX))
+}
+
+fn is_net_column(c: ColumnId) -> bool {
+    matches!(
+        c,
+        ColumnId::NetDown
+            | ColumnId::NetUp
+            | ColumnId::NetDownTotal
+            | ColumnId::NetUpTotal
+            | ColumnId::Connections
+    )
+}
+
+/// [`layout_columns_with`] using default hints.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn layout_columns(
     columns: &[ColumnId],
     settings: &ExplorerSettings,
     x: u16,
     width: u16,
+) -> Vec<ColumnSlot> {
+    layout_columns_with(columns, settings, x, width, &LayoutHints::default())
+}
+
+/// Place `columns` in `width` cells starting at `x`. Columns separated by one
+/// space; the flexible column absorbs slack; when too narrow the columns with
+/// the highest `priority()` are dropped first (PID and the flexible column are
+/// kept as long as possible). Fixed columns are dropped until the flexible
+/// column gets a readable width (about 30% of the table, up to
+/// `FLEX_COMFORT`), and NET columns go first while capture is off.
+pub fn layout_columns_with(
+    columns: &[ColumnId],
+    settings: &ExplorerSettings,
+    x: u16,
+    width: u16,
+    hints: &LayoutHints,
 ) -> Vec<ColumnSlot> {
     let keep_flex = width >= FLEX_KEEP;
     let mut cols: Vec<(ColumnId, u16)> = columns
@@ -350,7 +422,7 @@ pub fn layout_columns(
             let w = if c.is_flexible() {
                 0
             } else {
-                column_width(settings, c)
+                effective_width(settings, c, hints)
             };
             (c, w)
         })
@@ -360,28 +432,43 @@ pub fn layout_columns(
             if keep_flex { 0 } else { u8::MAX }
         } else if c == ColumnId::Pid {
             0
+        } else if !hints.net_available && is_net_column(c) {
+            u8::MAX - 1
         } else {
             c.priority()
         }
     };
-    let needed = |cols: &[(ColumnId, u16)]| -> usize {
+    let needed = |cols: &[(ColumnId, u16)], flex_min: u16| -> usize {
         cols.iter()
-            .map(|(c, w)| usize::from(if c.is_flexible() { FLEX_MIN } else { *w }))
+            .map(|(c, w)| usize::from(if c.is_flexible() { flex_min } else { *w }))
             .sum::<usize>()
             + cols.len().saturating_sub(1)
     };
-    while cols.len() > 1 && needed(&cols) > usize::from(width) {
+    let drop_one = |cols: &mut Vec<(ColumnId, u16)>, spare_pid: bool| -> bool {
         let victim = cols
             .iter()
             .enumerate()
             .filter(|(_, (c, _))| !(keep_flex && c.is_flexible()))
+            .filter(|(_, (c, _))| !(spare_pid && *c == ColumnId::Pid))
             .max_by_key(|(i, (c, _))| (rank(*c), *i))
             .map(|(i, _)| i);
         match victim {
             Some(i) => {
                 cols.remove(i);
+                true
             }
-            None => break,
+            None => false,
+        }
+    };
+    // First make room for a readable flexible column, dropping fixed columns
+    // other than PID; then squeeze down to `FLEX_MIN` as before.
+    if keep_flex && cols.iter().any(|(c, _)| c.is_flexible()) {
+        let comfort = FLEX_MIN.max(FLEX_COMFORT.min(width * 3 / 10));
+        while needed(&cols, comfort) > usize::from(width) && drop_one(&mut cols, true) {}
+    }
+    while cols.len() > 1 && needed(&cols, FLEX_MIN) > usize::from(width) {
+        if !drop_one(&mut cols, false) {
+            break;
         }
     }
     let fixed: usize = cols
@@ -580,7 +667,15 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
     let content_x = area.x + gutter;
     let content_w = area.width - gutter - u16::from(show_bar);
     let right = content_x + content_w;
-    let slots = layout_columns(&state.table.columns, &state.settings, content_x, content_w);
+    state.table.auto_user_width = fit_user_width(state);
+    let hints = layout_hints(state);
+    let slots = layout_columns_with(
+        &state.table.columns,
+        &state.settings,
+        content_x,
+        content_w,
+        &hints,
+    );
 
     draw_header(frame, area, &slots, right, state);
     if body_h == 0 {
@@ -598,6 +693,7 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
 
     let ctx = state.table.column_ctx(&state.store, state.traffic);
     let focused = !state.search.focused && state.overlays.is_empty();
+    let stale = state.search.error.is_some();
     let hover = state.pointer.position.filter(|_| state.overlays.is_empty());
     let row_w = area.width - u16::from(show_bar);
     let first = state.table.scroll;
@@ -629,7 +725,11 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
         } else {
             RowLook::Base
         };
-        let style = look.style();
+        let mut style = look.style();
+        if stale && look != RowLook::Selected {
+            // The filter text does not parse: these rows match an older one.
+            style = style.add_modifier(Modifier::DIM);
+        }
         frame.fill(row_rect, style);
         if gutter > 0 {
             let marker = if state.table.marked.contains(&key) {
@@ -747,6 +847,36 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
     } else {
         state.table.scrollbar = None;
     }
+}
+
+/// Hints for laying out the table in its current state.
+pub fn layout_hints(state: &ExplorerState) -> LayoutHints {
+    LayoutHints {
+        net_available: state.network_note.is_none(),
+        auto_user_width: state.table.auto_user_width,
+    }
+}
+
+/// USER width fitted to the names of the rows shown, unless the column is
+/// hidden or the user resized it.
+fn fit_user_width(state: &ExplorerState) -> Option<u16> {
+    let table = &state.table;
+    if !table.columns.contains(&ColumnId::User)
+        || state
+            .settings
+            .column_widths
+            .contains_key(ColumnId::User.filter_key())
+    {
+        return None;
+    }
+    let ctx = table.column_ctx(&state.store, state.traffic);
+    let names: Vec<String> = table
+        .rows
+        .iter()
+        .filter_map(|v| state.store.get(&v.key))
+        .map(|row| ColumnId::User.text(row, &ctx))
+        .collect();
+    auto_user_width(names.iter().map(String::as_str))
 }
 
 fn draw_header(
@@ -1039,17 +1169,22 @@ pub fn handle_drag(state: &mut ExplorerState, drag: &Drag, mouse: &MouseEvent) -
     let start = match state.table.resize {
         Some((c, w)) if c == column => w,
         _ => {
-            let w = column_width(&state.settings, column);
+            let w = effective_width(&state.settings, column, &layout_hints(state));
             state.table.resize = Some((column, w));
             w
         }
+    };
+    // The width the column has without an override.
+    let default = match (column, state.table.auto_user_width) {
+        (ColumnId::User, Some(w)) => w,
+        _ => column.width(),
     };
     let delta = i32::from(mouse.position.x) - i32::from(drag.origin.x);
     let width = (i32::from(start) + delta)
         .clamp(i32::from(MIN_COLUMN_WIDTH), i32::from(MAX_COLUMN_WIDTH)) as u16;
     let key = column.filter_key().to_string();
     // Leave the settings free of no-op overrides while at the default width.
-    if state.settings.column_widths.contains_key(&key) || width != column.width() {
+    if state.settings.column_widths.contains_key(&key) || width != default {
         state.settings.column_widths.insert(key, width);
     }
     if matches!(mouse.kind, MouseEventKind::Up(_)) {
