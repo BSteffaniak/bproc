@@ -17,6 +17,29 @@ pub const SEND: u16 = 3;
 
 /// Targets listed by name before collapsing into "and N more".
 const LISTED: usize = 4;
+/// Signalling more processes than this (with children) asks twice.
+pub const LARGE_TREE: usize = 50;
+
+/// Whether `key` is this bproc process. bproc never signals itself: doing so
+/// mid-list stops the remaining targets and leaves the terminal in raw mode.
+pub fn is_self(key: &ProcessKey) -> bool {
+    i64::from(key.pid) == i64::from(std::process::id())
+}
+
+/// Processes whose tree is (almost) everything: init / launchd, the kernel
+/// swapper and, on Linux, kthreadd. "Kill process tree" is never offered
+/// for them.
+pub fn is_system_root(pid: i32) -> bool {
+    pid <= 1 || (cfg!(target_os = "linux") && pid == 2)
+}
+
+/// `keys` without bproc itself; the flag says whether it was present.
+pub fn without_self(keys: Vec<ProcessKey>) -> (Vec<ProcessKey>, bool) {
+    let before = keys.len();
+    let kept: Vec<ProcessKey> = keys.into_iter().filter(|k| !is_self(k)).collect();
+    let removed = kept.len() != before;
+    (kept, removed)
+}
 
 pub struct SignalDialog {
     pub targets: Vec<ProcessKey>,
@@ -26,22 +49,32 @@ pub struct SignalDialog {
     pub include_children: bool,
     /// Enter presses Cancel instead of Send.
     pub cancel_focused: bool,
+    /// bproc itself was among the requested targets and was dropped.
+    pub skipped_self: bool,
+    /// Some target is a system root, so its children are not offered.
+    pub tree_blocked: bool,
+    /// A large send was pressed once; the next press sends.
+    pub armed: bool,
     hover: Target,
 }
 
 impl SignalDialog {
     pub fn new(state: &ExplorerState, targets: Vec<ProcessKey>, signal: Signal) -> Self {
+        let (targets, skipped_self) = without_self(targets);
         let mut unique: Vec<ProcessKey> = Vec::with_capacity(targets.len());
         for key in targets {
             if !unique.contains(&key) {
                 unique.push(key);
             }
         }
+        let tree_blocked = unique.iter().any(|k| is_system_root(k.pid));
         let mut children: Vec<ProcessKey> = Vec::new();
-        for key in &unique {
-            for child in state.store.descendants(key) {
-                if !unique.contains(&child) && !children.contains(&child) {
-                    children.push(child);
+        if !tree_blocked {
+            for key in &unique {
+                for child in state.store.descendants(key) {
+                    if !is_self(&child) && !unique.contains(&child) && !children.contains(&child) {
+                        children.push(child);
+                    }
                 }
             }
         }
@@ -51,6 +84,9 @@ impl SignalDialog {
             children,
             include_children: false,
             cancel_focused: false,
+            skipped_self,
+            tree_blocked,
+            armed: false,
             hover: Target::Outside,
         }
     }
@@ -64,11 +100,67 @@ impl SignalDialog {
         out
     }
 
-    fn send(&self, state: &mut ExplorerState) {
+    /// Whether Send must be pressed twice (more than `LARGE_TREE` recipients
+    /// including children).
+    pub fn needs_second_press(&self) -> bool {
+        self.include_children && self.recipients().len() > LARGE_TREE
+    }
+
+    /// Press Send: returns false when the dialog should stay open (a large
+    /// send was armed instead of sent).
+    fn press_send(&mut self, state: &mut ExplorerState) -> bool {
+        if self.needs_second_press() && !self.armed {
+            self.armed = true;
+            return false;
+        }
+        let targets = self.recipients();
+        if targets.is_empty() {
+            state.flash("bproc does not signal itself");
+            return true;
+        }
         state.request(UiRequest::Action(ActionRequest::Signal {
-            targets: self.recipients(),
+            targets,
             signal: self.signal,
         }));
+        true
+    }
+
+    fn toggle_children(&mut self) {
+        if !self.children.is_empty() {
+            self.include_children = !self.include_children;
+            self.armed = false;
+        }
+    }
+
+    /// Warning lines shown under the summary.
+    fn notes(&self) -> Vec<(String, Style)> {
+        let warn = widgets::body().fg(bmux_tui::style::Color::Yellow);
+        let mut out = Vec::new();
+        if self.skipped_self {
+            out.push((
+                format!(
+                    "⚠ bproc itself (PID {}) is skipped; quit with q.",
+                    std::process::id()
+                ),
+                warn,
+            ));
+        }
+        if self.tree_blocked {
+            out.push((
+                "Children of a system root process are never offered.".to_string(),
+                widgets::muted(),
+            ));
+        }
+        if self.needs_second_press() {
+            let n = self.recipients().len();
+            let text = if self.armed {
+                format!("⚠ Press Send again to signal all {n} processes.")
+            } else {
+                format!("⚠ This signals {n} processes.")
+            };
+            out.push((text, warn.patch(theme::bold())));
+        }
+        out
     }
 
     fn select(&mut self, i: usize) {
@@ -127,7 +219,8 @@ impl SignalDialog {
         index: usize,
         state: &ExplorerState,
     ) {
-        let summary = self.summary(state);
+        let mut summary = self.summary(state);
+        summary.extend(self.notes());
         let children_rows = if self.children.is_empty() { 0 } else { 2 };
         let rows = summary.len() + 1 + children_rows + Signal::ALL.len() + 1 + 1;
         let h = (rows + 2).min(u16::MAX as usize) as u16;
@@ -227,8 +320,16 @@ impl SignalDialog {
                 },
             );
         }
-        let send_label = format!("Send {}", self.signal.name());
-        let send_style = if self.signal == Signal::Kill {
+        let send_label = if self.armed && self.needs_second_press() {
+            format!(
+                "Confirm {} ×{}",
+                self.signal.name(),
+                self.recipients().len()
+            )
+        } else {
+            format!("Send {}", self.signal.name())
+        };
+        let send_style = if self.signal == Signal::Kill || self.armed {
             theme::button_danger()
         } else {
             theme::button_primary()
@@ -269,8 +370,8 @@ impl SignalDialog {
             Event::Key(key) => match key.key {
                 KeyCode::Escape => return OverlayOutcome::Close,
                 KeyCode::Enter => {
-                    if !self.cancel_focused {
-                        self.send(state);
+                    if !self.cancel_focused && !self.press_send(state) {
+                        return OverlayOutcome::Consumed;
                     }
                     return OverlayOutcome::Close;
                 }
@@ -282,9 +383,7 @@ impl SignalDialog {
                     self.cancel_focused = !self.cancel_focused;
                 }
                 KeyCode::Space | KeyCode::Char(' ') | KeyCode::Char('c') => {
-                    if !self.children.is_empty() {
-                        self.include_children = !self.include_children;
-                    }
+                    self.toggle_children();
                 }
                 KeyCode::Char(c @ '1'..='9') => self.select(c as usize - '1' as usize),
                 _ => {}
@@ -295,13 +394,12 @@ impl SignalDialog {
                     MouseEventKind::Move | MouseEventKind::Drag(_) => self.hover = target,
                     MouseEventKind::Down(MouseButton::Left) => match target {
                         Target::Item(i) => self.select(i),
-                        Target::Control(CHILDREN) => {
-                            self.include_children = !self.include_children;
-                        }
+                        Target::Control(CHILDREN) => self.toggle_children(),
                         Target::Control(CANCEL) => return OverlayOutcome::Close,
                         Target::Control(SEND) => {
-                            self.send(state);
-                            return OverlayOutcome::Close;
+                            if self.press_send(state) {
+                                return OverlayOutcome::Close;
+                            }
                         }
                         Target::Control(_) | Target::Body => {}
                         Target::Outside => return OverlayOutcome::Close,

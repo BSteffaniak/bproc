@@ -164,6 +164,26 @@ fn renice(state: &ExplorerState) -> &ReniceDialog {
     }
 }
 
+fn root_renice(state: &ExplorerState, targets: Vec<ProcessKey>, lower: bool) -> Overlay {
+    Overlay::Renice(ReniceDialog::with_privilege(
+        state,
+        targets,
+        Some(lower),
+        true,
+    ))
+}
+
+fn user_renice(state: &ExplorerState, targets: Vec<ProcessKey>, lower: Option<bool>) -> Overlay {
+    Overlay::Renice(ReniceDialog::with_privilege(state, targets, lower, false))
+}
+
+fn affinity(state: &ExplorerState) -> &AffinityDialog {
+    match state.overlays.last() {
+        Some(Overlay::Affinity(d)) => d,
+        _ => panic!("top overlay is not the affinity dialog"),
+    }
+}
+
 fn chooser(state: &ExplorerState) -> &ColumnChooser {
     match state.overlays.last() {
         Some(Overlay::Columns(d)) => d,
@@ -915,19 +935,19 @@ fn signal_dialog_shows_single_target_details() {
 #[test]
 fn renice_starts_one_step_from_current() {
     let state = fixture();
-    let Overlay::Renice(lower) = renice_dialog(&state, vec![key(300)], true) else {
+    let Overlay::Renice(lower) = root_renice(&state, vec![key(300)], true) else {
         unreachable!()
     };
     assert_eq!((lower.current, lower.value), (Some(5), 6));
-    let Overlay::Renice(higher) = renice_dialog(&state, vec![key(300)], false) else {
+    let Overlay::Renice(higher) = root_renice(&state, vec![key(300)], false) else {
         unreachable!()
     };
     assert_eq!(higher.value, 4);
-    let Overlay::Renice(mixed) = renice_dialog(&state, vec![key(300), key(200)], true) else {
+    let Overlay::Renice(mixed) = root_renice(&state, vec![key(300), key(200)], true) else {
         unreachable!()
     };
     assert!(mixed.mixed && mixed.current.is_none());
-    let Overlay::Renice(unknown) = renice_dialog(&state, vec![key(999)], true) else {
+    let Overlay::Renice(unknown) = root_renice(&state, vec![key(999)], true) else {
         unreachable!()
     };
     assert_eq!((unknown.current, unknown.value), (None, 1));
@@ -938,7 +958,7 @@ fn renice_keyboard_and_typing() {
     let mut state = fixture();
     state
         .overlays
-        .push(renice_dialog(&state, vec![key(200)], true));
+        .push(root_renice(&state, vec![key(200)], true));
     press(&mut state, KeyCode::Right);
     assert_eq!(renice(&state).value, 2);
     press(&mut state, KeyCode::Left);
@@ -971,7 +991,7 @@ fn renice_slider_is_clickable_and_draggable() {
     let mut state = fixture();
     state
         .overlays
-        .push(renice_dialog(&state, vec![key(200)], true));
+        .push(root_renice(&state, vec![key(200)], true));
     let buffer = render(&mut state, 100, 40);
     let text = screen(&buffer);
     assert!(text.contains("Lower values = higher priority"));
@@ -1141,6 +1161,7 @@ fn every_overlay(state: &ExplorerState) -> Vec<Overlay> {
         column_chooser(state),
         renice_dialog(state, vec![key(100)], true),
         signal_dialog(state, vec![key(100), key(200)], Signal::Term),
+        Overlay::Affinity(AffinityDialog::with_mask(12, vec![key(100)], None)),
     ]
 }
 
@@ -1251,4 +1272,447 @@ fn menu_items_expose_kinds() {
     assert!(!m.items[3].selectable());
     assert!(m.items[5].selectable());
     assert!(!MenuItem::submenu("Empty", vec![]).selectable());
+}
+
+// ---- menu frame ------------------------------------------------------------------
+
+/// Every row of a menu panel is closed on the right: `╮` / `╯` corners,
+/// `┤` on separators and `│` elsewhere.
+fn assert_closed_frame(buffer: &Buffer, r: Rect, items: &[MenuItem], scroll: usize) {
+    let right = r.x + r.width - 1;
+    let at = |y| buffer.get(Point::new(right, y)).unwrap().symbol.clone();
+    let left = |y| buffer.get(Point::new(r.x, y)).unwrap().symbol.clone();
+    assert_eq!(at(r.y), "╮", "top-right corner\n{}", screen(buffer));
+    assert_eq!(at(r.y + r.height - 1), "╯", "bottom-right corner");
+    for row in 0..r.height.saturating_sub(2) {
+        let y = r.y + 1 + row;
+        let separator = matches!(
+            items.get(scroll + row as usize).map(|i| &i.kind),
+            Some(ItemKind::Separator)
+        );
+        let (l, rt) = if separator {
+            ("├", "┤")
+        } else {
+            ("│", "│")
+        };
+        assert_eq!(left(y), l, "left edge at row {y}\n{}", screen(buffer));
+        assert_eq!(at(y), rt, "right edge at row {y}\n{}", screen(buffer));
+    }
+}
+
+#[test]
+fn menu_frames_close_on_the_right_including_separators() {
+    let mut state = fixture();
+    for at in [Point::new(10, 2), Point::new(95, 2), Point::new(0, 30)] {
+        state.overlays.clear();
+        state.overlays.push(process_menu(&state, key(100), at));
+        let buffer = render(&mut state, 100, 40);
+        let m = menu(&state);
+        let g = m.geometry(state.last_area);
+        assert_closed_frame(&buffer, g[0].rect, &m.items, g[0].scroll);
+    }
+    // A scrolled menu in a short terminal and an open submenu.
+    state.overlays.clear();
+    state
+        .overlays
+        .push(process_menu(&state, key(100), Point::new(2, 1)));
+    let buffer = render(&mut state, 60, 12);
+    let m = menu(&state);
+    let g = m.geometry(state.last_area);
+    assert_closed_frame(&buffer, g[0].rect, &m.items, g[0].scroll);
+
+    state.overlays.clear();
+    state
+        .overlays
+        .push(Overlay::Menu(sample_menu(Point::new(5, 5))));
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "Delta");
+    let buffer = render(&mut state, 100, 40);
+    let m = menu(&state);
+    let g = m.geometry(state.last_area);
+    assert_eq!(g.len(), 2, "submenu open");
+    for (level, geometry) in g.iter().enumerate() {
+        assert_closed_frame(
+            &buffer,
+            geometry.rect,
+            m.level_items(level),
+            geometry.scroll,
+        );
+    }
+}
+
+// ---- dimmed backdrop ---------------------------------------------------------------
+
+#[test]
+fn dimmed_backdrop_keeps_selected_and_highlighted_colours() {
+    use bmux_tui::style::{Color, Modifier, Style};
+    let mut state = fixture();
+    let area = Rect::new(0, 0, 100, 40);
+    state.last_area = area;
+    let mut buffer = Buffer::empty(area);
+    let selected = crate::ui::explorer::paint::theme::selected();
+    let marked = Style::new().fg(Color::Yellow);
+    {
+        let mut bf = bmux_tui::frame::Frame::new(&mut buffer);
+        let mut cx = PaintCx::new(&mut bf);
+        cx.fill(
+            crate::ui::explorer::paint::lr(Rect::new(0, 0, 100, 1)),
+            "s",
+            selected,
+        );
+        cx.fill(
+            crate::ui::explorer::paint::lr(Rect::new(0, 1, 100, 1)),
+            "m",
+            marked,
+        );
+        let mut hits = std::mem::take(&mut state.hits);
+        hits.begin();
+        state
+            .overlays
+            .push(root_renice(&state, vec![key(200)], true));
+        {
+            let mut frame = Frame {
+                cx: &mut cx,
+                hits: &mut hits,
+                now: std::time::Instant::now(),
+            };
+            draw(&mut frame, area, 0, &state);
+        }
+        state.hits = hits;
+    }
+    let sel = buffer.get(Point::new(0, 0)).unwrap();
+    assert_eq!(sel.style.fg, selected.fg, "selected text keeps its colour");
+    assert_eq!(sel.style.bg, selected.bg);
+    assert!(sel.style.modifiers.contains(Modifier::DIM));
+    let hl = buffer.get(Point::new(0, 1)).unwrap();
+    assert_eq!(
+        hl.style.fg,
+        Some(Color::Yellow),
+        "highlighted text keeps its colour"
+    );
+    assert!(hl.style.modifiers.contains(Modifier::DIM));
+}
+
+// ---- bproc never signals itself ----------------------------------------------------
+
+/// The fixture plus this test process (as "bproc") under zsh, with a child.
+fn fixture_with_self() -> (ExplorerState, ProcessKey) {
+    let me = std::process::id() as i32;
+    let mut state = fixture();
+    let mut entries: Vec<ProcessEntry> =
+        state.store.rows().iter().map(|r| r.entry.clone()).collect();
+    entries.push(entry(me, Some(200), "bproc", "me"));
+    entries.push(entry(me + 100_000, Some(me), "bproc-helper", "me"));
+    state.store = ProcessStore::from_entries(entries, SystemSnapshot::default());
+    (state, key(me))
+}
+
+#[test]
+fn kill_tree_never_includes_bproc_itself() {
+    let (mut state, me) = fixture_with_self();
+    let buffer = open_process_menu(&mut state, 200);
+    tap(&mut state, &buffer, "Kill process tree");
+    let d = signal(&state);
+    assert!(d.include_children);
+    assert!(!d.children.contains(&me), "bproc is not a recipient");
+    assert!(!d.recipients().contains(&me));
+    // Its own children are still offered.
+    assert!(d.children.contains(&key(me.pid + 100_000)));
+    press(&mut state, KeyCode::Enter);
+    let requests = state.take_requests();
+    let [UiRequest::Action(ActionRequest::Signal { targets, .. })] = requests.as_slice() else {
+        panic!("{requests:?}")
+    };
+    assert!(!targets.contains(&me));
+    assert!(targets.contains(&key(200)));
+}
+
+#[test]
+fn signalling_bproc_directly_skips_it_with_a_warning() {
+    let (mut state, me) = fixture_with_self();
+    // Without confirmation: the menu drops bproc and raises a toast.
+    state.settings.confirm_signals = false;
+    state.table.mark_all(vec![me, key(200)]);
+    let buffer = open_process_menu(&mut state, 200);
+    tap(&mut state, &buffer, "Terminate");
+    assert_eq!(
+        state.take_requests(),
+        vec![UiRequest::Action(ActionRequest::Signal {
+            targets: vec![key(200)],
+            signal: Signal::Term,
+        })]
+    );
+    assert!(
+        state
+            .toasts
+            .items
+            .iter()
+            .any(|t| t.text.contains("does not signal itself"))
+    );
+    // Only bproc targeted: nothing is sent at all.
+    state.table.clear_marks();
+    state.toasts.clear();
+    let buffer = open_process_menu(&mut state, me.pid);
+    tap(&mut state, &buffer, "Force kill");
+    assert!(state.take_requests().is_empty());
+    assert_eq!(state.toasts.items.len(), 1);
+
+    // The dialog says so and never lists bproc as a recipient.
+    state
+        .overlays
+        .push(signal_dialog(&state, vec![me, key(200)], Signal::Term));
+    let buffer = render(&mut state, 100, 40);
+    assert!(signal(&state).skipped_self);
+    assert_eq!(signal(&state).targets, vec![key(200)]);
+    assert!(
+        screen(&buffer).contains("is skipped"),
+        "{}",
+        screen(&buffer)
+    );
+    state.overlays.clear();
+    state
+        .overlays
+        .push(signal_dialog(&state, vec![me], Signal::Term));
+    press(&mut state, KeyCode::Enter);
+    assert!(state.take_requests().is_empty());
+    assert!(state.overlays.is_empty());
+}
+
+#[test]
+fn system_roots_never_offer_their_tree() {
+    let mut state = fixture();
+    // launchd (PID 1) has children but "Kill process tree…" is disabled.
+    open_process_menu(&mut state, 1);
+    let item = menu(&state)
+        .items
+        .iter()
+        .find(|i| i.label.starts_with("Kill process tree"))
+        .unwrap();
+    assert!(!item.enabled);
+    // The dialog does not offer its children either.
+    let d = SignalDialog::new(&state, vec![key(1)], Signal::Term);
+    assert!(d.children.is_empty() && d.tree_blocked);
+    assert_eq!(d.recipients(), vec![key(1)]);
+    // Executing the command directly (e.g. stale menu) does nothing.
+    state.overlays.clear();
+    super::menus::execute(
+        &MenuCommand::SignalTree,
+        Some(key(1)),
+        &[key(1)],
+        &mut state,
+    );
+    assert!(state.overlays.is_empty());
+    assert!(signal::is_system_root(0) && signal::is_system_root(1));
+    assert!(!signal::is_system_root(100));
+}
+
+#[test]
+fn large_trees_need_a_second_press() {
+    let mut entries = vec![
+        entry(1, None, "launchd", "root"),
+        entry(10, Some(1), "tmux", "me"),
+    ];
+    for pid in 0..60 {
+        entries.push(entry(1000 + pid, Some(10), "sh", "me"));
+    }
+    let mut state = ExplorerState {
+        store: ProcessStore::from_entries(entries, SystemSnapshot::default()),
+        last_area: Rect::new(0, 0, 100, 40),
+        ..Default::default()
+    };
+    let buffer = open_process_menu(&mut state, 10);
+    tap(&mut state, &buffer, "Kill process tree");
+    assert!(signal(&state).needs_second_press());
+    let buffer = render(&mut state, 100, 40);
+    assert!(screen(&buffer).contains("This signals 61 processes"));
+    press(&mut state, KeyCode::Enter);
+    assert!(state.take_requests().is_empty(), "first press only arms");
+    assert!(signal(&state).armed);
+    let buffer = render(&mut state, 100, 40);
+    assert!(screen(&buffer).contains("Press Send again"));
+    // Toggling the children disarms.
+    press(&mut state, KeyCode::Char('c'));
+    press(&mut state, KeyCode::Char('c'));
+    assert!(!signal(&state).armed);
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "Send SIGTERM");
+    assert!(state.take_requests().is_empty());
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "Confirm SIGTERM");
+    let requests = state.take_requests();
+    let [UiRequest::Action(ActionRequest::Signal { targets, .. })] = requests.as_slice() else {
+        panic!("{requests:?}")
+    };
+    assert_eq!(targets.len(), 61);
+    assert!(state.overlays.is_empty());
+}
+
+// ---- renice without root -------------------------------------------------------
+
+#[test]
+fn renice_without_root_cannot_go_below_the_current_value() {
+    let mut state = fixture();
+    // paused (300) has nice 5.
+    state
+        .overlays
+        .push(user_renice(&state, vec![key(300)], Some(false)));
+    let d = renice(&state);
+    assert_eq!(d.floor(), 5);
+    assert_eq!(d.value, 5, "F7 opens at the current value, not 4");
+    assert!(d.cannot_raise());
+    let buffer = render(&mut state, 100, 40);
+    let text = screen(&buffer);
+    assert!(
+        text.contains("Without root you can only lower priority"),
+        "{text}"
+    );
+    assert!(text.contains("5..19"), "{text}");
+    assert!(!text.contains("Values below 0 need root"));
+    press(&mut state, KeyCode::Left);
+    press(&mut state, KeyCode::Home);
+    assert_eq!(renice(&state).value, 5);
+    press(&mut state, KeyCode::Char('-'));
+    press(&mut state, KeyCode::Char('3'));
+    assert_eq!(renice(&state).value, 5, "typed values clamp to the floor");
+    // Clicking a slider step below the floor clamps too.
+    let buffer = render(&mut state, 100, 40);
+    let first = state
+        .hits
+        .committed()
+        .iter()
+        .find(|(_, h)| matches!(h, Hit::OverlayItem { item: 0, .. }))
+        .map(|(r, _)| *r)
+        .unwrap();
+    assert_eq!(
+        cells(&buffer, first),
+        "┄",
+        "unreachable steps are drawn dashed"
+    );
+    click(&mut state, center(first));
+    assert_eq!(renice(&state).value, 5);
+    press(&mut state, KeyCode::Right);
+    assert_eq!(renice(&state).value, 6);
+
+    // Mixed or unknown targets keep the full range (the action reports
+    // permission errors).
+    let mixed = ReniceDialog::with_privilege(&state, vec![key(300), key(200)], Some(false), false);
+    assert_eq!(mixed.floor(), -20);
+    assert!(!mixed.cannot_raise());
+    // Root can go anywhere.
+    let Overlay::Renice(root) = root_renice(&state, vec![key(300)], false) else {
+        unreachable!()
+    };
+    assert_eq!((root.floor(), root.value), (-20, 4));
+}
+
+#[test]
+fn renice_values_stay_in_nice_range() {
+    use crate::procs::actions::NICE_RANGE;
+    assert_eq!(renice::MIN, *NICE_RANGE.start());
+    assert_eq!(renice::MAX, *NICE_RANGE.end());
+    let mut state = fixture();
+    state
+        .overlays
+        .push(root_renice(&state, vec![key(200)], true));
+    for _ in 0..50 {
+        press(&mut state, KeyCode::PageUp);
+    }
+    assert_eq!(renice(&state).value, *NICE_RANGE.end());
+    for _ in 0..50 {
+        press(&mut state, KeyCode::PageDown);
+    }
+    assert_eq!(renice(&state).value, *NICE_RANGE.start());
+}
+
+#[test]
+fn open_renice_flashes_when_priority_cannot_be_raised() {
+    let mut state = fixture();
+    if renice::is_privileged() {
+        return; // root may always raise priority
+    }
+    open_renice(&mut state, vec![key(300)], false);
+    assert!(state.overlays.is_empty());
+    assert_eq!(
+        state.flash.as_ref().unwrap().0,
+        "Raising priority needs root"
+    );
+    open_renice(&mut state, vec![key(300)], true);
+    assert_eq!(renice(&state).value, 6);
+    state.overlays.clear();
+    open_renice(&mut state, vec![], true);
+    assert!(state.overlays.is_empty());
+}
+
+// ---- CPU affinity --------------------------------------------------------------
+
+#[test]
+fn affinity_dialog_toggles_cpus_and_queues_request() {
+    let mut state = fixture();
+    state
+        .overlays
+        .push(Overlay::Affinity(AffinityDialog::with_mask(
+            12,
+            vec![key(100)],
+            Some(&[0, 2]),
+        )));
+    assert_eq!(affinity(&state).selected(), vec![0, 2]);
+    let buffer = render(&mut state, 100, 40);
+    let text = screen(&buffer);
+    assert!(text.contains("CPU affinity") && text.contains("[x] 0") && text.contains("[ ] 11"));
+    // Click CPU 5 on, keyboard-toggle CPU 0 off.
+    tap(&mut state, &buffer, "[ ] 5");
+    press(&mut state, KeyCode::Home);
+    press(&mut state, KeyCode::Space);
+    assert_eq!(affinity(&state).selected(), vec![2, 5]);
+    // Grid navigation wraps by rows of 8.
+    press(&mut state, KeyCode::Down);
+    assert_eq!(affinity(&state).cursor, 8);
+    // None, then Apply refuses an empty mask.
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "None");
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "Apply");
+    assert!(state.take_requests().is_empty());
+    assert_eq!(state.flash.as_ref().unwrap().0, "Select at least one CPU");
+    assert_eq!(state.overlays.len(), 1);
+    let buffer = render(&mut state, 100, 40);
+    tap(&mut state, &buffer, "All");
+    press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        state.take_requests(),
+        vec![UiRequest::Action(ActionRequest::Affinity {
+            targets: vec![key(100)],
+            cpus: (0..12).collect(),
+        })]
+    );
+    assert!(state.overlays.is_empty());
+    // Unknown mask = all CPUs; Escape cancels.
+    let d = AffinityDialog::with_mask(4, vec![key(100)], None);
+    assert_eq!(d.selected(), vec![0, 1, 2, 3]);
+    state.overlays.push(Overlay::Affinity(d));
+    press(&mut state, KeyCode::Escape);
+    assert!(state.overlays.is_empty() && state.take_requests().is_empty());
+}
+
+#[test]
+fn affinity_menu_item_follows_platform_support() {
+    let mut state = fixture();
+    open_process_menu(&mut state, 100);
+    let has = menu(&state)
+        .items
+        .iter()
+        .any(|i| i.label == "Set CPU affinity…");
+    assert_eq!(has, crate::procs::actions::affinity_supported());
+    // The command itself opens the dialog only where supported.
+    state.overlays.clear();
+    super::menus::execute(
+        &MenuCommand::Affinity,
+        Some(key(100)),
+        &[key(100)],
+        &mut state,
+    );
+    assert_eq!(
+        matches!(state.overlays.last(), Some(Overlay::Affinity(_))),
+        crate::procs::actions::affinity_supported()
+    );
 }

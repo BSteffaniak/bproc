@@ -4,8 +4,10 @@ use super::super::actions::Action;
 use super::super::hits::Hit;
 use super::super::{ExplorerState, UiRequest};
 use super::menu::{MenuCommand, MenuItem, MenuOverlay, column_label};
-use super::{Overlay, ReniceDialog, SignalDialog};
+use super::signal::{is_system_root, without_self};
+use super::{AffinityDialog, Overlay, ReniceDialog, SignalDialog};
 use crate::procs::ProcessKey;
+use crate::procs::actions::affinity_supported;
 use crate::procs::actions::{ActionRequest, Signal};
 use crate::procs::columns::ALL_COLUMNS;
 use crate::procs::export::ExportFormat;
@@ -35,6 +37,8 @@ pub fn process_menu(state: &ExplorerState, key: ProcessKey, at: Point) -> MenuOv
         .and_then(|r| r.net.as_ref())
         .is_some_and(|n| n.throttle_limit.is_some());
     let has_tree = targets.iter().any(|k| !state.store.children(k).is_empty());
+    // Killing launchd/init's tree would signal nearly every process.
+    let system_root = targets.iter().any(|k| is_system_root(k.pid));
     let has_parent = !state.store.ancestors(&key).is_empty();
 
     let signals: Vec<MenuItem> = Signal::ALL
@@ -106,12 +110,17 @@ pub fn process_menu(state: &ExplorerState, key: ProcessKey, at: Point) -> MenuOv
             .hint("F7 F8")
             .enabled(any_live),
         MenuItem::command("Kill process tree…", MenuCommand::SignalTree)
-            .enabled(any_live && has_tree),
+            .enabled(any_live && has_tree && !system_root),
+    ];
+    if affinity_supported() {
+        items.push(MenuItem::command("Set CPU affinity…", MenuCommand::Affinity).enabled(any_live));
+    }
+    items.extend([
         MenuItem::separator(),
         MenuItem::command("Throttle bandwidth…", MenuCommand::Run(Action::Throttle))
             .hint("t")
             .enabled(live),
-    ];
+    ]);
     if throttled {
         items.push(
             MenuItem::command("Remove throttle", MenuCommand::Run(Action::RemoveThrottle))
@@ -341,6 +350,10 @@ pub fn execute(
             state.table.mark_dirty();
         }
         MenuCommand::Signal(signal) => {
+            let (targets, skipped_self) = without_self(targets);
+            if skipped_self {
+                warn_self(state);
+            }
             if targets.is_empty() {
                 return;
             }
@@ -358,7 +371,7 @@ pub fn execute(
             }
         }
         MenuCommand::SignalTree => {
-            if targets.is_empty() {
+            if targets.is_empty() || targets.iter().any(|k| is_system_root(k.pid)) {
                 return;
             }
             let mut dialog = SignalDialog::new(state, targets, Signal::Term);
@@ -369,6 +382,12 @@ pub fn execute(
             if !targets.is_empty() {
                 let dialog = ReniceDialog::new(state, targets, None);
                 state.overlays.push(Overlay::Renice(dialog));
+            }
+        }
+        MenuCommand::Affinity => {
+            if !targets.is_empty() && affinity_supported() {
+                let dialog = AffinityDialog::new(state, targets);
+                state.overlays.push(Overlay::Affinity(dialog));
             }
         }
         MenuCommand::TogglePin => {
@@ -428,6 +447,17 @@ pub fn execute(
             set_sort(state, current.column, !current.descending);
         }
     }
+}
+
+/// Tell the user bproc left itself out of a signal.
+fn warn_self(state: &mut ExplorerState) {
+    state.toasts.push(
+        super::super::toasts::Severity::Warning,
+        format!(
+            "bproc does not signal itself (PID {}). Press q to quit.",
+            std::process::id()
+        ),
+    );
 }
 
 fn set_sort(state: &mut ExplorerState, column: crate::procs::columns::ColumnId, descending: bool) {

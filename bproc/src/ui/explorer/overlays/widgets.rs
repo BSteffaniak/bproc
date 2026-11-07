@@ -7,11 +7,18 @@ use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text_width::display_width;
 
 /// Capture clicks over the whole screen and dim what is underneath.
+///
+/// Dimming keeps each cell's own colours and only adds the faint
+/// attribute, so the selected row (dark text on a bright background) and
+/// highlighted text stay readable instead of turning grey-on-colour.
 pub fn backdrop(frame: &mut Frame<'_, '_, '_>, area: Rect, index: usize) {
-    frame
-        .cx
-        .restyle(lr(area), Style::new().fg(Color::BrightBlack));
+    frame.cx.restyle(lr(area), backdrop_style());
     frame.hit(area, Hit::OverlayBackdrop { overlay: index });
+}
+
+/// Style layered over everything behind a modal dialog.
+pub fn backdrop_style() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
 }
 
 /// What a pointer position means for overlay `index`.

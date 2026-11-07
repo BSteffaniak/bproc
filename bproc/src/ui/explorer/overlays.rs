@@ -1,15 +1,16 @@
-//! Modal overlay stack: context menus, signal / renice dialogs, column
-//! chooser, sort and filter menus, export menu, plus hosting for help,
+//! Modal overlay stack: context menus, signal / renice / CPU affinity
+//! dialogs, column chooser, sort and filter menus, export menu, plus hosting for help,
 //! settings and the watch editor (drawn/handled by their own modules).
 //!
 //! Every overlay pushes `Hit::OverlayBackdrop` over the whole screen first,
 //! so clicks outside it are captured (and dismiss it) instead of reaching
 //! whatever is underneath.
+mod affinity;
 mod columns;
 mod menu;
 mod menus;
 mod renice;
-mod signal;
+pub mod signal;
 #[cfg(test)]
 mod tests;
 pub(super) mod widgets;
@@ -22,6 +23,7 @@ use crate::procs::actions::Signal;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Point, Rect};
 
+pub use affinity::AffinityDialog;
 pub use columns::ColumnChooser;
 pub use menu::MenuOverlay;
 pub use renice::ReniceDialog;
@@ -31,6 +33,7 @@ pub enum Overlay {
     Menu(MenuOverlay),
     Signal(SignalDialog),
     Renice(ReniceDialog),
+    Affinity(AffinityDialog),
     Columns(ColumnChooser),
     Help(help::HelpState),
     Settings(settings::SettingsState),
@@ -69,6 +72,22 @@ pub fn renice_dialog(state: &ExplorerState, targets: Vec<ProcessKey>, lower: boo
 pub fn signal_dialog(state: &ExplorerState, targets: Vec<ProcessKey>, signal: Signal) -> Overlay {
     Overlay::Signal(SignalDialog::new(state, targets, signal))
 }
+/// F7 / F8 entry point: opens the renice dialog, or flashes instead when
+/// the user cannot raise the targets' priority (F7 without root on a
+/// process whose nice value is known).
+// Called from `ExplorerState::run` (Action::NiceUp / NiceDown).
+#[allow(dead_code)]
+pub fn open_renice(state: &mut ExplorerState, targets: Vec<ProcessKey>, lower: bool) {
+    if targets.is_empty() {
+        return;
+    }
+    let dialog = ReniceDialog::new(state, targets, Some(lower));
+    if !lower && dialog.cannot_raise() {
+        state.flash("Raising priority needs root");
+        return;
+    }
+    state.overlays.push(Overlay::Renice(dialog));
+}
 
 /// Draw overlay `index` of `state.overlays` (bottom = 0).
 pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, index: usize, state: &ExplorerState) {
@@ -88,6 +107,10 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, index: usize, state: &Exp
             d.draw(frame, area, index, state);
         }
         Overlay::Renice(d) => {
+            widgets::backdrop(frame, area, index);
+            d.draw(frame, area, index, state);
+        }
+        Overlay::Affinity(d) => {
             widgets::backdrop(frame, area, index);
             d.draw(frame, area, index, state);
         }
@@ -112,6 +135,7 @@ pub fn handle(
         Overlay::Menu(m) => m.handle(index, event, state),
         Overlay::Signal(d) => d.handle(index, event, state),
         Overlay::Renice(d) => d.handle(index, event, state),
+        Overlay::Affinity(d) => d.handle(index, event, state),
         Overlay::Columns(d) => d.handle(index, event, state),
     }
 }

@@ -38,6 +38,8 @@ pub enum MenuCommand {
     /// Signal dialog for the targets with their descendants preselected.
     SignalTree,
     Renice,
+    /// CPU affinity dialog (Linux).
+    Affinity,
     TogglePin,
     ToggleMark,
     ShowInTree,
@@ -363,6 +365,21 @@ impl MenuOverlay {
                         item: level * LEVEL_STRIDE + idx,
                     },
                 );
+            }
+        }
+        // Close the frame last so nothing drawn above can leave the right
+        // edge open: corners on the top / bottom rows, tees on separators.
+        if r.width >= 2 && r.height >= 2 {
+            let right = r.x + r.width - 1;
+            frame.cell(right, r.y, "╮", border);
+            frame.cell(right, r.y + r.height - 1, "╯", border);
+            for row in 0..inner.height as usize {
+                let y = inner.y + row as u16;
+                let symbol = match items.get(g.scroll + row).map(|i| &i.kind) {
+                    Some(ItemKind::Separator) => "┤",
+                    _ => "│",
+                };
+                frame.cell(right, y, symbol, border);
             }
         }
         if r.width > 4 {
