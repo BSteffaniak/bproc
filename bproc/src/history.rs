@@ -129,18 +129,6 @@ impl HistoryTracker {
         }
     }
 
-    /// Update history for a process
-    #[cfg(test)]
-    pub fn update(&mut self, pid: i32, process_name: String, download_rate: u64, upload_rate: u64) {
-        self.update_at(
-            unix_timestamp(),
-            pid,
-            process_name,
-            download_rate,
-            upload_rate,
-        );
-    }
-
     /// Record a reliably delivered measurement without replacing intermediate samples.
     pub fn update_at(
         &mut self,

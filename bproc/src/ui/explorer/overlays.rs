@@ -7,8 +7,8 @@
 //! whatever is underneath.
 mod affinity;
 mod columns;
-mod menu;
-mod menus;
+pub mod menu;
+pub mod menus;
 mod renice;
 pub mod signal;
 #[cfg(test)]
@@ -65,18 +65,12 @@ pub fn export_menu(state: &ExplorerState) -> Overlay {
 pub fn column_chooser(state: &ExplorerState) -> Overlay {
     Overlay::Columns(ColumnChooser::new(state))
 }
-/// `lower` = F8 (nice +, lower priority); otherwise F7.
-pub fn renice_dialog(state: &ExplorerState, targets: Vec<ProcessKey>, lower: bool) -> Overlay {
-    Overlay::Renice(ReniceDialog::new(state, targets, Some(lower)))
-}
 pub fn signal_dialog(state: &ExplorerState, targets: Vec<ProcessKey>, signal: Signal) -> Overlay {
     Overlay::Signal(SignalDialog::new(state, targets, signal))
 }
-/// F7 / F8 entry point: opens the renice dialog, or flashes instead when
+/// F7 / F8 entry point (`lower` = F8, nice +): opens the renice dialog, or flashes instead when
 /// the user cannot raise the targets' priority (F7 without root on a
 /// process whose nice value is known).
-// Called from `ExplorerState::run` (Action::NiceUp / NiceDown).
-#[allow(dead_code)]
 pub fn open_renice(state: &mut ExplorerState, targets: Vec<ProcessKey>, lower: bool) {
     if targets.is_empty() {
         return;

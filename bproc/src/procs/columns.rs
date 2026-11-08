@@ -53,7 +53,6 @@ pub struct ColumnCtx {
     pub traffic: TrafficType,
     pub now_ms: u64,
     pub mem_total: u64,
-    pub cpu_count: usize,
 }
 
 impl Default for ColumnCtx {
@@ -62,7 +61,6 @@ impl Default for ColumnCtx {
             traffic: TrafficType::All,
             now_ms: 0,
             mem_total: 0,
-            cpu_count: 1,
         }
     }
 }

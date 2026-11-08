@@ -254,11 +254,41 @@ fn check_identity(key: ProcessKey, current: Option<u64>) -> Result<(), ActionErr
     }
 }
 
+/// Whether `pid` is this bproc process. bproc never signals itself on
+/// purpose: doing so mid-list stops the remaining targets and can leave the
+/// terminal in raw mode.
+pub fn is_self(pid: i32) -> bool {
+    i64::from(pid) == i64::from(std::process::id())
+}
+
+/// Processes whose tree is (almost) everything: the kernel swapper (PID 0),
+/// init / launchd (PID 1) and, on Linux, kthreadd (PID 2). Tree-wide
+/// actions refuse them.
+pub fn is_system_root(pid: i32) -> bool {
+    pid <= 1 || (cfg!(target_os = "linux") && pid == 2)
+}
+
+/// `keys` without bproc itself; the flag says whether it was present.
+pub fn exclude_self(keys: Vec<ProcessKey>) -> (Vec<ProcessKey>, bool) {
+    let before = keys.len();
+    let kept: Vec<ProcessKey> = keys.into_iter().filter(|k| !is_self(k.pid)).collect();
+    let removed = kept.len() != before;
+    (kept, removed)
+}
+
 /// Execute a request (blocking). `names` supplies display names for reports.
+///
+/// A signal reaches bproc itself (if it is a target at all) only after
+/// every other target, so stopping or terminating bproc can never leave the
+/// rest of the list unsignalled.
 pub fn execute(request: &ActionRequest, names: &dyn Fn(&ProcessKey) -> String) -> ActionReport {
-    let outcomes = request
-        .targets()
-        .iter()
+    let mut order: Vec<&ProcessKey> = request.targets().iter().collect();
+    if matches!(request, ActionRequest::Signal { .. }) {
+        // Stable: the other targets keep their order.
+        order.sort_by_key(|k| is_self(k.pid));
+    }
+    let outcomes = order
+        .into_iter()
         .map(|key| ActionOutcome {
             key: *key,
             name: names(key),
@@ -688,6 +718,45 @@ mod tests {
             ));
             assert!(current_affinity(key.pid).is_err());
         }
+    }
+
+    #[test]
+    fn signals_reach_bproc_itself_last() {
+        // A wrong start time: identity checks fail, so nothing is sent.
+        let me = ProcessKey::new(std::process::id() as i32, 1);
+        let (a, b) = (
+            ProcessKey::new(i32::MAX - 5, 1),
+            ProcessKey::new(i32::MAX - 6, 1),
+        );
+        let order = |request: &ActionRequest| -> Vec<ProcessKey> {
+            execute(request, &|_| String::new())
+                .outcomes
+                .iter()
+                .map(|o| o.key)
+                .collect()
+        };
+        let signal = ActionRequest::Signal {
+            targets: vec![me, a, b],
+            signal: Signal::Cont,
+        };
+        assert_eq!(order(&signal), vec![a, b, me]);
+        let renice = ActionRequest::Renice {
+            targets: vec![me, a, b],
+            nice: 0,
+        };
+        assert_eq!(order(&renice), vec![me, a, b], "only signals reorder");
+    }
+
+    #[test]
+    fn self_and_system_root_helpers() {
+        let me = std::process::id() as i32;
+        assert!(is_self(me) && !is_self(me + 1));
+        assert!(is_system_root(0) && is_system_root(1));
+        assert_eq!(is_system_root(2), cfg!(target_os = "linux"));
+        assert!(!is_system_root(100));
+        let keys = vec![ProcessKey::new(10, 1), ProcessKey::new(me, 1)];
+        assert_eq!(exclude_self(keys.clone()), (vec![keys[0]], true));
+        assert_eq!(exclude_self(vec![keys[0]]), (vec![keys[0]], false));
     }
 
     #[test]

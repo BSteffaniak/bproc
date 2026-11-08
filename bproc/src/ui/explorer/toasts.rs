@@ -13,7 +13,6 @@ use super::overlays::widgets::wrap;
 use super::paint::{Frame, theme, truncate};
 use super::{Click, ExplorerState, Outcome, UiRequest};
 use crate::procs::actions::{ActionRequest, Signal};
-use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::MouseEvent;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::style::{Color, Style};
@@ -412,27 +411,6 @@ pub fn dismiss_newest(state: &mut ExplorerState) -> bool {
     state.toasts.items.pop().is_some()
 }
 
-/// Toast keys: [`ACTION_KEY`] runs the newest action; Esc dismisses the
-/// newest toast. Meant to be called after the focused view declined the key.
-// Called from `ExplorerState::handle_event` key routing.
-#[allow(dead_code)]
-pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
-    let m = key.modifiers;
-    if m.ctrl || m.alt {
-        return Outcome::Ignored;
-    }
-    let handled = match key.key {
-        KeyCode::Char(c) if c == ACTION_KEY => run_newest_action(state),
-        KeyCode::Escape => dismiss_newest(state),
-        _ => false,
-    };
-    if handled {
-        Outcome::Consumed
-    } else {
-        Outcome::Ignored
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,29 +719,32 @@ mod tests {
 
     #[test]
     fn keyboard_runs_the_newest_action_and_esc_dismisses() {
-        let key = |code| KeyStroke::simple(code);
+        use bmux_keyboard::{KeyCode, KeyStroke};
+        use bmux_tui::event::Event;
+        let press = |state: &mut ExplorerState, code| {
+            state.handle_event(&Event::Key(KeyStroke::simple(code)));
+        };
         let mut state = ExplorerState::default();
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Char(ACTION_KEY))),
-            Outcome::Ignored
-        );
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Escape)),
-            Outcome::Ignored
-        );
+        // No action to run: a notice says so instead.
+        press(&mut state, KeyCode::Char(ACTION_KEY));
+        assert!(state.take_requests().is_empty());
+        assert!(state.flash.is_some());
+        state.toasts.push(Severity::Info, "only");
+        press(&mut state, KeyCode::Escape);
+        assert!(state.toasts.is_empty(), "Esc dismisses the newest toast");
+
         state.settings.confirm_signals = false;
         let request = escalation(&mut state);
         state.toasts.push(Severity::Info, "plain");
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Char(ACTION_KEY))),
-            Outcome::Consumed
-        );
+        press(&mut state, KeyCode::Char(ACTION_KEY));
         assert_eq!(state.take_requests(), vec![request]);
         assert_eq!(state.toasts.items.len(), 1);
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Escape)),
-            Outcome::Consumed
-        );
+        // Esc closes other things first (here: the search).
+        state.search.set_text("x");
+        press(&mut state, KeyCode::Escape);
+        assert!(state.search.text.is_empty());
+        assert_eq!(state.toasts.items.len(), 1);
+        press(&mut state, KeyCode::Escape);
         assert!(state.toasts.is_empty());
 
         // With confirmation on, the key opens the dialog instead.

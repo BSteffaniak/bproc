@@ -71,14 +71,16 @@ pub fn state_with(entries: Vec<ProcessEntry>) -> ExplorerState {
     state
 }
 
+/// Refresh like `ExplorerState::draw` (hover freeze included).
 pub fn refresh(state: &mut ExplorerState) {
+    let hovering = state.hovering_table();
     state.table.refresh(
         &state.store,
         &state.settings,
         &state.search,
         state.traffic,
         state.uid,
-        false,
+        hovering,
     );
 }
 

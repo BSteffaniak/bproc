@@ -543,7 +543,8 @@ fn action_buttons_target_the_panel_process_and_keep_marks() {
             name: "bproc".into()
         })]
     );
-    assert_eq!(state.table.selected(), Some(k(300)));
+    // Inspector actions never retarget the (hidden) table.
+    assert_eq!(state.table.selected(), Some(k(1)));
     assert_eq!(state.table.marked(), vec![k(1), k(100)]);
 
     state.settings.confirm_signals = false;

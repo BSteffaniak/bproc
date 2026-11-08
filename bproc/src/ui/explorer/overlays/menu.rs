@@ -10,7 +10,7 @@ use super::widgets::{self, Target, visible_scroll};
 use crate::procs::ProcessKey;
 use crate::procs::actions::Signal;
 use crate::procs::columns::ColumnId;
-use bmux_keyboard::KeyCode;
+use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::text_width::display_width;
@@ -45,6 +45,11 @@ pub enum MenuCommand {
     ShowInTree,
     Sort(ColumnId),
     ToggleDescending,
+    /// Save the watch-rule editor under the menu, its broad signal action
+    /// confirmed.
+    ConfirmWatchSave,
+    /// Just close the menu.
+    Dismiss,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,7 +406,7 @@ impl MenuOverlay {
     ) -> OverlayOutcome {
         match event {
             Event::Key(key) => {
-                let outcome = self.handle_key(key.key, state);
+                let outcome = self.handle_key(key, state);
                 self.sync_scroll(state.last_area);
                 outcome
             }
@@ -446,10 +451,11 @@ impl MenuOverlay {
         }
     }
 
-    fn handle_key(&mut self, key: KeyCode, state: &mut ExplorerState) -> OverlayOutcome {
+    fn handle_key(&mut self, key: &KeyStroke, state: &mut ExplorerState) -> OverlayOutcome {
         let level = self.levels() - 1;
-        match key {
+        match key.key {
             KeyCode::Up => self.step(level, -1),
+            KeyCode::Tab if key.modifiers.shift => self.step(level, -1),
             KeyCode::Down | KeyCode::Tab => self.step(level, 1),
             KeyCode::Home => self.cursor[level] = first_selectable(self.level_items(level)),
             KeyCode::End => {

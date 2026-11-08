@@ -52,6 +52,7 @@ pub enum Action {
     Kill,
     Suspend,
     Resume,
+    RunToast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,10 +102,21 @@ macro_rules! b {
     };
 }
 
+/// Label for [`super::toasts::ACTION_KEY`] (kept in sync by a test).
+const TOAST_ACTION_KEYS: &str = "!";
+/// Shift+Enter only arrives as such with the kitty keyboard protocol; most
+/// terminals send a plain Enter, and Enter on an open panel goes full screen.
+pub const FULL_DETAILS_KEYS: &str = "Shift+Enter, Enter×2";
+
 pub const BINDINGS: &[Binding] = &[
     b!(Search, "F3 /", "Search & filter", Navigate),
     b!(Details, "Enter", "Open details panel", Navigate),
-    b!(FullDetails, "Shift+Enter", "Full-screen details", Navigate),
+    b!(
+        FullDetails,
+        FULL_DETAILS_KEYS,
+        "Full-screen details",
+        Navigate
+    ),
     b!(CloseDetails, "Esc", "Close panel / clear search", Navigate),
     b!(
         ContextMenu,
@@ -151,6 +163,12 @@ pub const BINDINGS: &[Binding] = &[
     b!(TrafficMode, "l", "Traffic: all/internet/local", Network),
     b!(Graph, "g", "Bandwidth graph", Network),
     b!(Backends, "b", "Throttle backends", Network),
+    b!(
+        RunToast,
+        TOAST_ACTION_KEYS,
+        "Run the newest notification's action",
+        App
+    ),
     b!(Help, "F1 ?", "Help", App),
     b!(Settings, "F2 S", "Settings", App),
     b!(Export, "E", "Export view (CSV/JSON)", App),
@@ -199,15 +217,9 @@ impl Action {
                 | Self::Graph
         )
     }
-    #[allow(dead_code)] // registry lookups for help/menus
     pub fn binding(self) -> Option<&'static Binding> {
         BINDINGS.iter().find(|b| b.action == self)
     }
-    #[allow(dead_code)]
-    pub fn label(self) -> &'static str {
-        self.binding().map(|b| b.label).unwrap_or("")
-    }
-    #[allow(dead_code)]
     pub fn keys(self) -> &'static str {
         self.binding().map(|b| b.keys).unwrap_or("")
     }
@@ -276,6 +288,7 @@ impl Action {
                 'g' => Action::Graph,
                 'b' => Action::Backends,
                 'E' => Action::Export,
+                c if c == super::toasts::ACTION_KEY => Action::RunToast,
                 _ => return None,
             },
             _ => return None,
@@ -289,8 +302,19 @@ mod tests {
     #[test]
     fn every_fkey_and_action_has_a_binding_label() {
         for (_, action, _) in FKEYS {
-            assert!(!action.label().is_empty(), "{action:?}");
+            assert!(
+                action.binding().is_some_and(|b| !b.label.is_empty()),
+                "{action:?}"
+            );
         }
+        assert_eq!(
+            TOAST_ACTION_KEYS,
+            super::super::toasts::ACTION_KEY.to_string()
+        );
+        assert_eq!(
+            Action::from_key(&KeyStroke::simple(KeyCode::Char('!'))),
+            Some(Action::RunToast)
+        );
         let mut seen = std::collections::HashSet::new();
         for b in BINDINGS {
             assert!(seen.insert(b.action), "duplicate binding {:?}", b.action);

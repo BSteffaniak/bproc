@@ -1,7 +1,7 @@
 //! Help overlay generated from the action registry; every row is clickable
 //! and runs its action.
 use super::ExplorerState;
-use super::actions::{Action, BINDINGS, Group};
+use super::actions::{Action, BINDINGS, FULL_DETAILS_KEYS, Group};
 use super::hits::{Hit, contains};
 use super::overlays::OverlayOutcome;
 use super::paint::{Frame, centered, fit, theme, truncate};
@@ -42,16 +42,19 @@ pub const MOUSE: &[(&str, &str)] = &[
 pub const INSPECTOR: &[(&str, &str)] = &[
     ("{ }", "Previous / next tab"),
     (FULL_DETAILS_KEYS, "Full screen"),
+    ("Shift+↑↓ Shift+PgUp/PgDn", "Scroll the docked inspector"),
     ("Tab ⇧Tab ← →", "Switch tabs (full screen)"),
-    ("↑↓ PgUp PgDn", "Scroll (full screen)"),
+    ("↑↓", "Move the row cursor (full screen)"),
+    ("PgUp PgDn Home End", "Scroll (full screen)"),
+    (
+        "Enter",
+        "Open the selected row (copy env var / inspect process)",
+    ),
+    ("y", "Copy the selected env var"),
     ("Esc", "Leave full screen / close"),
     ("Drag splitter", "Resize the panel"),
     ("Dbl-click splitter", "Toggle full screen"),
 ];
-
-/// Shift+Enter only arrives as such with the kitty keyboard protocol; most
-/// terminals send a plain Enter, and Enter on an open panel goes full screen.
-const FULL_DETAILS_KEYS: &str = "Shift+Enter, Enter×2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
@@ -80,9 +83,6 @@ fn signal_shortcut(action: Action) -> Option<usize> {
 /// placeholder word. Actions reached through the signal dialog show its
 /// shortcut (e.g. "x ▸ 1"); actions without any key show nothing.
 pub fn help_keys(action: Action) -> String {
-    if action == Action::FullDetails {
-        return FULL_DETAILS_KEYS.into();
-    }
     let keys = action.keys();
     if !keys.is_empty() {
         return keys.into();

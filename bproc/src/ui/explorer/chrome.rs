@@ -1026,8 +1026,7 @@ fn fkey_short(action: Action) -> &'static str {
 /// Whether an F-key's action currently has something to act on.
 fn fkey_enabled(state: &ExplorerState, action: Action) -> bool {
     !matches!(action, Action::NiceDown | Action::NiceUp | Action::Signal)
-        || state.table.selected().is_some()
-        || !state.table.marked().is_empty()
+        || !state.targets().is_empty()
 }
 
 /// Indices into `FKEYS` and whether short labels are used for `width`.
@@ -1217,9 +1216,8 @@ fn status_parts(
             format!("{showing}/{live}")
         } else {
             let mut t = format!("{live} processes · showing {showing}");
-            let filter = state.search.text.trim();
-            if !filter.is_empty() {
-                t.push_str(&format!(" · filter: {}", truncate(filter, 24)));
+            if let Some(label) = state.search.status_label(24) {
+                t.push_str(&format!(" · {label}"));
             }
             t
         };

@@ -69,9 +69,13 @@ pub struct SignalArgs {
     /// Signal: term, kill, hup, int, quit, stop, cont, usr1, usr2 (or SIGTERM, 15, ...)
     #[arg(long, short, value_name = "SIGNAL", default_value = "term", value_parser = parse_signal)]
     pub signal: Signal,
-    /// Also signal every descendant of the process
+    /// Also signal every descendant of the process (never bproc itself)
     #[arg(long)]
     pub tree: bool,
+    /// Allow --tree on a system root (PID 0, 1, or 2 on Linux), whose tree
+    /// is nearly every process
+    #[arg(long, requires = "tree")]
+    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq)]
@@ -327,7 +331,6 @@ fn column_ctx(store: &ProcessStore) -> ColumnCtx {
     ColumnCtx {
         now_ms: store.acquired_at_ms(),
         mem_total: store.system().mem_total,
-        cpu_count: store.system().cpus.len().max(1),
         ..ColumnCtx::default()
     }
 }
@@ -372,6 +375,9 @@ fn ps(args: &PsArgs) -> Result<()> {
         })?),
         _ => None,
     };
+    if let Some(hint) = filter.as_ref().and_then(Filter::hint) {
+        eprintln!("note: {hint}");
+    }
     let store = sample_store(Some(Duration::from_millis(500)))?;
     let rows = ps_rows(&store, args, filter.as_ref());
     let columns = args
@@ -581,7 +587,20 @@ pub fn render_table(
 
 // ---- signal ----------------------------------------------------------------------
 
+/// `--tree` on a system root would signal nearly every process: refused
+/// unless `--force` is given.
+fn check_tree_allowed(args: &SignalArgs) -> Result<()> {
+    if args.tree && !args.force && actions::is_system_root(args.pid) {
+        bail!(
+            "refusing --tree for PID {}: its tree is nearly every process (pass --force to do it anyway)",
+            args.pid
+        );
+    }
+    Ok(())
+}
+
 fn signal(args: &SignalArgs) -> Result<()> {
+    check_tree_allowed(args)?;
     let start = actions::current_start_time(args.pid)
         .ok_or_else(|| anyhow!("no process with PID {}", args.pid))?;
     let store = match sample_store(None) {
@@ -601,6 +620,11 @@ fn signal(args: &SignalArgs) -> Result<()> {
         && let Some(store) = &store
     {
         targets.extend(store.descendants(&key));
+        let (kept, skipped_self) = actions::exclude_self(targets);
+        targets = kept;
+        if skipped_self {
+            eprintln!("Skipping bproc itself (PID {})", std::process::id());
+        }
         eprintln!(
             "Sending {} to {} process(es)",
             args.signal.name(),
@@ -922,7 +946,8 @@ mod tests {
             Command::Signal(SignalArgs {
                 pid: 4242,
                 signal: Signal::Term,
-                tree: false
+                tree: false,
+                force: false,
             })
         );
         assert_eq!(
@@ -930,9 +955,26 @@ mod tests {
             Command::Signal(SignalArgs {
                 pid: 7,
                 signal: Signal::Kill,
-                tree: true
+                tree: true,
+                force: false,
             })
         );
+        assert!(
+            parse(&["signal", "1", "--force"]).is_err(),
+            "--force needs --tree"
+        );
+        let Command::Signal(root) = command(&["signal", "1", "--tree"]) else {
+            unreachable!()
+        };
+        assert!(check_tree_allowed(&root).is_err());
+        let Command::Signal(forced) = command(&["signal", "1", "--tree", "--force"]) else {
+            unreachable!()
+        };
+        assert!(forced.force && check_tree_allowed(&forced).is_ok());
+        let Command::Signal(plain) = command(&["signal", "1"]) else {
+            unreachable!()
+        };
+        assert!(check_tree_allowed(&plain).is_ok(), "only --tree is refused");
         assert!(parse(&["signal"]).is_err());
         assert!(parse(&["signal", "1", "--signal", "nope"]).is_err());
     }

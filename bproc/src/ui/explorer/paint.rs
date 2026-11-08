@@ -223,6 +223,10 @@ pub mod theme {
     pub fn error() -> Style {
         Style::new().fg(Color::BrightRed)
     }
+    /// Non-fatal advice (e.g. a search hint).
+    pub fn warn() -> Style {
+        Style::new().fg(Color::Yellow)
+    }
     pub fn ok() -> Style {
         Style::new().fg(Color::Green)
     }

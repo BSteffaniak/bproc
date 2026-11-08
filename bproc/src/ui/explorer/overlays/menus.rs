@@ -17,9 +17,8 @@ use std::collections::BTreeSet;
 
 pub fn process_menu(state: &ExplorerState, key: ProcessKey, at: Point) -> MenuOverlay {
     let row = state.store.get(&key);
-    let marked = state.table.marked();
-    let multi = marked.len() > 1 && marked.contains(&key);
-    let targets = if multi { marked } else { vec![key] };
+    let targets = state.action_targets(Some(key));
+    let multi = targets.len() > 1;
     let name = state.name_of(&key);
     let live = row.is_some_and(|r| !r.is_ghost());
     let any_live = targets
@@ -357,10 +356,13 @@ pub fn execute(
             if targets.is_empty() {
                 return;
             }
-            // Signals that end the process confirm first (SIGHUP usually reloads).
+            // Signals that end the process confirm first (SIGHUP usually
+            // reloads), and so does any send to a process the user cannot see.
+            state.sync_rows();
+            let hidden = state.hidden_targets(&targets) > 0;
             let confirm =
                 state.settings.confirm_signals && signal.is_terminating() && *signal != Signal::Hup;
-            if confirm {
+            if confirm || hidden {
                 let dialog = SignalDialog::new(state, targets, *signal);
                 state.overlays.push(Overlay::Signal(dialog));
             } else {
@@ -446,7 +448,41 @@ pub fn execute(
             let current = state.table.sort();
             set_sort(state, current.column, !current.descending);
         }
+        MenuCommand::ConfirmWatchSave => {
+            if matches!(state.overlays.last(), Some(Overlay::WatchEditor(_)))
+                && let Some(Overlay::WatchEditor(mut editor)) = state.overlays.pop()
+                && !editor.save_confirmed(state)
+            {
+                state.overlays.push(Overlay::WatchEditor(editor));
+            }
+        }
+        MenuCommand::Dismiss => {}
     }
+}
+
+/// Confirmation shown before saving a watch rule that signals every
+/// process (or every name / command / user): names the signal and the
+/// condition. "Keep editing" is preselected.
+pub fn confirm_broad_signal(state: &ExplorerState, signal: Signal, summary: &str) -> MenuOverlay {
+    let items = vec![
+        MenuItem::header(format!("⚠ {summary}")),
+        MenuItem::header(format!(
+            "This sends {} to every matching process.",
+            signal.name()
+        )),
+        MenuItem::separator(),
+        MenuItem::command("Keep editing", MenuCommand::Dismiss).hint("Esc"),
+        MenuItem::command(
+            format!("Save and send {}", signal.name()),
+            MenuCommand::ConfirmWatchSave,
+        ),
+    ];
+    let area = state.last_area;
+    let at = Point::new(
+        area.x.saturating_add(area.width / 4),
+        area.y.saturating_add(area.height / 3),
+    );
+    MenuOverlay::new(at, items)
 }
 
 /// Tell the user bproc left itself out of a signal.

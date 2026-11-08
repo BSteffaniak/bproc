@@ -863,7 +863,11 @@ fn user_column_fits_names_unless_resized() {
 
     state.settings.column_widths.insert("user".into(), 9);
     render(&mut state, 100, 6);
-    assert_eq!(header_rect(&state, ColumnId::User).width, 9, "override wins");
+    assert_eq!(
+        header_rect(&state, ColumnId::User).width,
+        9,
+        "override wins"
+    );
 }
 
 #[test]
@@ -880,4 +884,24 @@ fn rows_are_dimmed_while_the_filter_does_not_parse() {
     state.search.set_text("proc");
     let out = render(&mut state, 80, 6);
     assert!(!out.cell(30, y).style.modifiers.contains(Modifier::DIM));
+}
+
+#[test]
+fn hover_freeze_shows_a_pause_mark_by_the_sort_arrow() {
+    let mut state = state_with(many(4));
+    let out = render(&mut state, 100, 8);
+    assert!(!out.row(0).contains(super::SORT_PAUSED), "{}", out.row(0));
+    // Pointer resting on a row (hit regions from the last frame).
+    state.pointer.position = Some(Point::new(30, row_y(&state, 1)));
+    state.pointer.moved_at = Some(std::time::Instant::now());
+    assert!(state.hovering_table());
+    let out = render(&mut state, 100, 8);
+    let header = out.row(0);
+    assert!(
+        header.contains(&format!("▼{}", super::SORT_PAUSED)),
+        "{header}"
+    );
+    state.settings.hover_freeze = false;
+    let out = render(&mut state, 100, 8);
+    assert!(!out.row(0).contains(super::SORT_PAUSED));
 }

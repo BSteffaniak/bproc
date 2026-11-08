@@ -203,7 +203,17 @@ impl Default for ExplorerSettings {
     }
 }
 
+/// Largest `dock_size` accepted from a config file.
+pub const DOCK_SIZE_MAX: u16 = 1000;
+
 impl ExplorerSettings {
+    /// Clamp values a hand-edited file could make unusable.
+    pub fn sanitize(&mut self) {
+        self.dock_size = self
+            .dock_size
+            .clamp(crate::ui::explorer::settings::DOCK_MIN_ROWS, DOCK_SIZE_MAX);
+    }
+
     pub fn columns_for(
         &self,
         preset: crate::procs::columns::Preset,
@@ -282,8 +292,9 @@ impl Config {
         let contents =
             fs::read_to_string(path).context(format!("Failed to read config file: {:?}", path))?;
 
-        let config: Config =
+        let mut config: Config =
             serde_json::from_str(&contents).context("Failed to parse config file")?;
+        config.explorer.sanitize();
 
         log::info!("Loaded configuration from {:?}", path);
         Ok(config)
@@ -526,6 +537,20 @@ mod tests {
         tmp.push(".tmp");
         assert!(!PathBuf::from(tmp).exists());
         assert!(Config::load_from(&path).unwrap().explorer.tree);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dock_size_is_clamped_on_load() {
+        let path = temp_path("dock");
+        for (written, loaded) in [(0, 6), (3, 6), (14, 14), (60_000, DOCK_SIZE_MAX)] {
+            fs::write(
+                &path,
+                format!(r#"{{"explorer": {{"dock_size": {written}}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(Config::load_from(&path).unwrap().explorer.dock_size, loaded);
+        }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

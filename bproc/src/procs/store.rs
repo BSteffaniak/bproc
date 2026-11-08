@@ -84,37 +84,6 @@ pub struct Aggregate {
     pub net_up: u64,
 }
 
-impl Aggregate {
-    fn add(&mut self, row: &Row) {
-        let s = &row.entry.sample;
-        self.processes += 1;
-        self.cpu_percent += finite(s.cpu_percent);
-        self.mem_rss = self.mem_rss.saturating_add(s.mem_rss);
-        self.disk_read_rate = self.disk_read_rate.saturating_add(s.disk_read_rate);
-        self.disk_write_rate = self.disk_write_rate.saturating_add(s.disk_write_rate);
-        if let Some(n) = &row.net {
-            self.net_down = self.net_down.saturating_add(n.download_rate);
-            self.net_up = self.net_up.saturating_add(n.upload_rate);
-        }
-    }
-}
-
-/// Whole-machine sums over live processes (ghosts excluded).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Totals {
-    pub processes: usize,
-    /// Sum of thread counts; processes with an unknown count contribute one.
-    pub threads: u64,
-    /// Sum of per-process CPU (percent of one core).
-    pub cpu_percent: f32,
-    pub mem_rss: u64,
-    pub disk_read_rate: u64,
-    pub disk_write_rate: u64,
-    /// All-traffic network rates from the packet monitor.
-    pub net_down: u64,
-    pub net_up: u64,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewRow {
     pub key: ProcessKey,
@@ -141,13 +110,7 @@ pub struct ProcessStore {
     system_history: SystemHistory,
     history: HashMap<ProcessKey, MetricHistory>,
     network: HashMap<i32, Arc<ProcessInfo>>,
-    sequence: u64,
     acquired_at_ms: u64,
-    permission_limited: usize,
-}
-
-fn finite(value: f32) -> f32 {
-    if value.is_finite() { value } else { 0.0 }
 }
 
 /// First position of every key in `keys` (later duplicates are ignored).
@@ -221,9 +184,7 @@ impl ProcessStore {
         self.system_history.push(&snapshot.system, &rows);
         self.rows = rows;
         self.system = snapshot.system;
-        self.sequence = snapshot.sequence;
         self.acquired_at_ms = now;
-        self.permission_limited = snapshot.permission_limited;
         self.reindex();
     }
 
@@ -273,14 +234,8 @@ impl ProcessStore {
     pub fn len_live(&self) -> usize {
         self.by_pid.len()
     }
-    pub fn sequence(&self) -> u64 {
-        self.sequence
-    }
     pub fn acquired_at_ms(&self) -> u64 {
         self.acquired_at_ms
-    }
-    pub fn permission_limited(&self) -> usize {
-        self.permission_limited
     }
     pub fn has_network(&self) -> bool {
         !self.network.is_empty()
@@ -333,93 +288,6 @@ impl ProcessStore {
             current = row.entry.record.ppid.filter(|p| *p != ppid);
         }
         out
-    }
-
-    /// Usage of `key` plus all its live descendants.
-    pub fn subtree_aggregate(&self, key: &ProcessKey) -> Aggregate {
-        let mut agg = Aggregate::default();
-        if let Some(row) = self.get(key) {
-            agg.add(row);
-        }
-        for k in self.descendants(key) {
-            if let Some(row) = self.get(&k) {
-                agg.add(row);
-            }
-        }
-        agg
-    }
-
-    /// Sums over all live processes for headers and status lines.
-    pub fn totals(&self) -> Totals {
-        let mut agg = Aggregate::default();
-        let mut threads = 0u64;
-        for row in self.rows.iter().filter(|r| !r.is_ghost()) {
-            agg.add(row);
-            threads = threads.saturating_add(row.entry.sample.threads.unwrap_or(1) as u64);
-        }
-        Totals {
-            processes: agg.processes,
-            threads,
-            cpu_percent: agg.cpu_percent,
-            mem_rss: agg.mem_rss,
-            disk_read_rate: agg.disk_read_rate,
-            disk_write_rate: agg.disk_write_rate,
-            net_down: agg.net_down,
-            net_up: agg.net_up,
-        }
-    }
-
-    /// Distinct owners of live processes (user name, else numeric uid),
-    /// sorted case-insensitively.
-    pub fn users(&self) -> Vec<String> {
-        let mut users: Vec<String> = self
-            .rows
-            .iter()
-            .filter(|r| !r.is_ghost())
-            .filter_map(|r| {
-                let rec = &r.entry.record;
-                rec.user.clone().or_else(|| rec.uid.map(|u| u.to_string()))
-            })
-            .filter(|u| !u.is_empty())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        users.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then(a.cmp(b)));
-        users
-    }
-
-    /// Live processes whose name equals `name` (case-insensitive), by PID.
-    pub fn find_by_name(&self, name: &str) -> Vec<ProcessKey> {
-        let needle = name.trim().to_lowercase();
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let mut keys: Vec<ProcessKey> = self
-            .rows
-            .iter()
-            .filter(|r| !r.is_ghost() && r.name().to_lowercase() == needle)
-            .map(Row::key)
-            .collect();
-        keys.sort_unstable_by(tiebreak);
-        keys
-    }
-
-    /// The `n` live processes ranking highest by `column` in its natural
-    /// direction (largest first for numbers, A→Z for text); missing values last.
-    pub fn top_by(&self, column: ColumnId, n: usize, ctx: &ColumnCtx) -> Vec<ProcessKey> {
-        if n == 0 {
-            return Vec::new();
-        }
-        let live: Vec<&Row> = self.rows.iter().filter(|r| !r.is_ghost()).collect();
-        let keys: Vec<SortKey> = live.iter().map(|r| column.sort_key(r, ctx)).collect();
-        let descending = column.default_descending();
-        let mut order: Vec<usize> = (0..live.len()).collect();
-        order.sort_unstable_by(|&a, &b| {
-            keys[a]
-                .cmp_directed(&keys[b], descending)
-                .then_with(|| tiebreak(&live[a].key(), &live[b].key()))
-        });
-        order.into_iter().take(n).map(|i| live[i].key()).collect()
     }
 
     fn visible(&self, row: &Row, spec: &ViewSpec<'_>) -> bool {
@@ -933,40 +801,6 @@ mod tests {
         assert_eq!(s.descendants(&key(20)), vec![key(21)]);
         assert!(s.ancestors(&key(999)).is_empty());
         assert!(s.descendants(&key(999)).is_empty());
-        let agg = s.subtree_aggregate(&key(10));
-        assert_eq!(agg.processes, 3);
-        assert_eq!(agg.mem_rss, (10 + 11 + 12) * 1024);
-    }
-
-    #[test]
-    fn queries() {
-        let mut s = sample_store();
-        let mut map = ProcessMap::new();
-        let mut info = ProcessInfo::new(5, "Cargo".into());
-        info.download_rate = 100;
-        info.upload_rate = 7;
-        map.insert(5, info);
-        s.merge_network(&map);
-        let t = s.totals();
-        assert_eq!(t.processes, 5);
-        assert_eq!(t.threads, 10);
-        assert!((t.cpu_percent - 61.5).abs() < 1e-4);
-        assert_eq!(t.mem_rss, (1 + 20 + 3 + 40 + 5) * 1024);
-        assert_eq!((t.net_down, t.net_up), (100, 7));
-        assert_eq!(s.users(), vec!["alice".to_string(), "root".to_string()]);
-        assert_eq!(s.find_by_name("cargo"), vec![key(5)]);
-        assert!(s.find_by_name("  ").is_empty());
-        assert!(s.find_by_name("carg").is_empty());
-        let ctx = ColumnCtx::default();
-        assert_eq!(
-            s.top_by(ColumnId::Cpu, 3, &ctx),
-            vec![key(5), key(3), key(20)]
-        );
-        assert_eq!(s.top_by(ColumnId::Name, 2, &ctx), vec![key(3), key(5)]);
-        assert_eq!(s.top_by(ColumnId::NetDown, 1, &ctx), vec![key(5)]);
-        assert!(s.top_by(ColumnId::Cpu, 0, &ctx).is_empty());
-        assert_eq!(s.top_by(ColumnId::Cpu, 99, &ctx).len(), 5);
-        assert_eq!(ProcessStore::new().totals(), Totals::default());
     }
 
     #[test]

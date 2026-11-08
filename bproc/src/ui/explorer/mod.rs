@@ -383,7 +383,12 @@ impl ExplorerState {
         let header = Rect::new(area.x, y, area.width, header_h);
         y += header_h;
         let toolbar_h = u16::from(area.height > header_h + 2);
-        let search_w = (area.width / 3).clamp(18.min(area.width), 48);
+        // An idle, empty box gives its room to the toolbar tabs and chips.
+        let search_w = if self.search.text.is_empty() && !self.search.focused {
+            (area.width / 4).clamp(14.min(area.width), 40)
+        } else {
+            (area.width / 3).clamp(18.min(area.width), 48)
+        };
         let toolbar = Rect::new(area.x, y, area.width.saturating_sub(search_w), toolbar_h);
         let search = Rect::new(area.x + toolbar.width, y, search_w, toolbar_h);
         y += toolbar_h;
@@ -409,7 +414,10 @@ impl ExplorerState {
                     )
                 }
                 DockPosition::Right => {
-                    let w = (self.settings.dock_size * 4)
+                    let w = self
+                        .settings
+                        .dock_size
+                        .saturating_mul(4)
                         .clamp(30, main.width.saturating_sub(40).max(30))
                         .min(main.width);
                     (
@@ -821,11 +829,7 @@ impl ExplorerState {
                 if targets.is_empty() {
                     self.flash("Select a process first");
                 } else {
-                    self.overlays.push(overlays::renice_dialog(
-                        self,
-                        targets,
-                        action == Action::NiceUp,
-                    ));
+                    overlays::open_renice(self, targets, action == Action::NiceUp);
                 }
             }
             Action::Signal => {
@@ -889,6 +893,14 @@ impl ExplorerState {
                     self.detail.close();
                 } else if !self.table.marked().is_empty() {
                     self.table.clear_marks();
+                } else {
+                    // Nothing else wanted Esc: dismiss the newest notification.
+                    toasts::dismiss_newest(self);
+                }
+            }
+            Action::RunToast => {
+                if !toasts::run_newest_action(self) {
+                    self.flash("No notification with an action");
                 }
             }
             Action::ToggleDock => {
@@ -917,7 +929,12 @@ impl ExplorerState {
                 if let Some(key) = selected {
                     let mut keys = vec![key];
                     keys.extend(self.store.descendants(&key));
+                    // A marked bproc would become a signal target.
+                    let (keys, skipped_self) = crate::procs::actions::exclude_self(keys);
                     self.table.mark_all(keys);
+                    if skipped_self {
+                        self.flash("bproc itself is never marked");
+                    }
                 }
             }
             Action::ClearMarks => self.table.clear_marks(),

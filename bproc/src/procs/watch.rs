@@ -328,9 +328,10 @@ impl Comparison {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WatchAction {
     /// Toast + event log entry.
+    #[default]
     Notify,
     /// Event log only.
     Log,
@@ -348,25 +349,41 @@ impl WatchAction {
     }
 }
 
+/// Optional fields fall back to the editor defaults, so hand-written or
+/// older rules missing them still load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchRule {
     pub id: u64,
     pub name: String,
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub target: WatchTarget,
     pub metric: WatchMetric,
     pub comparison: Comparison,
     pub threshold: f64,
     /// Condition must hold continuously this long before firing.
+    #[serde(default = "default_sustain_secs")]
     pub sustain_secs: u64,
     /// Minimum time between firings for the same process. 0 fires once per
     /// episode (again only after the condition has cleared).
+    #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    #[serde(default)]
     pub action: WatchAction,
 }
 
 pub const DEFAULT_SUSTAIN_SECS: u64 = 10;
 pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
+
+fn default_enabled() -> bool {
+    true
+}
+fn default_sustain_secs() -> u64 {
+    DEFAULT_SUSTAIN_SECS
+}
+fn default_cooldown_secs() -> u64 {
+    DEFAULT_COOLDOWN_SECS
+}
 
 impl WatchRule {
     /// A rule with editor defaults: enabled, 10s sustain, 60s cooldown, notify.
@@ -661,17 +678,6 @@ impl WatchEngine {
         keys.dedup();
         keys
     }
-    /// Rules a process currently violates (for detail views and tooltips).
-    pub fn alerting_rules(&self, key: &ProcessKey) -> Vec<u64> {
-        let mut ids: Vec<u64> = self
-            .trackers
-            .iter()
-            .filter(|((_, k), t)| k == key && t.sustained)
-            .map(|((id, _), _)| *id)
-            .collect();
-        ids.sort();
-        ids
-    }
     pub fn rule(&self, id: u64) -> Option<&WatchRule> {
         self.rules.iter().find(|r| r.id == id)
     }
@@ -686,6 +692,7 @@ impl WatchEngine {
             None => self.rules.push(rule),
         }
     }
+    /// Delete a rule and its tracking state.
     pub fn remove(&mut self, id: u64) -> Option<WatchRule> {
         self.forget(id);
         let index = self.rules.iter().position(|r| r.id == id)?;
@@ -845,6 +852,19 @@ mod tests {
         )
         .with_sustain(sustain)
         .with_cooldown(cooldown)
+    }
+
+    #[test]
+    fn rules_missing_optional_fields_load_with_editor_defaults() {
+        let rule: WatchRule = serde_json::from_str(
+            r#"{"id":1,"name":"n","target":"Any","metric":"CpuPercent",
+                "comparison":"Above","threshold":80.0}"#,
+        )
+        .unwrap();
+        assert!(rule.enabled);
+        assert_eq!(rule.sustain_secs, DEFAULT_SUSTAIN_SECS);
+        assert_eq!(rule.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+        assert_eq!(rule.action, WatchAction::Notify);
     }
 
     #[test]
@@ -1130,7 +1150,7 @@ mod tests {
         let mut sim = Sim::new();
         let snap = sim.tick(0, vec![entry(&node, 99.0)]);
         assert_eq!(engine.evaluate(&snap, &sim.store).len(), 2);
-        assert_eq!(engine.alerting_rules(&node.key), vec![1, 2]);
+        assert_eq!(engine.alerting(), vec![node.key]);
         engine.rules[0].enabled = false;
         engine.rules.retain(|r| r.id != 2);
         let snap = sim.tick(1, vec![entry(&node, 99.0)]);

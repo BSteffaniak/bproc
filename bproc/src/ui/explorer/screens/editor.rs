@@ -141,6 +141,21 @@ pub fn action_label(action: WatchAction) -> String {
     }
 }
 
+/// The signal a rule sends when its target is every process: `Any`, or a
+/// name / command / user that is empty or only `*`.
+pub fn signals_broadly(rule: &WatchRule) -> Option<Signal> {
+    let WatchAction::Signal(signal) = rule.action else {
+        return None;
+    };
+    let wildcard = |v: &str| v.trim().chars().all(|c| c == '*');
+    let broad = match &rule.target {
+        WatchTarget::Any => true,
+        WatchTarget::Name(v) | WatchTarget::Command(v) | WatchTarget::User(v) => wildcard(v),
+        WatchTarget::Process { .. } => false,
+    };
+    broad.then_some(signal)
+}
+
 /// How a metric's threshold is entered and displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
@@ -657,23 +672,42 @@ impl EditorForm {
         })
     }
 
-    /// Validate and store the rule. Returns true when saved.
+    /// Validate and store the rule. Returns true when saved. A rule that
+    /// would signal every process (see [`signals_broadly`]) is not saved
+    /// yet: a confirmation naming the signal and condition opens instead.
     pub fn save(&mut self, state: &mut ExplorerState) -> bool {
+        self.save_inner(state, false)
+    }
+
+    /// [`save`](Self::save) after the broad-signal confirmation.
+    pub fn save_confirmed(&mut self, state: &mut ExplorerState) -> bool {
+        self.save_inner(state, true)
+    }
+
+    fn save_inner(&mut self, state: &mut ExplorerState, confirmed: bool) -> bool {
         let id = self.id.unwrap_or_else(|| state.watch.next_id());
         match self.build(id) {
             Ok(rule) => {
+                if !confirmed && let Some(signal) = signals_broadly(&rule) {
+                    let menu = super::super::overlays::menus::confirm_broad_signal(
+                        state,
+                        signal,
+                        &self.summary(),
+                    );
+                    state
+                        .overlays
+                        .push(super::super::overlays::Overlay::Menu(menu));
+                    return false;
+                }
                 let name = rule.name.clone();
-                let rules = &mut state.watch.rules;
-                let index = match rules.iter().position(|r| r.id == id) {
-                    Some(i) => {
-                        rules[i] = rule;
-                        i
-                    }
-                    None => {
-                        rules.push(rule);
-                        rules.len() - 1
-                    }
-                };
+                // An edited rule starts tracking afresh.
+                state.watch.upsert(rule);
+                let index = state
+                    .watch
+                    .rules
+                    .iter()
+                    .position(|r| r.id == id)
+                    .unwrap_or_default();
                 state.watches_view.selected = index;
                 state.request(UiRequest::SaveSettings);
                 state.flash(if self.id.is_some() {
@@ -1426,5 +1460,47 @@ mod tests {
             }
         }
         assert_eq!(decode(999), None);
+    }
+
+    #[test]
+    fn broad_signal_rules_confirm_before_saving() {
+        use super::super::super::overlays::Overlay;
+        use super::super::super::overlays::menu::MenuCommand;
+        let mut state = ExplorerState::default();
+        let mut e = EditorForm::blank(None);
+        e.target = TargetKind::Any;
+        e.action = WatchAction::Signal(Signal::Kill);
+        assert!(!e.save(&mut state), "not saved yet");
+        assert!(state.watch.rules.is_empty());
+        let Some(Overlay::Menu(menu)) = state.overlays.last() else {
+            panic!("confirmation expected")
+        };
+        let text: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        let text = text.join("\n");
+        assert!(text.contains("SIGKILL"), "{text}");
+        assert!(text.contains("any process CPU > 80%"), "{text}");
+        // Confirming (the menu closed, the editor on top) saves it.
+        state.overlays.clear();
+        state.overlays.push(Overlay::WatchEditor(e.into()));
+        super::super::super::overlays::menus::execute(
+            &MenuCommand::ConfirmWatchSave,
+            None,
+            &[],
+            &mut state,
+        );
+        assert_eq!(state.watch.rules.len(), 1);
+        assert!(state.overlays.is_empty(), "the editor closes once saved");
+
+        // Narrow targets and non-signal actions save directly.
+        let mut state = ExplorerState::default();
+        let mut e = EditorForm::blank(None);
+        e.value = TextInput::new("node");
+        e.action = WatchAction::Signal(Signal::Term);
+        assert!(e.save(&mut state));
+        let mut e = EditorForm::blank(None);
+        e.value = TextInput::new("*");
+        assert!(e.save(&mut state), "notify on everything is harmless");
+        e.action = WatchAction::Signal(Signal::Term);
+        assert!(!e.save(&mut state), "'*' signals everything");
     }
 }

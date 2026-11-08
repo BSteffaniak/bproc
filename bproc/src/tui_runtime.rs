@@ -1,6 +1,5 @@
 //! BMUX owns scheduling, terminal ingress, and committed presentation. All kernel/config
 //! effects are serialized by `services`; update only performs local state transitions.
-mod export_file;
 mod services;
 use crate::backends::throttle::{BackendInfo, ThrottleManager};
 use crate::{
@@ -416,6 +415,9 @@ enum Message {
     DeepDetailFailed(crate::procs::ProcessKey),
     Report(crate::procs::actions::ActionReport),
     Exported(std::result::Result<std::path::PathBuf, String>),
+    /// SIGTERM / SIGHUP arrived: leave through the normal exit path so the
+    /// terminal is restored and throttles are removed.
+    ExitSignal(&'static str),
 }
 struct Application {
     app: AppState,
@@ -609,7 +611,8 @@ impl Application {
                     );
                     update.commands.push(Command::concurrent(async move {
                         let written = tokio::task::spawn_blocking(move || {
-                            export_file::write(&contents, format).map_err(|e| e.to_string())
+                            crate::procs::export::write(&contents, format, None)
+                                .map_err(|e| e.to_string())
                         })
                         .await
                         .ok()?;
@@ -964,6 +967,10 @@ impl Program for Application {
             RuntimeEvent::Message(Message::MonitorClosed) => {
                 anyhow::bail!("monitor update channel closed")
             }
+            RuntimeEvent::Message(Message::ExitSignal(name)) => {
+                log::info!("{name} received; exiting");
+                update.lifecycle = Lifecycle::Exit;
+            }
             RuntimeEvent::Message(Message::InputFailed(error) | Message::EffectFailed(error)) => {
                 anyhow::bail!("{error}")
             }
@@ -987,6 +994,57 @@ pub(super) struct Startup {
     pub procs: tokio::sync::mpsc::Receiver<crate::procs::ProcSnapshot>,
 }
 
+/// SIGTERM / SIGHUP listeners for the TUI session.
+struct ExitSignals {
+    #[cfg(unix)]
+    streams: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl ExitSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let streams = match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::hangup()),
+            ) {
+                (Ok(term), Ok(hup)) => Some((term, hup)),
+                (Err(e), _) | (_, Err(e)) => {
+                    log::warn!("cannot listen for SIGTERM/SIGHUP: {e}");
+                    None
+                }
+            };
+            Self { streams }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Send [`Message::ExitSignal`] through `handle` when a signal arrives.
+    fn forward(
+        self,
+        handle: bmux_tui_runtime::RuntimeHandle<Message>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        #[cfg(unix)]
+        {
+            let (mut term, mut hup) = self.streams?;
+            Some(tokio::spawn(async move {
+                let name = tokio::select! {
+                    _ = term.recv() => "SIGTERM",
+                    _ = hup.recv() => "SIGHUP",
+                };
+                let _ = handle.send(Message::ExitSignal(name)).await;
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+}
+
 pub(super) async fn run(startup: Startup) -> Result<()> {
     let Startup {
         app,
@@ -1000,6 +1058,10 @@ pub(super) async fn run(startup: Startup) -> Result<()> {
         collector,
         procs,
     } = startup;
+    // Registered before the terminal enters raw mode, so a SIGTERM / SIGHUP
+    // can never take the default action (die with the terminal raw and
+    // throttles installed) once the TUI is up.
+    let exit_signals = ExitSignals::register();
     let setup = (|| -> Result<_> {
         let size = bmux_tui::crossterm::terminal_size()?;
         let guard = bmux_tui::crossterm::CrosstermTerminalGuard::enter(std::io::stdout())?;
@@ -1072,8 +1134,12 @@ pub(super) async fn run(startup: Startup) -> Result<()> {
     let mut input = TerminalInput::start::<Application>(handle.clone(), |error| {
         Message::InputFailed(error.to_string())
     });
+    let exit_signals = exit_signals.forward(handle.clone());
     let _ = handle.send(Message::Start).await;
     let result = runtime.run().await;
+    if let Some(task) = exit_signals {
+        task.abort();
+    }
     // Never restore the terminal while a managed reader still owns stdin.
     input.shutdown().await;
     let (mut output, runtime_error) = match result {
@@ -1417,6 +1483,21 @@ mod tests {
             Lifecycle::Exit
         );
     }
+    #[test]
+    fn exit_signals_take_the_normal_exit_path() {
+        for name in ["SIGTERM", "SIGHUP"] {
+            let mut program = application();
+            program
+                .app
+                .explorer
+                .run(ui::explorer::actions::Action::Settings);
+            let update = program
+                .update(RuntimeEvent::Message(Message::ExitSignal(name)))
+                .unwrap();
+            assert_eq!(update.lifecycle, Lifecycle::Exit);
+        }
+    }
+
     #[test]
     fn ctrl_c_precedes_every_modal() {
         let open: [fn(&mut Application); 6] = [

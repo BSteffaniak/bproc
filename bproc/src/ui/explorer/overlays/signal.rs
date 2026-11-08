@@ -5,7 +5,7 @@ use super::super::{ExplorerState, UiRequest};
 use super::OverlayOutcome;
 use super::widgets::{self, Button, Target};
 use crate::procs::ProcessKey;
-use crate::procs::actions::{ActionRequest, Signal};
+use crate::procs::actions::{self, ActionRequest, Signal};
 use bmux_keyboard::KeyCode;
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -15,30 +15,27 @@ pub const CHILDREN: u16 = 1;
 pub const CANCEL: u16 = 2;
 pub const SEND: u16 = 3;
 
+/// Suffix for a target that is not a row of the visible table.
+const HIDDEN: &str = "  (hidden by filter)";
 /// Targets listed by name before collapsing into "and N more".
 const LISTED: usize = 4;
 /// Signalling more processes than this (with children) asks twice.
 pub const LARGE_TREE: usize = 50;
 
-/// Whether `key` is this bproc process. bproc never signals itself: doing so
-/// mid-list stops the remaining targets and leaves the terminal in raw mode.
+/// Whether `key` is this bproc process (see [`actions::is_self`]).
 pub fn is_self(key: &ProcessKey) -> bool {
-    i64::from(key.pid) == i64::from(std::process::id())
+    actions::is_self(key.pid)
 }
 
-/// Processes whose tree is (almost) everything: init / launchd, the kernel
-/// swapper and, on Linux, kthreadd. "Kill process tree" is never offered
-/// for them.
+/// "Kill process tree" is never offered for these (see
+/// [`actions::is_system_root`]).
 pub fn is_system_root(pid: i32) -> bool {
-    pid <= 1 || (cfg!(target_os = "linux") && pid == 2)
+    actions::is_system_root(pid)
 }
 
 /// `keys` without bproc itself; the flag says whether it was present.
 pub fn without_self(keys: Vec<ProcessKey>) -> (Vec<ProcessKey>, bool) {
-    let before = keys.len();
-    let kept: Vec<ProcessKey> = keys.into_iter().filter(|k| !is_self(k)).collect();
-    let removed = kept.len() != before;
-    (kept, removed)
+    actions::exclude_self(keys)
 }
 
 pub struct SignalDialog {
@@ -181,6 +178,8 @@ impl SignalDialog {
     fn summary(&self, state: &ExplorerState) -> Vec<(String, Style)> {
         let text = widgets::body();
         let muted = widgets::muted();
+        // Targets the user cannot see in the table are called out by name.
+        let hidden = |key: &ProcessKey| state.hidden_targets(std::slice::from_ref(key)) > 0;
         if let [key] = self.targets.as_slice() {
             let row = state.store.get(key);
             let mut first = format!("{}  ·  PID {}", state.name_of(key), key.pid);
@@ -189,6 +188,9 @@ impl SignalDialog {
             }
             if row.is_some_and(|r| r.is_ghost()) {
                 first.push_str("  (exited)");
+            }
+            if hidden(key) {
+                first.push_str(HIDDEN);
             }
             let mut lines = vec![(first, text.patch(theme::bold()))];
             if let Some(r) = row {
@@ -199,12 +201,18 @@ impl SignalDialog {
             }
             return lines;
         }
-        let mut lines = vec![(
-            format!("{} processes", self.targets.len()),
-            text.patch(theme::bold()),
-        )];
+        let mut header = format!("{} processes", self.targets.len());
+        let hidden_count = state.hidden_targets(&self.targets);
+        if hidden_count > 0 {
+            header.push_str(&format!("  ({hidden_count} hidden by filter)"));
+        }
+        let mut lines = vec![(header, text.patch(theme::bold()))];
         for key in self.targets.iter().take(LISTED) {
-            lines.push((format!("• {}  ({})", state.name_of(key), key.pid), text));
+            let mut line = format!("• {}  ({})", state.name_of(key), key.pid);
+            if hidden(key) {
+                line.push_str(HIDDEN);
+            }
+            lines.push((line, text));
         }
         if self.targets.len() > LISTED {
             lines.push((format!("and {} more", self.targets.len() - LISTED), muted));

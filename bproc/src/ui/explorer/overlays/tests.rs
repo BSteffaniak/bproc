@@ -250,6 +250,13 @@ fn keyboard_navigation_skips_headers_separators_and_disabled() {
     assert_eq!(menu(&state).cursor, vec![Some(1)]);
     press(&mut state, KeyCode::End);
     assert_eq!(menu(&state).cursor, vec![Some(6)]);
+    // Tab moves forward, Shift+Tab backward.
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(menu(&state).cursor, vec![Some(1)]);
+    press_shift(&mut state, KeyCode::Tab);
+    assert_eq!(menu(&state).cursor, vec![Some(6)]);
+    press_shift(&mut state, KeyCode::Tab);
+    assert_eq!(menu(&state).cursor, vec![Some(5)]);
 }
 
 #[test]
@@ -1159,7 +1166,7 @@ fn every_overlay(state: &ExplorerState) -> Vec<Overlay> {
         filter_menu(state),
         export_menu(state),
         column_chooser(state),
-        renice_dialog(state, vec![key(100)], true),
+        Overlay::Renice(ReniceDialog::new(state, vec![key(100)], Some(true))),
         signal_dialog(state, vec![key(100), key(200)], Signal::Term),
         Overlay::Affinity(AffinityDialog::with_mask(12, vec![key(100)], None)),
     ]
@@ -1714,5 +1721,59 @@ fn affinity_menu_item_follows_platform_support() {
     assert_eq!(
         matches!(state.overlays.last(), Some(Overlay::Affinity(_))),
         crate::procs::actions::affinity_supported()
+    );
+}
+
+// ---- targets hidden by the filter ----------------------------------------------------
+
+#[test]
+fn menu_signals_to_hidden_targets_always_confirm_and_name_them() {
+    let mut state = fixture();
+    state.settings.confirm_signals = false;
+    state.search.set_text("zsh");
+    state.table.mark_all(vec![key(200), key(100)]);
+    // The menu acts on every mark, including nginx hidden by the filter.
+    let Overlay::Menu(menu) = process_menu(&state, key(200), Point::new(5, 5)) else {
+        unreachable!()
+    };
+    assert_eq!(menu.targets, vec![key(200), key(100)]);
+    super::menus::execute(
+        &MenuCommand::Signal(Signal::Hup),
+        Some(key(200)),
+        &menu.targets,
+        &mut state,
+    );
+    assert!(state.take_requests().is_empty(), "never sent unseen");
+    assert_eq!(signal(&state).targets, vec![key(200), key(100)]);
+    let text = screen(&render(&mut state, 100, 40));
+    assert!(text.contains("1 hidden by filter"), "{text}");
+    assert!(text.contains("nginx  (100)  (hidden by filter)"), "{text}");
+    assert!(!text.contains("zsh  (200)  (hidden"), "{text}");
+
+    // Every target visible: sent directly (confirmation off).
+    state.overlays.clear();
+    state.search.clear();
+    state.table.mark_dirty();
+    super::menus::execute(
+        &MenuCommand::Signal(Signal::Hup),
+        Some(key(200)),
+        &[key(200), key(100)],
+        &mut state,
+    );
+    assert!(state.overlays.is_empty());
+    assert_eq!(state.take_requests().len(), 1);
+}
+
+#[test]
+fn mark_tree_never_marks_bproc_itself() {
+    let (mut state, me) = fixture_with_self();
+    state.table.select(key(200));
+    state.run(crate::ui::explorer::actions::Action::MarkTree);
+    let marked = state.table.marked();
+    assert!(marked.contains(&key(200)));
+    assert!(!marked.contains(&me));
+    assert!(
+        marked.contains(&key(me.pid + 100_000)),
+        "its children still mark"
     );
 }

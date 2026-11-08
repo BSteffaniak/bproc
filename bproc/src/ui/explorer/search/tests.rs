@@ -323,3 +323,42 @@ fn status_label_names_the_filter_actually_applied() {
     bar.set_text("cpu>>5");
     assert!(bar.status_label(24).unwrap().ends_with("showing all"));
 }
+
+#[test]
+fn narrow_boxes_use_a_shorter_placeholder() {
+    let mut state = named();
+    let row = render_search(&mut state, Rect::new(0, 0, 20, 1)).row(0);
+    assert!(row.contains("⌕ Search  /"), "{row}");
+    assert!(!row.contains("e.g."), "never a clipped example: {row}");
+    let row = render_search(&mut state, Rect::new(0, 0, 8, 1)).row(0);
+    assert!(row.contains("⌕ Find"), "{row}");
+    let row = render_search(&mut state, Rect::new(0, 0, 4, 1)).row(0);
+    assert_eq!(row.trim_end(), "⌕", "{row}");
+}
+
+#[test]
+fn idle_empty_box_shrinks_at_medium_widths() {
+    let mut state = named();
+    let area = Rect::new(0, 0, 100, 30);
+    assert_eq!(state.layout(area).search.width, 25);
+    state.search.focused = true;
+    assert_eq!(state.layout(area).search.width, 33);
+    state.search.focused = false;
+    state.search.set_text("node");
+    assert_eq!(state.layout(area).search.width, 33);
+}
+
+#[test]
+fn near_miss_field_shows_a_non_fatal_hint() {
+    let mut state = named();
+    state.search.set_text("usr:root");
+    assert!(state.search.error.is_none());
+    let hint = state.search.hint().expect("hint").to_string();
+    assert!(hint.contains("did you mean user:?"), "{hint}");
+    let label = state.search.status_label(24).unwrap();
+    assert!(label.contains("did you mean user:?"), "{label}");
+    let row = render_search(&mut state, Rect::new(0, 0, 80, 1)).row(0);
+    assert!(row.contains("did you mean"), "{row}");
+    state.search.set_text("node");
+    assert!(state.search.hint().is_none());
+}

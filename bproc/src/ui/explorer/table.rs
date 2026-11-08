@@ -56,6 +56,9 @@ pub struct TableView {
     pinned: Vec<ProcessKey>,
     collapsed: HashSet<ProcessKey>,
     frozen: Option<Vec<ProcessKey>>,
+    /// The last refresh held the row order for hover freeze (painters
+    /// cannot ask `hovering_table` mid-frame: the hit map is being rebuilt).
+    hover_paused: bool,
     scroll: usize,
     dirty: bool,
     /// Body rows painted last frame (paging and wheel clamping).
@@ -107,6 +110,7 @@ impl TableView {
             pinned: Vec::new(),
             collapsed: HashSet::new(),
             frozen: None,
+            hover_paused: false,
             scroll: 0,
             dirty: true,
             body_height: 0,
@@ -123,7 +127,6 @@ impl TableView {
             traffic,
             now_ms: store.acquired_at_ms(),
             mem_total: store.system().mem_total,
-            cpu_count: store.system().cpus.len().max(1),
         }
     }
     pub fn mark_dirty(&mut self) {
@@ -140,6 +143,7 @@ impl TableView {
         uid: Option<u32>,
         hovering: bool,
     ) {
+        self.hover_paused = hovering && self.frozen.is_none();
         if !self.dirty {
             return;
         }
@@ -303,6 +307,10 @@ impl TableView {
             self.pinned.push(key);
             true
         }
+    }
+    /// Whether hover freeze is holding the row order right now.
+    pub fn is_hover_paused(&self) -> bool {
+        self.hover_paused
     }
     pub fn is_frozen(&self) -> bool {
         self.frozen.is_some()
@@ -879,6 +887,9 @@ fn fit_user_width(state: &ExplorerState) -> Option<u16> {
     auto_user_width(names.iter().map(String::as_str))
 }
 
+/// Shown after the sort arrow while hover freeze holds the row order.
+pub const SORT_PAUSED: &str = "⏸";
+
 fn draw_header(
     frame: &mut Frame<'_, '_, '_>,
     area: Rect,
@@ -889,6 +900,8 @@ fn draw_header(
     let header = Rect::new(area.x, area.y, area.width, 1);
     frame.fill(header, theme::header());
     let sort = state.table.sort;
+    // Hover freeze holds the row order: say so next to the sort arrow.
+    let paused = state.table.is_hover_paused();
     let hovered_edge = state.pointer.position.and_then(|p| {
         (p.y == area.y)
             .then(|| state.hits.at(p))
@@ -916,13 +929,23 @@ fn draw_header(
         let title = slot.column.title();
         let label = if active {
             let arrow = if sort.descending { "▼" } else { "▲" };
-            let full = format!("{title}{arrow}");
+            let mark = if paused {
+                format!("{arrow}{SORT_PAUSED}")
+            } else {
+                arrow.to_string()
+            };
+            let mark_w = display_width(&mark);
+            let full = format!("{title}{mark}");
             if display_width(&full) <= width {
                 full
-            } else if width <= 2 {
-                arrow.to_string()
+            } else if width <= mark_w + 1 {
+                if width >= mark_w {
+                    mark
+                } else {
+                    arrow.to_string()
+                }
             } else {
-                format!("{}{arrow}", truncate(title, width - 1))
+                format!("{}{mark}", truncate(title, width - mark_w))
             }
         } else {
             title.to_string()

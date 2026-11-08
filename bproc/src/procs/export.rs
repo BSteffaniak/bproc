@@ -147,14 +147,12 @@ fn number(v: f64) -> Value {
 /// Most numbered variants tried when exports collide within one second.
 const MAX_SUFFIX: u32 = 100;
 
-/// Write an export to `dir` and return its absolute path.
+/// Write an export to `dir` (default: [`default_dir`]) and return its
+/// absolute path.
 ///
-/// Without `dir` the file goes to the current directory, or, when running as
-/// root, to the invoking account's downloads/home directory so `sudo bproc`
-/// in a shared directory (`/tmp`) does not write where others can plant
-/// files. The file is always created fresh (`O_EXCL`): an existing file or
-/// symlink is never followed or overwritten; a `-1`, `-2`, … suffix is added
-/// instead.
+/// The file is always created fresh (`O_EXCL`): an existing file or symlink
+/// is never followed or overwritten; a `-1`, `-2`, … suffix is added
+/// instead. Under `sudo` the file is handed to the invoking user.
 pub fn write(contents: &str, format: ExportFormat, dir: Option<&Path>) -> std::io::Result<PathBuf> {
     let dir = match dir {
         Some(d) => d.to_path_buf(),
@@ -185,6 +183,7 @@ fn write_new(dir: &Path, stamp: &str, ext: &str, contents: &str) -> std::io::Res
         {
             Ok(mut file) => {
                 file.write_all(contents.as_bytes())?;
+                crate::config::chown_to_invoker(&path);
                 return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -197,27 +196,20 @@ fn write_new(dir: &Path, stamp: &str, ext: &str, contents: &str) -> std::io::Res
     ))
 }
 
+/// Where exports land: the (invoking user's) downloads directory, else
+/// their home, else the working directory. Never the working directory
+/// first, so `sudo bproc` started in a shared directory (`/tmp`) does not
+/// write where others can plant files.
 fn default_dir() -> PathBuf {
-    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if running_as_root() {
-        dirs::download_dir()
-            .filter(|d| d.is_dir())
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(cwd)
-    } else {
-        cwd()
-    }
-}
-
-#[cfg(unix)]
-fn running_as_root() -> bool {
-    // SAFETY: geteuid has no preconditions.
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(not(unix))]
-fn running_as_root() -> bool {
-    false
+    [
+        crate::config::invoking_download_dir(),
+        crate::config::invoking_home_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|d| d.is_dir())
+    .or_else(|| std::env::current_dir().ok())
+    .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -447,6 +439,13 @@ mod tests {
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("csv"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\r\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_dir_is_an_existing_directory() {
+        let dir = default_dir();
+        assert!(dir.is_dir(), "{dir:?}");
+        assert!(std::path::absolute(&dir).unwrap().is_absolute());
     }
 
     #[test]

@@ -15,6 +15,8 @@ use bmux_tui::text_width::display_width;
 mod tests;
 
 pub const PLACEHOLDER: &str = "Search  /   e.g. node  cpu>5  user:me";
+/// Placeholders for narrower boxes, widest first.
+const SHORT_PLACEHOLDERS: [&str; 2] = ["Search  /", "Find"];
 const ICON: &str = "⌕ ";
 const CLEAR: &str = "✕";
 
@@ -37,6 +39,15 @@ impl SearchBar {
     pub fn filter(&self) -> Option<&Filter> {
         self.filter.as_ref()
     }
+    /// Advice for a query that parsed but may not mean what was typed
+    /// (e.g. "searching text 'usr:'; did you mean user:?"). `None` while the
+    /// text has an error (the applied filter is then an older query).
+    pub fn hint(&self) -> Option<&str> {
+        if self.error.is_some() {
+            return None;
+        }
+        self.filter.as_ref().and_then(Filter::hint)
+    }
     pub fn set_text(&mut self, text: &str) {
         self.text = text.to_string();
         self.cursor = self.text.chars().count();
@@ -54,16 +65,18 @@ impl SearchBar {
     /// Status-line description of the filter actually applied. When the
     /// typed text does not parse, the table keeps the last valid filter, so
     /// this names that filter (not the invalid text) and includes the error.
+    /// A parse [`hint`](Self::hint) is appended as a non-fatal note.
     /// `None` when the box is empty.
-    // Consumed by the status line (chrome.rs) once it switches over.
-    #[allow(dead_code)]
     pub fn status_label(&self, max: usize) -> Option<String> {
         let text = self.text.trim();
         if text.is_empty() {
             return None;
         }
         Some(match &self.error {
-            None => format!("filter: {}", truncate(text, max)),
+            None => match self.hint() {
+                Some(hint) => format!("filter: {} ({hint})", truncate(text, max)),
+                None => format!("filter: {}", truncate(text, max)),
+            },
             Some(err) => {
                 let showing = match self.filter() {
                     Some(f) => format!("showing \"{}\"", truncate(f.source().trim(), max)),
@@ -229,9 +242,15 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
         text_end = x;
     }
     if has_text {
-        let note = match &state.search.error {
-            Some(e) => Some((e.clone(), bg.patch(theme::error()))),
-            None => {
+        let note = match (&state.search.error, state.search.hint()) {
+            (Some(e), _) => Some((e.clone(), bg.patch(theme::error()))),
+            // The box is narrow: lead with the suggestion ("did you mean
+            // user:?"); the status line carries the full hint.
+            (None, Some(hint)) => {
+                let short = hint.rsplit("; ").next().unwrap_or(hint);
+                Some((short.to_string(), bg.patch(theme::warn())))
+            }
+            (None, None) => {
                 let shown = state.table.rows().iter().filter(|r| !r.ghost).count();
                 let total = state.store.len_live();
                 Some((format!("{shown}/{total}"), bg.patch(theme::dim())))
@@ -258,8 +277,8 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
     if !has_text {
         state.search.offset = 0;
         if !focused || text_w > 0 {
-            let hint = truncate(PLACEHOLDER, usize::from(text_w));
-            frame.text(text_rect, &hint, bg.patch(theme::dim()));
+            let hint = placeholder(usize::from(text_w));
+            frame.text(text_rect, hint, bg.patch(theme::dim()));
         }
     } else {
         state.search.scroll_to_cursor(usize::from(text_w));
@@ -306,6 +325,15 @@ pub fn draw(frame: &mut Frame<'_, '_, '_>, area: Rect, state: &mut ExplorerState
             .min(text_x + text_w - 1);
         frame.cx.set_cursor(Point::new(x, area.y), true);
     }
+}
+
+/// The widest placeholder that fits `width` cells whole (never a clipped
+/// example query); empty when even the shortest does not fit.
+fn placeholder(width: usize) -> &'static str {
+    std::iter::once(PLACEHOLDER)
+        .chain(SHORT_PLACEHOLDERS)
+        .find(|p| display_width(p) <= width)
+        .unwrap_or("")
 }
 
 /// Clip to `width` cells without an ellipsis (the cursor scrolls the view).

@@ -648,9 +648,7 @@ pub fn new_rule_editor(state: &ExplorerState) -> Overlay {
 pub fn edit_rule_editor(state: &ExplorerState, id: u64) -> Option<Overlay> {
     state
         .watch
-        .rules
-        .iter()
-        .find(|r| r.id == id)
+        .rule(id)
         .map(|r| Overlay::WatchEditor(EditorForm::from_rule(r).into()))
 }
 
@@ -958,15 +956,15 @@ fn selected_rule_id(state: &ExplorerState) -> Option<u64> {
 }
 
 fn toggle_rule(state: &mut ExplorerState, index: usize) {
-    let Some(rule) = state.watch.rules.get_mut(index) else {
+    let Some(rule) = state.watch.rules.get(index) else {
         return;
     };
-    rule.enabled = !rule.enabled;
-    let message = format!(
-        "{} “{}”",
-        if rule.enabled { "Enabled" } else { "Disabled" },
-        rule.name
-    );
+    let (id, name) = (rule.id, rule.name.clone());
+    // Through the engine so the rule's alert state restarts.
+    let Some(enabled) = state.watch.toggle(id) else {
+        return;
+    };
+    let message = format!("{} “{name}”", if enabled { "Enabled" } else { "Disabled" });
     state.request(UiRequest::SaveSettings);
     state.flash(message);
 }
@@ -983,7 +981,9 @@ fn delete_selected(state: &mut ExplorerState) {
         return;
     }
     let index = state.watches_view.selected;
-    let rule = state.watch.rules.remove(index);
+    let Some(rule) = state.watch.remove(id) else {
+        return;
+    };
     state.watches_view.confirm_delete = None;
     state.watches_view.selected = index.min(state.watch.rules.len().saturating_sub(1));
     state.request(UiRequest::SaveSettings);

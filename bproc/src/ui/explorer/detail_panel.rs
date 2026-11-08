@@ -834,7 +834,7 @@ pub fn handle_key(state: &mut ExplorerState, key: &KeyStroke) -> Outcome {
         KeyCode::Escape => {
             panel.set_full(false);
             if let Some(k) = panel.key() {
-                state.table.select(k);
+                state.select_visible(k);
             }
         }
         _ => return Outcome::Ignored,
@@ -867,28 +867,20 @@ fn activate(state: &mut ExplorerState, hit: &Hit) -> Outcome {
     }
 }
 
-/// Inspect another process (breadcrumb / tree / PPID link).
+/// Inspect another process (breadcrumb / tree / PPID link). The table
+/// follows only when the process is one of its visible rows.
 fn navigate(state: &mut ExplorerState, key: ProcessKey) {
-    state.table.select(key);
+    state.select_visible(key);
     let full = state.detail.is_full();
     state.detail.open(key, full);
     state.request(UiRequest::LoadDetail(key));
-}
-
-/// Run `action` on the inspected process only, leaving marks untouched.
-fn run_for(state: &mut ExplorerState, key: ProcessKey, action: Action) {
-    let marks = state.table.marked();
-    state.table.clear_marks();
-    state.table.select(key);
-    state.run(action);
-    state.table.mark_all(marks);
 }
 
 fn toggle_full(state: &mut ExplorerState) {
     let full = !state.detail.is_full();
     state.detail.set_full(full);
     if !full && let Some(key) = state.detail.key() {
-        state.table.select(key);
+        state.select_visible(key);
     }
 }
 
@@ -933,7 +925,8 @@ pub fn handle_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
             if is_ghost(state, &key) {
                 state.flash("Process has exited");
             } else {
-                run_for(state, key, *action);
+                // The inspected process only: marks never apply.
+                state.run_for(*action, vec![key]);
             }
         }
         _ => return Outcome::Ignored,
@@ -943,11 +936,7 @@ pub fn handle_mouse(state: &mut ExplorerState, click: &Click<'_>) -> Outcome {
 
 /// Bounds for `dock_size` given the current main area.
 fn dock_bounds(state: &ExplorerState) -> (u16, u16) {
-    let main = state.layout(state.last_area).main;
-    match state.settings.dock {
-        DockPosition::Bottom => (6, main.height.saturating_sub(5).max(6)),
-        DockPosition::Right => (8, (main.width.saturating_sub(40) / 4).max(8)),
-    }
+    super::settings::current_dock_bounds(state)
 }
 
 pub fn handle_drag(state: &mut ExplorerState, drag: &Drag, mouse: &MouseEvent) -> Outcome {
