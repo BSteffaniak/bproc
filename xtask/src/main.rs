@@ -81,9 +81,14 @@ fn parse_build_args(args: &[String]) -> BuildOptions {
     }
 }
 
-/// Build feature list ensuring throttle-ebpf is ALWAYS included
+/// Build feature list, adding throttle-ebpf on Linux hosts
 fn build_feature_list(opts: &BuildOptions) -> String {
-    let mut features = vec!["throttle-ebpf".to_string()];
+    // throttle-ebpf pulls in aya, which only compiles on Linux. Elsewhere the
+    // BPF objects are still built but there is nothing to load them into.
+    let mut features = Vec::new();
+    if cfg!(target_os = "linux") {
+        features.push("throttle-ebpf".to_string());
+    }
 
     if let Some(user_features) = &opts.features {
         // Parse user features (could be comma-separated)
@@ -333,7 +338,7 @@ fn build_main(release: bool, opts: &BuildOptions) -> Result<()> {
 
     println!("🔨 Building main crate...");
 
-    // Build feature list with throttle-ebpf ALWAYS included
+    // Build feature list (throttle-ebpf included on Linux)
     let features = build_feature_list(opts);
 
     let mut cmd = Command::new("cargo");
@@ -345,7 +350,7 @@ fn build_main(release: bool, opts: &BuildOptions) -> Result<()> {
         println!("  → Disabling default features");
     }
 
-    // Apply features (throttle-ebpf always included)
+    // Apply features (throttle-ebpf included on Linux)
     if !features.is_empty() {
         cmd.args(["--features", &features]);
         println!("  → Using features: {}", features);
@@ -405,7 +410,7 @@ fn print_help() {
     println!("  --no-default-features      Disable default features\n");
     println!("EXAMPLES:");
     println!("  cargo xtask build");
-    println!("    → Default build with monitor-pnet + throttle-ebpf\n");
+    println!("    → Default build with monitor-pnet (+ throttle-ebpf on Linux)\n");
     println!("  cargo xtask build --features linux-full");
     println!("    → Build with all Linux backends enabled\n");
     println!("  cargo xtask build --features \"throttle-tc-htb,throttle-ifb-tc\"");
@@ -417,7 +422,9 @@ fn print_help() {
     println!("  cargo xtask build-ebpf");
     println!("    → Just rebuild eBPF programs\n");
     println!("NOTES:");
-    println!("  - throttle-ebpf is ALWAYS included (required for eBPF programs)");
+    println!(
+        "  - throttle-ebpf is always included on Linux and dropped elsewhere (aya is Linux-only)"
+    );
     println!("  - Default features: monitor-pnet (can disable with --no-default-features)");
     println!("  - Feature bundles: linux-full, macos-full");
     println!("  - See bproc/Cargo.toml for all available features\n");
