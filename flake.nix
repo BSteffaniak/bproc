@@ -31,6 +31,11 @@
             "llvm-tools-preview"
           ];
         };
+
+        # bpf-linker reads rustc's LLVM bitcode, so it must be built against the
+        # same LLVM major as the nightly above (`rustc -vV | grep LLVM`).
+        llvmPackages = pkgs.llvmPackages_23;
+        bpfLinker = pkgs.bpf-linker.override { llvmPackagesForLinker = llvmPackages; };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -39,9 +44,9 @@
             rustToolchain
 
             # eBPF tooling (bpf-linker works on macOS too)
-            pkgs.bpf-linker
-            pkgs.llvmPackages.clang
-            pkgs.llvmPackages.llvm
+            bpfLinker
+            llvmPackages.clang
+            llvmPackages.llvm
 
             # Build dependencies
             pkgs.pkg-config
